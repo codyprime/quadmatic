@@ -1,0 +1,182 @@
+# Reference Fedora CoreOS Butane configuration (v1.5) for a quadmatic node.
+# Replace all <PLACEHOLDER> values before compiling with `butane --strict`.
+variant: fcos
+version: 1.5.0
+
+passwd:
+  users:
+    - name: core
+      ssh_authorized_keys:
+        - "<CORE_SSH_PUBLIC_KEY>"
+
+storage:
+  # Preserve /var across OS reprovisioning so pinned-UID rootless user homes
+  # (/var/home/<user>) and Podman container storage remain intact.
+  # Adjust device/partition layout to match your node's disk topology (for
+  # single-disk nodes, verify partition sizes before reprovisioning, or dedicate
+  # a second disk for /var with wipe_table: false).
+  disks:
+    - device: /dev/disk/by-id/<BOOT_DISK_ID>
+      wipe_table: false
+      partitions:
+        - label: root
+          number: 4
+          size_mib: 20480
+          resize: true
+        - label: var
+          number: 5
+          size_mib: 0
+          should_exist: true
+
+  filesystems:
+    - path: /var
+      device: /dev/disk/by-partlabel/var
+      format: xfs
+      wipe_filesystem: false
+      with_mount_unit: true
+
+  directories:
+    - path: /etc/quadmatic
+      mode: 0755
+    - path: /var/lib/quadmatic
+      mode: 0750
+
+  files:
+    # Kernel sysctls required for rootless port 80/443 binding and VRF isolation.
+    # tcp_l3mdev_accept and udp_l3mdev_accept MUST stay 0 so default-VRF sockets
+    # never accept traffic arriving on VRF-enslaved untrusted VLAN interfaces.
+    - path: /etc/sysctl.d/90-quadmatic.conf
+      mode: 0644
+      contents:
+        inline: |
+          net.ipv4.ip_unprivileged_port_start=80
+          net.ipv4.tcp_l3mdev_accept=0
+          net.ipv4.udp_l3mdev_accept=0
+
+    # Trunk physical NIC carrying tagged VLANs (IP-less; management lives on VLAN).
+    - path: /etc/NetworkManager/system-connections/<TRUNK_INTERFACE>.nmconnection
+      mode: 0600
+      contents:
+        inline: |
+          [connection]
+          id=<TRUNK_INTERFACE>
+          type=ethernet
+          interface-name=<TRUNK_INTERFACE>
+          autoconnect=true
+
+          [ipv4]
+          method=disabled
+
+          [ipv6]
+          method=disabled
+
+    # Management VLAN interface on the trunk NIC. quadmatic's netmgr detects and
+    # reuses this unmanaged VLAN device when components attach to VLAN <MGMT_VLAN_ID>,
+    # and never modifies or prunes it.
+    - path: /etc/NetworkManager/system-connections/<TRUNK_INTERFACE>.<MGMT_VLAN_ID>.nmconnection
+      mode: 0600
+      contents:
+        inline: |
+          [connection]
+          id=<TRUNK_INTERFACE>.<MGMT_VLAN_ID>
+          type=vlan
+          interface-name=<TRUNK_INTERFACE>.<MGMT_VLAN_ID>
+          autoconnect=true
+
+          [vlan]
+          parent=<TRUNK_INTERFACE>
+          id=<MGMT_VLAN_ID>
+
+          [ipv4]
+          method=manual
+          address1=<MGMT_IP>/<MGMT_PREFIX>,<MGMT_GATEWAY>
+          dns=<MGMT_DNS>;
+
+          [ipv6]
+          method=disabled
+
+    # Static quadmatic binary verified by SHA-256 checksum.
+    - path: /usr/local/bin/quadmatic
+      mode: 0755
+      contents:
+        source: https://<ARTIFACT_HOST>/quadmatic/<VERSION>/quadmatic-linux-amd64
+        verification:
+          hash: sha256-<QUADMATIC_BINARY_SHA256>
+
+    # Host-local quadmatic configuration.
+    - path: /etc/quadmatic/config.toml
+      mode: 0640
+      contents:
+        inline: |
+          hostname = "<HOSTNAME>"
+          repo_url = "git@<GIT_HOST>:<ORG>/<REPO>.git"
+          branch = "main"
+          poll_interval = "5m"
+          ssh_key = "/etc/quadmatic/deploy_key"
+          ssh_known_hosts = "/etc/quadmatic/known_hosts"
+          allowed_signers = "/etc/quadmatic/allowed-signers"
+          allow_non_ff = false
+          age_identity = "/etc/quadmatic/age.key"
+          trunk_interface = "<TRUNK_INTERFACE>"
+          metrics_listen = "<MGMT_IP>:9100"
+          state_file = "/var/lib/quadmatic/state.json"
+          repo_dir = "/var/lib/quadmatic/repo"
+
+    # Read-only SSH deploy key for pulling the manifests repository.
+    - path: /etc/quadmatic/deploy_key
+      mode: 0600
+      contents:
+        inline: |
+          <SSH_DEPLOY_PRIVATE_KEY>
+
+    # Pinned SSH host keys for the Git server (StrictHostKeyChecking=yes).
+    - path: /etc/quadmatic/known_hosts
+      mode: 0644
+      contents:
+        inline: |
+          <GIT_HOST> <GIT_SSH_HOST_KEY_TYPE> <GIT_SSH_HOST_PUBLIC_KEY>
+
+    # OpenSSH public keys allowed to sign Git commits (`gpg.format = ssh`).
+    - path: /etc/quadmatic/allowed-signers
+      mode: 0644
+      contents:
+        inline: |
+          <SIGNER_PRINCIPAL> <SIGNER_SSH_PUBLIC_KEY>
+
+    # Host age private key (native age X25519 or unencrypted SSH Ed25519 key).
+    - path: /etc/quadmatic/age.key
+      mode: 0600
+      contents:
+        inline: |
+          <HOST_AGE_PRIVATE_KEY>
+
+systemd:
+  units:
+    - name: quadmatic.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Quadmatic GitOps Podman Quadlet Reconciler
+        Wants=network-online.target
+        After=network-online.target NetworkManager.service
+
+        [Service]
+        Type=simple
+        ExecStart=/usr/local/bin/quadmatic daemon --config /etc/quadmatic/config.toml
+        ExecReload=/bin/kill -HUP $MAINPID
+        Restart=on-failure
+        RestartSec=10s
+        TimeoutStopSec=90s
+        StateDirectory=quadmatic
+        StateDirectoryMode=0750
+
+        [Install]
+        WantedBy=multi-user.target
+
+    - name: podman-auto-update.timer
+      enabled: true
+
+    # Optional: enable netavark-dhcp-proxy.socket when any rootful = true component
+    # uses a Podman Driver=macvlan .network quadlet with DHCP IPAM.
+    # - name: netavark-dhcp-proxy.socket
+    #   enabled: true

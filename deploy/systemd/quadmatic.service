@@ -1,0 +1,17 @@
+[Unit]
+Description=Quadmatic GitOps Podman Quadlet Reconciler
+Wants=network-online.target
+After=network-online.target NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/quadmatic daemon --config /etc/quadmatic/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=90s
+StateDirectory=quadmatic
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target
