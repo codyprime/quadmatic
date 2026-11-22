@@ -1467,3 +1467,371 @@ dns = ["10.30.0.1"]
 		t.Fatalf("expected frigate.service stopped on prune, calls=%v", env.systemd.calls)
 	}
 }
+
+type cancelOnStartSystemd struct {
+	apply.Systemd
+	cancelTriggerUnit string
+	cancel            context.CancelFunc
+	inRollback        bool
+	rollbackCtxErrs   []error
+}
+
+func (c *cancelOnStartSystemd) Start(ctx context.Context, scope, unit string) error {
+	if scope+"/"+unit == c.cancelTriggerUnit {
+		err := c.Systemd.Start(ctx, scope, unit)
+		c.cancel()
+		return err
+	}
+	return c.Systemd.Start(ctx, scope, unit)
+}
+
+func (c *cancelOnStartSystemd) Restart(ctx context.Context, scope, unit string) error {
+	if !c.inRollback && ctx.Err() != nil {
+		c.inRollback = true
+		return ctx.Err()
+	}
+	if c.inRollback && ctx.Err() != nil {
+		c.rollbackCtxErrs = append(c.rollbackCtxErrs, fmt.Errorf("Restart(%s/%s): %w", scope, unit, ctx.Err()))
+	}
+	return c.Systemd.Restart(ctx, scope, unit)
+}
+
+func (c *cancelOnStartSystemd) ActiveState(ctx context.Context, scope, unit string) (string, error) {
+	if !c.inRollback && ctx.Err() != nil {
+		c.inRollback = true
+		return "", ctx.Err()
+	}
+	return c.Systemd.ActiveState(ctx, scope, unit)
+}
+
+func (c *cancelOnStartSystemd) Stop(ctx context.Context, scope, unit string) error {
+	if c.inRollback && ctx.Err() != nil {
+		c.rollbackCtxErrs = append(c.rollbackCtxErrs, fmt.Errorf("Stop(%s/%s): %w", scope, unit, ctx.Err()))
+	}
+	return c.Systemd.Stop(ctx, scope, unit)
+}
+
+func (c *cancelOnStartSystemd) DaemonReload(ctx context.Context, scope string) error {
+	if c.inRollback && ctx.Err() != nil {
+		c.rollbackCtxErrs = append(c.rollbackCtxErrs, fmt.Errorf("DaemonReload(%s): %w", scope, ctx.Err()))
+	}
+	return c.Systemd.DaemonReload(ctx, scope)
+}
+
+type ctxCheckGitClient struct {
+	*spyGitClient
+	checkActive     *bool
+	rollbackCtxErrs *[]error
+}
+
+func (g *ctxCheckGitClient) ReadFileAtCommit(ctx context.Context, sha, relPath string) ([]byte, error) {
+	if *g.checkActive && ctx.Err() != nil {
+		*g.rollbackCtxErrs = append(*g.rollbackCtxErrs, fmt.Errorf("ReadFileAtCommit(%s:%s): %w", sha, relPath, ctx.Err()))
+	}
+	return g.spyGitClient.ReadFileAtCommit(ctx, sha, relPath)
+}
+
+type ctxCheckNetmgr struct {
+	apply.NetmgrReconciler
+	checkActive     *bool
+	rollbackCtxErrs *[]error
+}
+
+func (n *ctxCheckNetmgr) Restore(ctx context.Context, snap *netmgr.Snapshot, created []state.ManagedNetworkRecord) error {
+	if *n.checkActive && ctx.Err() != nil {
+		*n.rollbackCtxErrs = append(*n.rollbackCtxErrs, fmt.Errorf("Netmgr.Restore: %w", ctx.Err()))
+	}
+	return n.NetmgrReconciler.Restore(ctx, snap, created)
+}
+
+type ctxCheckSecrets struct {
+	apply.SecretsManager
+	checkActive     *bool
+	rollbackCtxErrs *[]error
+}
+
+func (s *ctxCheckSecrets) Upsert(ctx context.Context, scope, name string, plaintext []byte) error {
+	if *s.checkActive && ctx.Err() != nil {
+		*s.rollbackCtxErrs = append(*s.rollbackCtxErrs, fmt.Errorf("Secrets.Upsert(%s/%s): %w", scope, name, ctx.Err()))
+	}
+	return s.SecretsManager.Upsert(ctx, scope, name, plaintext)
+}
+
+func TestReconcileRollbackSurvivesCanceledContext(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Commit 1: healthy open-webui with secret v1 + NM profile
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml": []byte("[users.openwebui]\nuid = 2001\n\n[users.brokenuser]\nuid = 2002\n"),
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "open-webui"
+user = "openwebui"
+
+[component.network]
+vlan = 30
+mac = "02:51:4d:00:07:d1"
+dns = ["10.30.0.1"]
+`),
+		"components/open-webui/component.toml":            []byte("[secrets]\nwebui_secret = \"secrets/open-webui.age\"\n"),
+		"components/open-webui/open-webui.container.tmpl": []byte("[Container]\nImage=ghcr.io/open-webui/open-webui:v1\nNetwork={{ .Net.PastaArgs }}\nSecret=webui_secret,type=env,target=WEBUI_SECRET_KEY\n"),
+		"secrets/open-webui.age":                          env.encryptSecret("secret-v1"),
+	})
+	sha1 := env.commitRepo("commit 1: baseline")
+
+	if _, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond)); err != nil {
+		t.Fatalf("commit 1 failed: %v", err)
+	}
+
+	// Commit 2: update secret v2, NM vlan, and add broken component whose Start cancels ctx.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sysWrapper := &cancelOnStartSystemd{
+		Systemd:           env.systemd,
+		cancelTriggerUnit: "brokenuser/broken.service",
+		cancel:            cancel,
+	}
+	gitWrapper := &ctxCheckGitClient{
+		spyGitClient:    env.git,
+		checkActive:     &sysWrapper.inRollback,
+		rollbackCtxErrs: &sysWrapper.rollbackCtxErrs,
+	}
+	netWrapper := &ctxCheckNetmgr{
+		NetmgrReconciler: env.netmgr,
+		checkActive:      &sysWrapper.inRollback,
+		rollbackCtxErrs:  &sysWrapper.rollbackCtxErrs,
+	}
+	secWrapper := &ctxCheckSecrets{
+		SecretsManager:  env.secretsMgr,
+		checkActive:     &sysWrapper.inRollback,
+		rollbackCtxErrs: &sysWrapper.rollbackCtxErrs,
+	}
+
+	env.engine = apply.NewEngine(apply.EngineDeps{
+		Config:             env.cfg,
+		Git:                gitWrapper,
+		Users:              env.users,
+		Quadlet:            env.quadlet,
+		Secrets:            secWrapper,
+		Netmgr:             netWrapper,
+		Systemd:            sysWrapper,
+		RootDir:            env.rootDir,
+		Chown:              func(string, int, int) error { return nil },
+		DHCPTimeout:        100 * time.Millisecond,
+		VerifyPollInterval: 5 * time.Millisecond,
+		RollbackTimeout:    5 * time.Second,
+	})
+
+	env.systemd.clearCalls()
+	env.writeRepoFiles(map[string][]byte{
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "open-webui"
+user = "openwebui"
+
+[component.network]
+vlan = 31
+mac = "02:51:4d:00:07:d2"
+dns = ["10.31.0.1"]
+
+[[component]]
+name = "broken"
+user = "brokenuser"
+`),
+		"components/open-webui/open-webui.container.tmpl": []byte("[Container]\nImage=ghcr.io/open-webui/open-webui:v2\nNetwork={{ .Net.PastaArgs }}\nSecret=webui_secret,type=env,target=WEBUI_SECRET_KEY\n"),
+		"secrets/open-webui.age":                          env.encryptSecret("secret-v2"),
+		"components/broken/broken.container":              []byte("[Container]\nImage=example.invalid/broken:latest\n"),
+	})
+	env.commitRepo("commit 2: canceled mid-Stage 7")
+
+	res, err := env.engine.Reconcile(ctx, env.reconcileOpts(50*time.Millisecond))
+	if err == nil {
+		t.Fatalf("expected commit 2 to fail when ctx canceled mid-Stage 7")
+	}
+	if !res.RolledBack {
+		t.Fatalf("expected RolledBack = true, got %+v", res)
+	}
+	if res.FailedStage != "apply" {
+		t.Fatalf("FailedStage = %q, want %q (rollback must not fail with context.Canceled)", res.FailedStage, "apply")
+	}
+	if res.AppliedSHA != sha1 {
+		t.Fatalf("AppliedSHA = %q, want %q", res.AppliedSHA, sha1)
+	}
+	if len(sysWrapper.rollbackCtxErrs) > 0 {
+		t.Fatalf("rollback calls observed canceled context: %v", sysWrapper.rollbackCtxErrs)
+	}
+
+	// Verify full restoration despite canceled caller ctx
+	if _, err := os.Stat(env.hostPath("/etc/containers/systemd/users/2002/broken.container")); !os.IsNotExist(err) {
+		t.Fatalf("expected broken.container deleted on rollback")
+	}
+	qBytes, err := os.ReadFile(env.hostPath("/etc/containers/systemd/users/2001/open-webui.container"))
+	if err != nil || !strings.Contains(string(qBytes), "open-webui:v1") {
+		t.Fatalf("expected open-webui.container restored to v1, got %q (err=%v)", string(qBytes), err)
+	}
+	if env.secRunner.store["openwebui/webui_secret"] != "secret-v1" {
+		t.Fatalf("expected secret restored to secret-v1, got %q", env.secRunner.store["openwebui/webui_secret"])
+	}
+	if _, ok := env.netRunner.conns["qm-vlan30"]; !ok {
+		t.Fatalf("expected qm-vlan30 restored on rollback")
+	}
+	if _, ok := env.netRunner.conns["qm-vlan31"]; ok {
+		t.Fatalf("expected qm-vlan31 deleted on rollback")
+	}
+	stAfter, err := state.Load(env.stateFile)
+	if err != nil || stAfter.AppliedSHA != sha1 {
+		t.Fatalf("expected state.json kept at %q, got %q (err=%v)", sha1, stAfter.AppliedSHA, err)
+	}
+}
+
+type failingSecretsManager struct {
+	apply.SecretsManager
+	failUpsert bool
+}
+
+func (f *failingSecretsManager) Upsert(ctx context.Context, scope, name string, plaintext []byte) error {
+	if f.failUpsert {
+		return errors.New("simulated Stage 7c secret upsert error")
+	}
+	return f.SecretsManager.Upsert(ctx, scope, name, plaintext)
+}
+
+type failingStartSystemd struct {
+	apply.Systemd
+	failStartKey string
+}
+
+func (f *failingStartSystemd) Start(ctx context.Context, scope, unit string) error {
+	if scope+"/"+unit == f.failStartKey {
+		return errors.New("simulated Stage 7d start failure")
+	}
+	return f.Systemd.Start(ctx, scope, unit)
+}
+
+func TestReconcileStage7cSecretFailureDoesNotRestartUntouchedOrManuallyStoppedUnits(t *testing.T) {
+	env := newTestEnv(t)
+	secMgr := &failingSecretsManager{SecretsManager: env.secretsMgr}
+	sysWrapper := &failingStartSystemd{Systemd: env.systemd}
+
+	env.engine = apply.NewEngine(apply.EngineDeps{
+		Config:             env.cfg,
+		Git:                env.git,
+		Users:              env.users,
+		Quadlet:            env.quadlet,
+		Secrets:            secMgr,
+		Netmgr:             env.netmgr,
+		Systemd:            sysWrapper,
+		RootDir:            env.rootDir,
+		Chown:              func(string, int, int) error { return nil },
+		DHCPTimeout:        100 * time.Millisecond,
+		VerifyPollInterval: 5 * time.Millisecond,
+	})
+
+	// Commit 1: open-webui (active) + caddy (will be manually stopped before Commit 2)
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml": []byte("[users.openwebui]\nuid = 2001\n\n[users.caddy]\nuid = 2002\n\n[users.brokenuser]\nuid = 2003\n"),
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "open-webui"
+user = "openwebui"
+
+[[component]]
+name = "caddy"
+user = "caddy"
+`),
+		"components/open-webui/component.toml":       []byte("[secrets]\nwebui_secret = \"secrets/open-webui.age\"\n"),
+		"components/open-webui/open-webui.container": []byte("[Container]\nImage=ghcr.io/open-webui/open-webui:v1\nSecret=webui_secret,type=env,target=WEBUI_SECRET_KEY\n"),
+		"components/caddy/caddy.container":           []byte("[Container]\nImage=docker.io/library/caddy:v1\n"),
+		"secrets/open-webui.age":                     env.encryptSecret("secret-v1"),
+	})
+	sha1 := env.commitRepo("commit 1: open-webui and caddy")
+
+	if _, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond)); err != nil {
+		t.Fatalf("commit 1 failed: %v", err)
+	}
+
+	// Manually stop caddy before Commit 2
+	env.systemd.states["caddy/caddy.service"] = "inactive"
+	env.systemd.clearCalls()
+	secMgr.failUpsert = true
+
+	// Commit 2: updates both quadlets (Stage 7b) + rotates open-webui secret (fails in Stage 7c before DaemonReload)
+	env.writeRepoFiles(map[string][]byte{
+		"components/open-webui/open-webui.container": []byte("[Container]\nImage=ghcr.io/open-webui/open-webui:v2\nSecret=webui_secret,type=env,target=WEBUI_SECRET_KEY\n"),
+		"components/caddy/caddy.container":           []byte("[Container]\nImage=docker.io/library/caddy:v2\n"),
+		"secrets/open-webui.age":                     env.encryptSecret("secret-v2"),
+	})
+	env.commitRepo("commit 2: stage 7c failure")
+
+	res2, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err == nil {
+		t.Fatalf("expected commit 2 to fail in Stage 7c")
+	}
+	if !res2.RolledBack || res2.FailedStage != "secrets" || res2.AppliedSHA != sha1 {
+		t.Fatalf("unexpected Stage 7c rollback result: %+v", res2)
+	}
+
+	// Both quadlets rolled back cleanly
+	owBytes, err := os.ReadFile(env.hostPath("/etc/containers/systemd/users/2001/open-webui.container"))
+	if err != nil || !strings.Contains(string(owBytes), "open-webui:v1") {
+		t.Fatalf("expected open-webui.container rolled back to v1, got %q (err=%v)", string(owBytes), err)
+	}
+	caddyBytes, err := os.ReadFile(env.hostPath("/etc/containers/systemd/users/2002/caddy.container"))
+	if err != nil || !strings.Contains(string(caddyBytes), "caddy:v1") {
+		t.Fatalf("expected caddy.container rolled back to v1, got %q (err=%v)", string(caddyBytes), err)
+	}
+
+	// Crucially: zero DaemonReload, Start, Restart, or Stop calls during pre-reload Stage 7c rollback!
+	for _, call := range env.systemd.calls {
+		if call.op != "active-state" {
+			t.Fatalf("expected zero mutating systemd calls on Stage 7c rollback, got calls=%v", env.systemd.calls)
+		}
+	}
+
+	// Part 2: When Stage 7d DOES run DaemonReload and then fails on Start("brokenuser/broken.service")
+	// BEFORE restarting caddy.service, manually stopped caddy.service must STILL NOT be restarted on rollback,
+	// whereas previously-active open-webui.service IS restarted.
+	secMgr.failUpsert = false
+	sysWrapper.failStartKey = "brokenuser/broken.service"
+	env.systemd.clearCalls()
+
+	env.writeRepoFiles(map[string][]byte{
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "open-webui"
+user = "openwebui"
+
+[[component]]
+name = "caddy"
+user = "caddy"
+
+[[component]]
+name = "broken"
+user = "brokenuser"
+`),
+		"components/broken/broken.container": []byte("[Container]\nImage=example.invalid/broken:latest\n"),
+	})
+	env.commitRepo("commit 3: stage 7d start failure after reload")
+
+	res3, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err == nil {
+		t.Fatalf("expected commit 3 to fail on Start")
+	}
+	if !res3.RolledBack || res3.FailedStage != "apply" || res3.AppliedSHA != sha1 {
+		t.Fatalf("unexpected Stage 7d rollback result: %+v", res3)
+	}
+	if env.systemd.countCalls("restart", "caddy", "caddy.service") != 0 {
+		t.Fatalf("manually stopped caddy.service must not be restarted on rollback, calls=%v", env.systemd.calls)
+	}
+	if env.systemd.countCalls("restart", "openwebui", "open-webui.service") != 1 {
+		t.Fatalf("previously active open-webui.service expected restarted once on rollback, calls=%v", env.systemd.calls)
+	}
+	if env.secRunner.store["openwebui/webui_secret"] != "secret-v1" {
+		t.Fatalf("expected secret restored to secret-v1, got %q", env.secRunner.store["openwebui/webui_secret"])
+	}
+}

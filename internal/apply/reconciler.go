@@ -29,6 +29,7 @@ import (
 const (
 	defaultStartVerifyTimeout = 30 * time.Second
 	defaultDHCPTimeout        = 30 * time.Second
+	defaultRollbackTimeout    = 60 * time.Second
 	maxVerifyPollInterval     = 250 * time.Millisecond
 	minVerifyPollInterval     = 5 * time.Millisecond
 )
@@ -113,6 +114,7 @@ type EngineDeps struct {
 	RootDir            string
 	Chown              func(path string, uid, gid int) error
 	DHCPTimeout        time.Duration
+	RollbackTimeout    time.Duration
 	VerifyPollInterval time.Duration
 }
 
@@ -129,6 +131,7 @@ type Engine struct {
 	rootDir            string
 	chown              func(path string, uid, gid int) error
 	dhcpTimeout        time.Duration
+	rollbackTimeout    time.Duration
 	verifyPollInterval time.Duration
 }
 
@@ -183,6 +186,11 @@ func NewEngine(deps EngineDeps) *Engine {
 		dhcpTimeout = defaultDHCPTimeout
 	}
 
+	rollbackTimeout := deps.RollbackTimeout
+	if rollbackTimeout <= 0 {
+		rollbackTimeout = defaultRollbackTimeout
+	}
+
 	return &Engine{
 		cfg:                deps.Config,
 		git:                gitClient,
@@ -195,6 +203,7 @@ func NewEngine(deps EngineDeps) *Engine {
 		rootDir:            deps.RootDir,
 		chown:              chownFn,
 		dhcpTimeout:        dhcpTimeout,
+		rollbackTimeout:    rollbackTimeout,
 		verifyPollInterval: deps.VerifyPollInterval,
 	}
 }
@@ -397,7 +406,7 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 	res.ManagedUnitsRootless = plan.managedRootless
 	res.ManagedUnitsRootful = plan.managedRootful
 
-	stage4FailedUnits, err := e.queryExistingUnitStates(ctx, prevState, plan.desiredUnits)
+	stage4FailedUnits, priorNonActive, err := e.queryExistingUnitStates(ctx, prevState, plan.desiredUnits, plan.unitsToStop)
 	if err != nil {
 		res.FailedStage = "apply"
 		return res, err
@@ -457,7 +466,10 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 	}
 
 	runRollback := func(failedStage string, cause error) (*Result, error) {
-		rbErr := e.rollback(ctx, prevState, fileSnap, netSnap, tracker, identities, plan)
+		rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), e.rollbackTimeout)
+		defer rbCancel()
+
+		rbErr := e.rollback(rbCtx, prevState, fileSnap, netSnap, tracker, identities, plan, priorNonActive)
 		res.AppliedSHA = prevState.AppliedSHA
 		res.RolledBack = true
 		if rbErr != nil {
@@ -659,6 +671,7 @@ func (e *Engine) rollback(
 	tracker *rollbackTracker,
 	identities []age.Identity,
 	plan *applyPlan,
+	priorNonActive map[string]bool,
 ) error {
 	var errs []error
 
@@ -728,14 +741,15 @@ func (e *Engine) rollback(
 		}
 	}
 
-	// 5. Run daemon-reload on affected scopes and restart previously active units whose restored state differs.
-	for _, scope := range sortedBoolKeys(tracker.affectedScopes) {
+	// 5. Run daemon-reload only on scopes that were reloaded during Stage 7d, and restart
+	// previously active (or Stage 7-mutated) units whose restored state differs.
+	for _, scope := range sortedBoolKeys(tracker.daemonReloaded) {
 		if err := e.systemd.DaemonReload(ctx, scope); err != nil {
 			errs = append(errs, fmt.Errorf("daemon-reload scope %q: %w", scope, err))
 		}
 	}
 
-	unitsToRestart := collectRollbackRestarts(prevState, tracker, plan, mutatedFiles)
+	unitsToRestart := collectRollbackRestarts(prevState, tracker, plan, mutatedFiles, priorNonActive)
 	for _, u := range unitsToRestart {
 		if err := e.systemd.Restart(ctx, u.Scope, u.UnitName); err != nil {
 			errs = append(errs, fmt.Errorf("restart restored unit %s: %w", u.Key, err))
@@ -836,6 +850,7 @@ func collectRollbackRestarts(
 	tracker *rollbackTracker,
 	plan *applyPlan,
 	mutatedFiles map[string]bool,
+	priorNonActive map[string]bool,
 ) []unitID {
 	if prevState.AppliedSHA == "" || len(prevState.GeneratedUnits) == 0 {
 		return nil
@@ -849,13 +864,15 @@ func collectRollbackRestarts(
 	}
 
 	for _, u := range tracker.stoppedUnits {
-		addUnit(u)
+		if !priorNonActive[u.Key] {
+			addUnit(u)
+		}
 	}
 	for _, u := range tracker.restartedUnits {
 		addUnit(u)
 	}
 
-	// Also catch any existing unit in prevState whose files were mutated and whose scope was reloaded.
+	// Also catch any previously active unit in prevState whose files were mutated and whose scope was reloaded.
 	mutatedComps := make(map[string]bool)
 	for destPath := range mutatedFiles {
 		if rec, ok := prevState.Files[destPath]; ok && rec.Component != "" {
@@ -869,7 +886,7 @@ func collectRollbackRestarts(
 		if _, existed := prevState.GeneratedUnits[unitKey]; !existed {
 			continue
 		}
-		if !tracker.daemonReloaded[meta.ID.Scope] && !tracker.affectedScopes[meta.ID.Scope] {
+		if !tracker.daemonReloaded[meta.ID.Scope] || priorNonActive[unitKey] {
 			continue
 		}
 		if mutatedFiles[meta.SourceDestPath] || (!meta.ID.IsHelper && mutatedComps[meta.Component]) {
@@ -1242,7 +1259,8 @@ func (e *Engine) queryExistingUnitStates(
 	ctx context.Context,
 	prevState *state.State,
 	desiredUnits map[string]unitPlanMeta,
-) ([]UnitStatus, error) {
+	unitsToStop []unitID,
+) ([]UnitStatus, map[string]bool, error) {
 	var keys []string
 	for k := range desiredUnits {
 		if _, existed := prevState.GeneratedUnits[k]; existed {
@@ -1251,14 +1269,16 @@ func (e *Engine) queryExistingUnitStates(
 	}
 	sort.Strings(keys)
 
+	nonActive := make(map[string]bool)
 	var failed []UnitStatus
 	for _, k := range keys {
 		meta := desiredUnits[k]
 		st, err := e.systemd.ActiveState(ctx, meta.ID.Scope, meta.ID.UnitName)
 		if err != nil {
-			return nil, fmt.Errorf("query systemd state for %s: %w", k, err)
+			return nil, nil, fmt.Errorf("query systemd state for %s: %w", k, err)
 		}
 		if st != "active" {
+			nonActive[k] = true
 			failed = append(failed, UnitStatus{
 				Scope:       meta.ID.Scope,
 				Unit:        meta.ID.UnitName,
@@ -1266,7 +1286,16 @@ func (e *Engine) queryExistingUnitStates(
 			})
 		}
 	}
-	return failed, nil
+	for _, u := range unitsToStop {
+		st, err := e.systemd.ActiveState(ctx, u.Scope, u.UnitName)
+		if err != nil {
+			return nil, nil, fmt.Errorf("query systemd state for %s: %w", u.Key, err)
+		}
+		if st != "active" {
+			nonActive[u.Key] = true
+		}
+	}
+	return failed, nonActive, nil
 }
 
 func correlateUnitOwner(
