@@ -282,8 +282,17 @@ func validateComponentSecrets(realRepoDir string, comp ResolvedComponent) error 
 		if err := ensureSubPath(realRepoDir, joined); err != nil {
 			return fmt.Errorf("component %q secret %q escapes repo root: %w", comp.Name, secretName, err)
 		}
-		if err := ensureRealContainment(realRepoDir, joined); err != nil {
-			return fmt.Errorf("component %q secret %q escapes repo root via symlink: %w", comp.Name, secretName, err)
+		if _, lerr := os.Lstat(joined); lerr == nil {
+			if err := ensureRealContainment(realRepoDir, joined); err != nil {
+				return fmt.Errorf("component %q secret %q escapes repo root via symlink: %w", comp.Name, secretName, err)
+			}
+		} else if os.IsNotExist(lerr) {
+			if err := ensureExistingParentContained(realRepoDir, filepath.Dir(joined)); err != nil {
+				return fmt.Errorf("component %q secret %q escapes repo root via symlink: %w", comp.Name, secretName, err)
+			}
+			return fmt.Errorf("component %q secret %q file %q: %w", comp.Name, secretName, relPath, lerr)
+		} else {
+			return fmt.Errorf("component %q secret %q file %q: %w", comp.Name, secretName, relPath, lerr)
 		}
 		info, err := os.Stat(joined)
 		if err != nil {
@@ -297,8 +306,30 @@ func validateComponentSecrets(realRepoDir string, comp ResolvedComponent) error 
 }
 
 func validateComponentFiles(realRepoDir string, comp ResolvedComponent, scopeQuadlets map[string]map[string]string) error {
-	realCompDir := filepath.Join(realRepoDir, "components", comp.Name)
+	realComponentsDir := filepath.Join(realRepoDir, "components")
+	if _, err := os.Lstat(realComponentsDir); err == nil {
+		if err := ensureRealContainment(realRepoDir, realComponentsDir); err != nil {
+			return fmt.Errorf("components directory escapes repo root: %w", err)
+		}
+	}
+	realCompDir := filepath.Join(realComponentsDir, comp.Name)
+	if _, err := os.Lstat(realCompDir); err == nil {
+		if err := ensureRepoAndParentContainment(realRepoDir, realComponentsDir, realCompDir, fmt.Sprintf("component %q directory", comp.Name)); err != nil {
+			return err
+		}
+	}
+	compTOMLPath := filepath.Join(realCompDir, "component.toml")
+	if _, err := os.Lstat(compTOMLPath); err == nil {
+		if err := ensureRepoAndParentContainment(realRepoDir, realCompDir, compTOMLPath, fmt.Sprintf("component %q manifest", comp.Name)); err != nil {
+			return err
+		}
+	}
 	realFilesDir := filepath.Join(realCompDir, "files")
+	if _, err := os.Lstat(realFilesDir); err == nil {
+		if err := ensureRepoAndParentContainment(realRepoDir, realCompDir, realFilesDir, fmt.Sprintf("component %q files directory", comp.Name)); err != nil {
+			return err
+		}
+	}
 
 	scope := comp.Scope()
 	if scopeQuadlets[scope] == nil {
@@ -313,8 +344,8 @@ func validateComponentFiles(realRepoDir string, comp ResolvedComponent, scopeQua
 			return fmt.Errorf("component %q: %w", comp.Name, err)
 		}
 		if qf.SourceAbsPath != "" {
-			if err := ensureRealContainment(realCompDir, qf.SourceAbsPath); err != nil {
-				return fmt.Errorf("component %q quadlet %q escapes component directory: %w", comp.Name, qf.SourceRelPath, err)
+			if err := ensureRepoAndParentContainment(realRepoDir, realCompDir, qf.SourceAbsPath, fmt.Sprintf("component %q quadlet %q", comp.Name, qf.SourceRelPath)); err != nil {
+				return err
 			}
 		}
 		if compQuadlets[qf.RelPath] {
@@ -338,8 +369,8 @@ func validateComponentFiles(realRepoDir string, comp ResolvedComponent, scopeQua
 			return fmt.Errorf("component %q data source file %q: %w", comp.Name, df.SourceRelPath, err)
 		}
 		if df.SourceAbsPath != "" {
-			if err := ensureRealContainment(realFilesDir, df.SourceAbsPath); err != nil {
-				return fmt.Errorf("component %q data file %q escapes files directory: %w", comp.Name, df.SourceRelPath, err)
+			if err := ensureRepoAndParentContainment(realRepoDir, realFilesDir, df.SourceAbsPath, fmt.Sprintf("component %q data file %q", comp.Name, df.SourceRelPath)); err != nil {
+				return err
 			}
 		}
 		if compDataByRel[df.RelPath] {
@@ -446,6 +477,33 @@ func ensureRealContainment(baseDir, targetPath string) error {
 		return err
 	}
 	return ensureSubPath(realBase, realTarget)
+}
+
+func ensureRepoAndParentContainment(repoDir, parentDir, targetPath, label string) error {
+	if err := ensureRealContainment(repoDir, targetPath); err != nil {
+		return fmt.Errorf("%s escapes repo root: %w", label, err)
+	}
+	if err := ensureRealContainment(parentDir, targetPath); err != nil {
+		return fmt.Errorf("%s escapes parent directory: %w", label, err)
+	}
+	return nil
+}
+
+func ensureExistingParentContained(realRepoDir, dir string) error {
+	cur := filepath.Clean(dir)
+	for {
+		if cur == realRepoDir {
+			return nil
+		}
+		if _, err := os.Lstat(cur); err == nil {
+			return ensureRealContainment(realRepoDir, cur)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return nil
+		}
+		cur = parent
+	}
 }
 
 func parseOctalMode(raw string) (fs.FileMode, error) {

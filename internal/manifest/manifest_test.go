@@ -228,6 +228,24 @@ reason = "USB Coral passthrough"
 		if _, err := manifest.LoadHost(r2.root, "badport", reg); err == nil {
 			t.Fatal("expected error for unknown field inside port table")
 		}
+
+		r2.writeFile(t, "components/badcomp/component.toml", "unknown_comp_key = true\n")
+		r2.writeFile(t, "hosts/badcomp.toml", "[[component]]\nname = \"badcomp\"\nuser = \"openwebui\"\n")
+		if _, err := manifest.LoadHost(r2.root, "badcomp", reg); err == nil {
+			t.Fatal("expected error for unknown top-level key in component.toml")
+		}
+
+		r2.writeFile(t, "components/badcompnet/component.toml", "[network]\nvlan = 10\nbogus_net_key = 1\n")
+		r2.writeFile(t, "hosts/badcompnet.toml", "[[component]]\nname = \"badcompnet\"\nuser = \"openwebui\"\n")
+		if _, err := manifest.LoadHost(r2.root, "badcompnet", reg); err == nil {
+			t.Fatal("expected error for unknown key in component.toml [network]")
+		}
+
+		r2.writeFile(t, "components/okcomp/component.toml", "")
+		r2.writeFile(t, "hosts/badhostnet.toml", "[[component]]\nname = \"okcomp\"\nuser = \"openwebui\"\n[component.network]\nvlan = 10\nbogus_host_net = true\n")
+		if _, err := manifest.LoadHost(r2.root, "badhostnet", reg); err == nil {
+			t.Fatal("expected error for unknown key in host [component.network]")
+		}
 	})
 
 	t.Run("nested vars tables and network dns override mode switch", func(t *testing.T) {
@@ -360,7 +378,7 @@ tcp_ports = ["8080:8080"]
 }
 
 func TestValidateNetworkConstraints(t *testing.T) {
-	baseRegistry := "[users.u1]\nuid = 2001\n[users.u2]\nuid = 2002\n"
+	baseRegistry := "[users.u1]\nuid = 2001\n[users.u2]\nuid = 2002\n[users.longuid]\nuid = 123456789012\nsubuid_start = 3000000\n"
 
 	cases := []struct {
 		name      string
@@ -494,7 +512,7 @@ user = "u1"
 			wantErr: "shared.container",
 		},
 		{
-			name: "rejects invalid macvlan_mode and out-of-range VLAN",
+			name: "rejects out-of-range VLAN",
 			setupRepo: func(t *testing.T, r *testRepo) {
 				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
 				r.writeFile(t, "hosts/node.toml", `
@@ -504,11 +522,98 @@ user = "u1"
 [component.network]
 vlan = 4095
 mac = "02:51:4d:00:07:d1"
-macvlan_mode = "vepa"
+macvlan_mode = "private"
 dns = ["10.0.30.1"]
 `)
 			},
 			wantErr: "VLAN",
+		},
+		{
+			name: "rejects invalid macvlan_mode",
+			setupRepo: func(t *testing.T, r *testRepo) {
+				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
+				r.writeFile(t, "hosts/node.toml", `
+[[component]]
+name = "c1"
+user = "u1"
+[component.network]
+vlan = 30
+mac = "02:51:4d:00:07:d1"
+macvlan_mode = "vepa"
+dns = ["10.0.30.1"]
+`)
+			},
+			wantErr: "macvlan_mode",
+		},
+		{
+			name: "rejects qmv-<uid> exceeding 15 characters",
+			setupRepo: func(t *testing.T, r *testRepo) {
+				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
+				r.writeFile(t, "hosts/node.toml", `
+[[component]]
+name = "c1"
+user = "longuid"
+[component.network]
+vlan = 30
+mac = "02:51:4d:00:07:d1"
+dns = ["10.0.30.1"]
+`)
+			},
+			wantErr: "15 characters",
+		},
+		{
+			name: "rejects invalid tcp_ports",
+			setupRepo: func(t *testing.T, r *testRepo) {
+				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
+				r.writeFile(t, "hosts/node.toml", `
+[[component]]
+name = "c1"
+user = "u1"
+[component.network]
+vlan = 30
+mac = "02:51:4d:00:07:d1"
+dns = ["10.0.30.1"]
+tcp_ports = ["8080,9090"]
+`)
+			},
+			wantErr: "tcp_ports",
+		},
+		{
+			name: "rejects invalid udp_ports",
+			setupRepo: func(t *testing.T, r *testRepo) {
+				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
+				r.writeFile(t, "hosts/node.toml", `
+[[component]]
+name = "c1"
+user = "u1"
+[component.network]
+vlan = 30
+mac = "02:51:4d:00:07:d1"
+dns = ["10.0.30.1"]
+udp_ports = ["9000-8000"]
+`)
+			},
+			wantErr: "udp_ports",
+		},
+		{
+			name: "rejects conflicting file overrides for foo.conf and foo.conf.tmpl",
+			setupRepo: func(t *testing.T, r *testRepo) {
+				r.writeFile(t, "components/c1/component.toml", `
+[files."foo.conf"]
+mode = "0600"
+
+[files."foo.conf.tmpl"]
+mode = "0640"
+`)
+				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
+				r.writeFile(t, "components/c1/files/foo.conf.tmpl", "hello={{ .Host.Hostname }}\n")
+				r.writeFile(t, "hosts/node.toml", `
+[[component]]
+name = "c1"
+user = "u1"
+`)
+			},
+			wantErr: "conflicting file overrides",
 		},
 		{
 			name: "rejects rootless component without user or missing user in registry",
@@ -542,6 +647,28 @@ user = "nobody_in_reg"
 			}
 		})
 	}
+
+	t.Run("allows rootful network component without dns", func(t *testing.T) {
+		r := newTestRepo(t)
+		reg := r.parseRegistry(t, baseRegistry)
+		r.writeFile(t, "components/frigate/frigate.network", "[Network]\nDriver=macvlan\n")
+		r.writeFile(t, "hosts/node.toml", `
+[[component]]
+name = "frigate"
+rootful = true
+reason = "L2 mDNS"
+[component.network]
+vlan = 40
+mac = "02:51:4d:00:07:e1"
+`)
+		h, err := manifest.LoadHost(r.root, "node", reg)
+		if err != nil {
+			t.Fatalf("LoadHost failed: %v", err)
+		}
+		if err := manifest.Validate(h, r.root); err != nil {
+			t.Fatalf("expected rootful network component without dns to pass validation, got: %v", err)
+		}
+	})
 }
 
 func TestValidateRejectsPathTraversal(t *testing.T) {
@@ -549,10 +676,12 @@ func TestValidateRejectsPathTraversal(t *testing.T) {
 
 	cases := []struct {
 		name      string
+		wantErr   string
 		setupRepo func(t *testing.T, r *testRepo)
 	}{
 		{
-			name: "secret path escaping repo with dot-dot",
+			name:    "secret path escaping repo with dot-dot",
+			wantErr: "rejected",
 			setupRepo: func(t *testing.T, r *testRepo) {
 				r.writeFile(t, "components/c1/component.toml", "[secrets]\nkey = \"../outside.age\"\n")
 				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
@@ -560,7 +689,8 @@ func TestValidateRejectsPathTraversal(t *testing.T) {
 			},
 		},
 		{
-			name: "secret path using absolute path",
+			name:    "secret path using absolute path",
+			wantErr: "must be relative",
 			setupRepo: func(t *testing.T, r *testRepo) {
 				r.writeFile(t, "components/c1/component.toml", "[secrets]\nkey = \"/etc/shadow\"\n")
 				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
@@ -568,7 +698,8 @@ func TestValidateRejectsPathTraversal(t *testing.T) {
 			},
 		},
 		{
-			name: "file override escaping with ../../etc/passwd",
+			name:    "file override escaping with ../../etc/passwd",
+			wantErr: "rejected",
 			setupRepo: func(t *testing.T, r *testRepo) {
 				r.writeFile(t, "components/c1/component.toml", "[files.\"../../etc/passwd\"]\nmode = \"0600\"\n")
 				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
@@ -576,7 +707,8 @@ func TestValidateRejectsPathTraversal(t *testing.T) {
 			},
 		},
 		{
-			name: "file override with absolute path",
+			name:    "file override with absolute path",
+			wantErr: "must be relative",
 			setupRepo: func(t *testing.T, r *testRepo) {
 				r.writeFile(t, "components/c1/component.toml", "[files.\"/etc/passwd\"]\nmode = \"0600\"\n")
 				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
@@ -584,7 +716,8 @@ func TestValidateRejectsPathTraversal(t *testing.T) {
 			},
 		},
 		{
-			name: "symlink secret pointing outside repo",
+			name:    "symlink secret pointing outside repo",
+			wantErr: "escapes repo",
 			setupRepo: func(t *testing.T, r *testRepo) {
 				outside := filepath.Join(t.TempDir(), "outside.age")
 				if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
@@ -602,7 +735,8 @@ func TestValidateRejectsPathTraversal(t *testing.T) {
 			},
 		},
 		{
-			name: "symlink data file pointing outside files dir",
+			name:    "symlink data file pointing outside files dir",
+			wantErr: "escapes",
 			setupRepo: func(t *testing.T, r *testRepo) {
 				outside := filepath.Join(t.TempDir(), "passwd")
 				if err := os.WriteFile(outside, []byte("root:x:0:0"), 0o600); err != nil {
@@ -619,7 +753,25 @@ func TestValidateRejectsPathTraversal(t *testing.T) {
 			},
 		},
 		{
-			name: "missing secret file fails validation",
+			name:    "symlink quadlet file pointing outside component dir",
+			wantErr: "escapes",
+			setupRepo: func(t *testing.T, r *testRepo) {
+				outside := filepath.Join(t.TempDir(), "evil.container")
+				if err := os.WriteFile(outside, []byte("[Container]\nImage=alpine\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(filepath.Join(r.root, "components/c1"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, filepath.Join(r.root, "components/c1/c1.container")); err != nil {
+					t.Fatal(err)
+				}
+				r.writeFile(t, "hosts/node.toml", "[[component]]\nname = \"c1\"\nuser = \"u1\"\n")
+			},
+		},
+		{
+			name:    "missing secret file fails validation",
+			wantErr: "missing.age",
 			setupRepo: func(t *testing.T, r *testRepo) {
 				r.writeFile(t, "components/c1/component.toml", "[secrets]\nkey = \"secrets/missing.age\"\n")
 				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
@@ -627,13 +779,77 @@ func TestValidateRejectsPathTraversal(t *testing.T) {
 			},
 		},
 		{
-			name: "symlink component directory escaping repo fails",
+			name:    "symlink hosts directory escaping repo fails",
+			wantErr: "escapes repo root",
+			setupRepo: func(t *testing.T, r *testRepo) {
+				outsideHosts := t.TempDir()
+				if err := os.WriteFile(filepath.Join(outsideHosts, "node.toml"), []byte("[[component]]\nname = \"c1\"\nuser = \"u1\"\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outsideHosts, filepath.Join(r.root, "hosts")); err != nil {
+					t.Fatal(err)
+				}
+				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
+			},
+		},
+		{
+			name:    "symlink host manifest file escaping repo fails",
+			wantErr: "escapes repo root",
+			setupRepo: func(t *testing.T, r *testRepo) {
+				outsideHost := filepath.Join(t.TempDir(), "node.toml")
+				if err := os.WriteFile(outsideHost, []byte("[[component]]\nname = \"c1\"\nuser = \"u1\"\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(filepath.Join(r.root, "hosts"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outsideHost, filepath.Join(r.root, "hosts/node.toml")); err != nil {
+					t.Fatal(err)
+				}
+				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
+			},
+		},
+		{
+			name:    "symlink components directory escaping repo fails",
+			wantErr: "escapes repo root",
+			setupRepo: func(t *testing.T, r *testRepo) {
+				outsideComps := t.TempDir()
+				if err := os.MkdirAll(filepath.Join(outsideComps, "c1"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(outsideComps, "c1/c1.container"), []byte("[Container]\nImage=alpine\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outsideComps, filepath.Join(r.root, "components")); err != nil {
+					t.Fatal(err)
+				}
+				r.writeFile(t, "hosts/node.toml", "[[component]]\nname = \"c1\"\nuser = \"u1\"\n")
+			},
+		},
+		{
+			name:    "symlink component directory escaping repo fails",
+			wantErr: "escapes repo root",
 			setupRepo: func(t *testing.T, r *testRepo) {
 				outsideComp := t.TempDir()
 				if err := os.MkdirAll(filepath.Join(r.root, "components"), 0o755); err != nil {
 					t.Fatal(err)
 				}
 				if err := os.Symlink(outsideComp, filepath.Join(r.root, "components/c1")); err != nil {
+					t.Fatal(err)
+				}
+				r.writeFile(t, "hosts/node.toml", "[[component]]\nname = \"c1\"\nuser = \"u1\"\n")
+			},
+		},
+		{
+			name:    "symlink component.toml escaping repo fails",
+			wantErr: "escapes repo root",
+			setupRepo: func(t *testing.T, r *testRepo) {
+				outsideTOML := filepath.Join(t.TempDir(), "component.toml")
+				if err := os.WriteFile(outsideTOML, []byte("[ports]\nhttp = 8080\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
+				if err := os.Symlink(outsideTOML, filepath.Join(r.root, "components/c1/component.toml")); err != nil {
 					t.Fatal(err)
 				}
 				r.writeFile(t, "hosts/node.toml", "[[component]]\nname = \"c1\"\nuser = \"u1\"\n")
@@ -647,16 +863,55 @@ func TestValidateRejectsPathTraversal(t *testing.T) {
 			reg := r.parseRegistry(t, regData)
 			tc.setupRepo(t, r)
 			h, err := manifest.LoadHost(r.root, "node", reg)
-			if err != nil {
-				// LoadHost may succeed and let Validate fail, or reject component traversal early.
-				// Ensure Validate rejects it if LoadHost loaded it.
-				return
+			if err == nil {
+				err = manifest.Validate(h, r.root)
 			}
-			if err := manifest.Validate(h, r.root); err == nil {
-				t.Fatalf("expected Validate to fail for %s", tc.name)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErr)
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tc.wantErr)) {
+				t.Fatalf("expected error containing %q, got: %v", tc.wantErr, err)
 			}
 		})
 	}
+
+	t.Run("Validate directly rejects escaping components symlink even without LoadHost", func(t *testing.T) {
+		r := newTestRepo(t)
+		reg := r.parseRegistry(t, regData)
+		outsideComps := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(outsideComps, "c1"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		outsideQuadlet := filepath.Join(outsideComps, "c1/c1.container")
+		if err := os.WriteFile(outsideQuadlet, []byte("[Container]\nImage=alpine\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideComps, filepath.Join(r.root, "components")); err != nil {
+			t.Fatal(err)
+		}
+		synthetic := &manifest.ResolvedHost{
+			Hostname: "node",
+			Registry: reg,
+			Components: []manifest.ResolvedComponent{
+				{
+					Name: "c1",
+					User: "u1",
+					UID:  2001,
+					QuadletFiles: []manifest.SourceFile{
+						{
+							RelPath:       "c1.container",
+							SourceRelPath: "c1.container",
+							SourceAbsPath: filepath.Join(r.root, "components/c1/c1.container"),
+						},
+					},
+				},
+			},
+		}
+		err := manifest.Validate(synthetic, r.root)
+		if err == nil || !strings.Contains(strings.ToLower(err.Error()), "escapes repo root") {
+			t.Fatalf("expected Validate to reject escaping components symlink, got: %v", err)
+		}
+	})
 }
 
 func TestRenderTemplatesAndPastaArgs(t *testing.T) {

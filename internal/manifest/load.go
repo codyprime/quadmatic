@@ -137,13 +137,18 @@ func LoadHost(repoDir, hostname string, reg *users.Registry) (*ResolvedHost, err
 	}
 
 	hostsDir := filepath.Join(repoDir, "hosts")
+	if _, err := os.Lstat(hostsDir); err == nil {
+		if err := ensureRealContainment(repoDir, hostsDir); err != nil {
+			return nil, fmt.Errorf("hosts directory escapes repo root: %w", err)
+		}
+	}
 	hostPath := filepath.Join(hostsDir, hostname+".toml")
 	if err := ensureSubPath(hostsDir, hostPath); err != nil {
 		return nil, fmt.Errorf("invalid host path %q: %w", hostname, err)
 	}
 	if _, err := os.Lstat(hostPath); err == nil {
-		if err := ensureRealContainment(hostsDir, hostPath); err != nil {
-			return nil, fmt.Errorf("host manifest %q escapes hosts directory: %w", hostPath, err)
+		if err := ensureRepoAndParentContainment(repoDir, hostsDir, hostPath, fmt.Sprintf("host manifest %q", hostPath)); err != nil {
+			return nil, err
 		}
 	}
 
@@ -168,8 +173,15 @@ func LoadHost(repoDir, hostname string, reg *users.Registry) (*ResolvedHost, err
 	}
 
 	componentsDir := filepath.Join(repoDir, "components")
+	if len(rawHost.Components) > 0 {
+		if _, err := os.Lstat(componentsDir); err == nil {
+			if err := ensureRealContainment(repoDir, componentsDir); err != nil {
+				return nil, fmt.Errorf("components directory escapes repo root: %w", err)
+			}
+		}
+	}
 	for _, hc := range rawHost.Components {
-		comp, err := loadComponent(componentsDir, hc, reg)
+		comp, err := loadComponent(repoDir, componentsDir, hc, reg)
 		if err != nil {
 			return nil, err
 		}
@@ -179,7 +191,7 @@ func LoadHost(repoDir, hostname string, reg *users.Registry) (*ResolvedHost, err
 	return resolved, nil
 }
 
-func loadComponent(componentsDir string, hc rawHostComponent, reg *users.Registry) (ResolvedComponent, error) {
+func loadComponent(repoDir, componentsDir string, hc rawHostComponent, reg *users.Registry) (ResolvedComponent, error) {
 	if err := validateSimpleName("component name", hc.Name); err != nil {
 		return ResolvedComponent{}, err
 	}
@@ -189,8 +201,8 @@ func loadComponent(componentsDir string, hc rawHostComponent, reg *users.Registr
 		return ResolvedComponent{}, fmt.Errorf("invalid component directory %q: %w", hc.Name, err)
 	}
 	if _, err := os.Lstat(compDir); err == nil {
-		if err := ensureRealContainment(componentsDir, compDir); err != nil {
-			return ResolvedComponent{}, fmt.Errorf("component directory %q escapes components directory: %w", hc.Name, err)
+		if err := ensureRepoAndParentContainment(repoDir, componentsDir, compDir, fmt.Sprintf("component directory %q", hc.Name)); err != nil {
+			return ResolvedComponent{}, err
 		}
 	}
 	info, err := os.Stat(compDir)
@@ -203,14 +215,26 @@ func loadComponent(componentsDir string, hc rawHostComponent, reg *users.Registr
 
 	var rawComp rawComponentManifest
 	compTOMLPath := filepath.Join(compDir, "component.toml")
-	compBytes, err := os.ReadFile(compTOMLPath)
-	if err != nil && !os.IsNotExist(err) {
-		return ResolvedComponent{}, fmt.Errorf("read component manifest %q: %w", compTOMLPath, err)
-	}
-	if err == nil {
+	if _, lerr := os.Lstat(compTOMLPath); lerr == nil {
+		if err := ensureRepoAndParentContainment(repoDir, compDir, compTOMLPath, fmt.Sprintf("component %q manifest", hc.Name)); err != nil {
+			return ResolvedComponent{}, err
+		}
+		tinfo, err := os.Stat(compTOMLPath)
+		if err != nil {
+			return ResolvedComponent{}, fmt.Errorf("stat component manifest %q: %w", compTOMLPath, err)
+		}
+		if !tinfo.Mode().IsRegular() {
+			return ResolvedComponent{}, fmt.Errorf("component manifest %q is not a regular file", compTOMLPath)
+		}
+		compBytes, err := os.ReadFile(compTOMLPath)
+		if err != nil {
+			return ResolvedComponent{}, fmt.Errorf("read component manifest %q: %w", compTOMLPath, err)
+		}
 		if err := decodeStrictTOML(compBytes, &rawComp, fmt.Sprintf("component %q manifest", hc.Name)); err != nil {
 			return ResolvedComponent{}, err
 		}
+	} else if !os.IsNotExist(lerr) {
+		return ResolvedComponent{}, fmt.Errorf("lstat component manifest %q: %w", compTOMLPath, lerr)
 	}
 
 	vars := mergeAnyMaps(rawComp.Vars, hc.Vars)
@@ -234,11 +258,11 @@ func loadComponent(componentsDir string, hc rawHostComponent, reg *users.Registr
 		overrides[k] = FileOverride{Mode: mode}
 	}
 
-	quadlets, err := collectQuadletFiles(compDir)
+	quadlets, err := collectQuadletFiles(repoDir, compDir)
 	if err != nil {
 		return ResolvedComponent{}, fmt.Errorf("collect quadlets for component %q: %w", hc.Name, err)
 	}
-	dataFiles, err := collectDataFiles(compDir)
+	dataFiles, err := collectDataFiles(repoDir, compDir)
 	if err != nil {
 		return ResolvedComponent{}, fmt.Errorf("collect data files for component %q: %w", hc.Name, err)
 	}
@@ -409,7 +433,7 @@ func applyRawNetwork(dst *NetworkSpec, src *rawNetworkSpec) {
 	}
 }
 
-func collectQuadletFiles(compDir string) ([]SourceFile, error) {
+func collectQuadletFiles(repoDir, compDir string) ([]SourceFile, error) {
 	entries, err := os.ReadDir(compDir)
 	if err != nil {
 		return nil, err
@@ -425,7 +449,7 @@ func collectQuadletFiles(compDir string) ([]SourceFile, error) {
 			continue
 		}
 		absPath := filepath.Join(compDir, name)
-		content, err := readContainedFile(compDir, absPath, entry.Type()&os.ModeSymlink != 0)
+		content, err := readContainedFile(repoDir, compDir, absPath, entry.Type()&os.ModeSymlink != 0)
 		if err != nil {
 			return nil, fmt.Errorf("read quadlet %q: %w", name, err)
 		}
@@ -441,7 +465,7 @@ func collectQuadletFiles(compDir string) ([]SourceFile, error) {
 	return out, nil
 }
 
-func collectDataFiles(compDir string) ([]SourceFile, error) {
+func collectDataFiles(repoDir, compDir string) ([]SourceFile, error) {
 	filesDir := filepath.Join(compDir, "files")
 	info, err := os.Lstat(filesDir)
 	if os.IsNotExist(err) {
@@ -452,6 +476,9 @@ func collectDataFiles(compDir string) ([]SourceFile, error) {
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return nil, fmt.Errorf("files path %q must be a real directory", filesDir)
+	}
+	if err := ensureRealContainment(repoDir, filesDir); err != nil {
+		return nil, fmt.Errorf("files directory %q escapes repo root: %w", filesDir, err)
 	}
 
 	var out []SourceFile
@@ -472,7 +499,7 @@ func collectDataFiles(compDir string) ([]SourceFile, error) {
 		if isTmpl {
 			renderedRel = strings.TrimSuffix(slashRel, ".tmpl")
 		}
-		content, err := readContainedFile(filesDir, p, d.Type()&os.ModeSymlink != 0)
+		content, err := readContainedFile(repoDir, filesDir, p, d.Type()&os.ModeSymlink != 0)
 		if err != nil {
 			return fmt.Errorf("read data file %q: %w", slashRel, err)
 		}
@@ -492,10 +519,13 @@ func collectDataFiles(compDir string) ([]SourceFile, error) {
 	return out, nil
 }
 
-// readContainedFile avoids reading outside baseDir if a symlink escapes; escaping symlinks
-// return nil content here so Validate can reject them with a path-traversal error.
-func readContainedFile(baseDir, filePath string, isSymlink bool) ([]byte, error) {
+// readContainedFile avoids reading outside repoDir/baseDir if a symlink escapes; escaping
+// symlinks return nil content here so Validate can reject them with a path-traversal error.
+func readContainedFile(repoDir, baseDir, filePath string, isSymlink bool) ([]byte, error) {
 	if isSymlink {
+		if err := ensureRealContainment(repoDir, filePath); err != nil {
+			return nil, nil
+		}
 		if err := ensureRealContainment(baseDir, filePath); err != nil {
 			return nil, nil
 		}
