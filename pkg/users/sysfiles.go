@@ -56,6 +56,27 @@ func readPasswd(path string) ([]PasswdEntry, error) {
 	return ParsePasswd(data)
 }
 
+// LookupPrimaryGID reads passwdPath (defaulting to /etc/passwd when empty) using ParsePasswd
+// and returns the primary GID for username.
+func LookupPrimaryGID(passwdPath, username string) (int, bool, error) {
+	if passwdPath == "" {
+		passwdPath = defaultPasswdPath
+	}
+	if username == "" {
+		return 0, false, nil
+	}
+	entries, err := readPasswd(passwdPath)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, e := range entries {
+		if e.Name == username {
+			return e.GID, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
 // ParseSubID parses /etc/subuid or /etc/subgid formatted bytes into SubIDEntry records.
 func ParseSubID(data []byte) ([]SubIDEntry, error) {
 	lines, err := parseSubIDLines(data)

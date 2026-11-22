@@ -438,3 +438,56 @@ func sortedMapKeys(m map[string]GeneratedUnit) []string {
 	slices.Sort(keys)
 	return keys
 }
+
+func TestSourceCandidates(t *testing.T) {
+	cases := []struct {
+		unit string
+		want []string
+	}{
+		{unit: "app.service", want: []string{"app.container", "app.kube"}},
+		{unit: "app-volume.service", want: []string{"app.volume"}},
+		{unit: "app-network.service", want: []string{"app.network"}},
+		{unit: "app-pod.service", want: []string{"app.pod"}},
+		{unit: "app-image.service", want: []string{"app.image"}},
+		{unit: "app-kube.service", want: []string{"app.kube"}},
+		{unit: "app-build.service", want: []string{"app.build"}},
+		{unit: "app.timer", want: nil},
+		{unit: "", want: nil},
+	}
+	for _, tc := range cases {
+		got := SourceCandidates(tc.unit)
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("SourceCandidates(%q) = %v, want %v", tc.unit, got, tc.want)
+		}
+	}
+
+	// Verify ValidateHost resolves secrets via the .kube fallback when SourcePath= is omitted.
+	host := &manifest.RenderedHost{
+		Hostname: "services-02",
+		Components: []manifest.RenderedComponent{
+			{
+				Name:    "kapp",
+				Rootful: true,
+				Files: []manifest.RenderedFile{
+					{
+						RelPath: "kapp.kube",
+						Kind:    manifest.FileKindQuadlet,
+						Content: []byte("[Kube]\nYaml=kapp.yaml\nSecret=kube_secret,type=env,target=KUBE_SEC\n"),
+					},
+				},
+			},
+		},
+	}
+	runner := &fakeCommandRunner{
+		fn: func(_ context.Context, _ []string, _ string, _ ...string) ([]byte, []byte, error) {
+			return []byte("---kapp.service---\n[Service]\nExecStart=/usr/bin/podman kube play kapp.yaml\n"), nil, nil
+		},
+	}
+	units, err := NewValidator("/custom/quadlet", runner).ValidateHost(context.Background(), host)
+	if err != nil {
+		t.Fatalf("ValidateHost(.kube fallback) failed: %v", err)
+	}
+	if got := units["rootful/kapp.service"].SecretRefs; !reflect.DeepEqual(got, []string{"kube_secret"}) {
+		t.Fatalf("kapp.service SecretRefs = %v, want [kube_secret]", got)
+	}
+}

@@ -3,7 +3,6 @@ package quadlet
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"quadmatic/internal/hashutil"
 	"quadmatic/internal/manifest"
 )
 
@@ -216,7 +216,7 @@ func ParseDryRunOutput(scope string, stdout []byte) map[string]GeneratedUnit {
 			Scope:      scope,
 			UnitName:   currentUnit,
 			Content:    content,
-			SHA256:     sha256Hex([]byte(content)),
+			SHA256:     hashutil.SHA256Hex([]byte(content)),
 			SecretRefs: extractSecretsFromGenerated(content),
 		}
 	}
@@ -278,7 +278,7 @@ func resolveSourceQuadlet(unit GeneratedUnit, files map[string][]byte) (string, 
 
 	// Fallback to standard quadlet unit-to-source naming conventions when SourcePath=
 	// is absent (for example in minimal synthetic unit tests).
-	candidates := quadletSourceCandidates(unit.UnitName)
+	candidates := SourceCandidates(unit.UnitName)
 	for _, cand := range candidates {
 		if _, ok := files[cand]; ok {
 			return cand, true
@@ -287,7 +287,10 @@ func resolveSourceQuadlet(unit GeneratedUnit, files map[string][]byte) (string, 
 	return "", false
 }
 
-func quadletSourceCandidates(unitName string) []string {
+// SourceCandidates returns candidate quadlet source filenames (e.g. .container, .kube,
+// or suffix-mapped .volume/.network/.pod/.image/.kube/.build) for a generated systemd
+// service unitName.
+func SourceCandidates(unitName string) []string {
 	if !strings.HasSuffix(unitName, ".service") {
 		return nil
 	}
@@ -308,7 +311,7 @@ func quadletSourceCandidates(unitName string) []string {
 			return []string{strings.TrimSuffix(stem, m.unitSuffix) + m.ext}
 		}
 	}
-	return []string{stem + ".container"}
+	return []string{stem + ".container", stem + ".kube"}
 }
 
 func extractSecretsFromQuadlet(content []byte) []string {
@@ -403,9 +406,4 @@ func withEnv(base []string, key, value string) []string {
 	}
 	out = append(out, prefix+value)
 	return out
-}
-
-func sha256Hex(data []byte) string {
-	sum := sha256.Sum256(data)
-	return fmt.Sprintf("%x", sum)
 }

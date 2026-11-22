@@ -162,6 +162,68 @@ uid = 2002
 			t.Fatalf("expected UID 2002, got %d", reg.Users["caddy"].UID)
 		}
 	})
+
+	t.Run("enforces uint32 upper bound on UID and computed subid range", func(t *testing.T) {
+		// uid = 70000 with default subid config yields start = 4,457,448,000 > math.MaxUint32.
+		if _, err := users.ParseRegistry([]byte("[users.highuid]\nuid = 70000\n")); err == nil {
+			t.Fatal("expected error when computed subid range for uid=70000 exceeds uint32 max")
+		}
+
+		// uid > math.MaxUint32 must fail even with an explicit small subuid override.
+		if _, err := users.ParseRegistry([]byte("[users.overuid]\nuid = 4294967296\nsubuid_start = 100000\nsubuid_count = 65536\n")); err == nil {
+			t.Fatal("expected error when uid exceeds uint32 max")
+		}
+
+		// Explicit subid range whose end (start + count - 1) exceeds math.MaxUint32 must fail.
+		if _, err := users.ParseRegistry([]byte("[users.edgeover]\nuid = 2001\nsubuid_start = 4294901761\nsubuid_count = 65536\n")); err == nil {
+			t.Fatal("expected error when subuid_start + subuid_count - 1 exceeds uint32 max")
+		}
+
+		// Multiplication overflow in (uid - uid_base) * count must fail cleanly instead of wrapping.
+		if _, err := users.ParseRegistry([]byte("[subid]\nbase = 1000000\ncount = 1000000000000\n[users.wrap]\nuid = 1000000000\n")); err == nil {
+			t.Fatal("expected error on subid range multiplication overflow")
+		}
+
+		// Exact boundary: start + count - 1 == math.MaxUint32 and uid == math.MaxUint32 succeed.
+		reg, err := users.ParseRegistry([]byte("[users.maxedge]\nuid = 4294967295\nsubuid_start = 4294901760\nsubuid_count = 65536\n"))
+		if err != nil {
+			t.Fatalf("expected exact uint32 boundary to succeed, got: %v", err)
+		}
+		if reg.Users["maxedge"].UID != 4294967295 {
+			t.Fatalf("unexpected UID: %d", reg.Users["maxedge"].UID)
+		}
+	})
+}
+
+func TestLookupPrimaryGID(t *testing.T) {
+	dir := t.TempDir()
+	passwdPath := filepath.Join(dir, "passwd")
+	mustWriteFile(t, passwdPath, strings.Join([]string{
+		"# comment",
+		"core:x:1000:1000:CoreOS:/var/home/core:/bin/bash",
+		"openwebui:x:2001:3000:adopted user:/var/home/openwebui:/usr/sbin/nologin",
+		"",
+	}, "\n"))
+
+	gid, found, err := users.LookupPrimaryGID(passwdPath, "openwebui")
+	if err != nil {
+		t.Fatalf("LookupPrimaryGID existing user failed: %v", err)
+	}
+	if !found || gid != 3000 {
+		t.Fatalf("LookupPrimaryGID(openwebui) = (%d, %v), want (3000, true)", gid, found)
+	}
+
+	gid, found, err = users.LookupPrimaryGID(passwdPath, "missing")
+	if err != nil {
+		t.Fatalf("LookupPrimaryGID missing user failed: %v", err)
+	}
+	if found || gid != 0 {
+		t.Fatalf("LookupPrimaryGID(missing) = (%d, %v), want (0, false)", gid, found)
+	}
+
+	if _, _, err := users.LookupPrimaryGID(filepath.Join(dir, "nope"), "openwebui"); err == nil {
+		t.Fatal("expected error for missing passwd file")
+	}
 }
 
 func TestPlanRejectsExistingSubIDOverlap(t *testing.T) {
