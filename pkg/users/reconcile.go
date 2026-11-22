@@ -117,6 +117,8 @@ func (r *Reconciler) Plan(ctx context.Context, reg *Registry, activeUsers []stri
 		return nil, err
 	}
 
+	nonActiveSubUID := filterOutUsers(subuidEntries, activeSet)
+	nonActiveSubGID := filterOutUsers(subgidEntries, activeSet)
 	plannedTargets := make([]SubIDEntry, 0, len(sortedActive))
 
 	for _, name := range sortedActive {
@@ -124,10 +126,10 @@ func (r *Reconciler) Plan(ctx context.Context, reg *Registry, activeUsers []stri
 		targetStart, targetCount := SubIDRange(spec.UID, spec, reg.SubID)
 		targetSubID := SubIDEntry{Name: name, Start: targetStart, Count: targetCount}
 
-		if err := CheckSubIDOverlap(subuidEntries, targetSubID); err != nil {
+		if err := CheckSubIDOverlap(nonActiveSubUID, targetSubID); err != nil {
 			return nil, fmt.Errorf("subuid validation for %q: %w", name, err)
 		}
-		if err := CheckSubIDOverlap(subgidEntries, targetSubID); err != nil {
+		if err := CheckSubIDOverlap(nonActiveSubGID, targetSubID); err != nil {
 			return nil, fmt.Errorf("subgid validation for %q: %w", name, err)
 		}
 		if err := CheckSubIDOverlap(plannedTargets, targetSubID); err != nil {
@@ -362,6 +364,16 @@ func (r *Reconciler) waitForBus(ctx context.Context, user, busPath string) error
 
 func isNoLoginShell(shell string) bool {
 	return shell == "/usr/sbin/nologin" || shell == "/sbin/nologin"
+}
+
+func filterOutUsers(entries []SubIDEntry, excluded map[string]bool) []SubIDEntry {
+	out := make([]SubIDEntry, 0, len(entries))
+	for _, e := range entries {
+		if !excluded[e.Name] {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func dedupAndSort(items []string) []string {

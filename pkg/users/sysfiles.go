@@ -168,21 +168,30 @@ func applySubIDUpdatesAtomic(path string, updates []SubIDEntry) error {
 		return fmt.Errorf("parse subid file %q: %w", path, err)
 	}
 
-	existingEntries := make([]SubIDEntry, 0, len(lines))
-	for _, l := range lines {
-		if l.entry != nil {
-			existingEntries = append(existingEntries, *l.entry)
-		}
-	}
-	for _, upd := range updates {
-		if err := CheckSubIDOverlap(existingEntries, upd); err != nil {
-			return err
-		}
-	}
-
 	updateMap := make(map[string]SubIDEntry, len(updates))
 	for _, upd := range updates {
 		updateMap[upd.Name] = upd
+	}
+
+	preservedEntries := make([]SubIDEntry, 0, len(lines))
+	for _, l := range lines {
+		if l.entry == nil {
+			continue
+		}
+		if _, isUpdated := updateMap[l.entry.Name]; !isUpdated {
+			preservedEntries = append(preservedEntries, *l.entry)
+		}
+	}
+
+	checkedUpdates := make([]SubIDEntry, 0, len(updates))
+	for _, upd := range updates {
+		if err := CheckSubIDOverlap(preservedEntries, upd); err != nil {
+			return err
+		}
+		if err := CheckSubIDOverlap(checkedUpdates, upd); err != nil {
+			return err
+		}
+		checkedUpdates = append(checkedUpdates, upd)
 	}
 
 	written := make(map[string]bool, len(updates))

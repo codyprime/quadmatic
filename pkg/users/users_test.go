@@ -687,6 +687,129 @@ func TestApplyReplacesUseraddAutoSubID(t *testing.T) {
 	}
 }
 
+func TestApplyBatchSubIDUpdateIgnoresPreUpdateEntriesOfUpdatedUsers(t *testing.T) {
+	t.Run("two new users where useradd auto-allocates colliding range", func(t *testing.T) {
+		dir := t.TempDir()
+		passwdPath := filepath.Join(dir, "passwd")
+		subuidPath := filepath.Join(dir, "subuid")
+		subgidPath := filepath.Join(dir, "subgid")
+		lingerDir := filepath.Join(dir, "linger")
+		runUserDir := filepath.Join(dir, "run_user")
+
+		mustMkdirAll(t, lingerDir)
+		mustMkdirAll(t, filepath.Join(runUserDir, "2001"))
+		mustMkdirAll(t, filepath.Join(runUserDir, "2002"))
+		mustWriteFile(t, filepath.Join(runUserDir, "2001", "bus"), "")
+		mustWriteFile(t, filepath.Join(runUserDir, "2002", "bus"), "")
+		mustWriteFile(t, passwdPath, "core:x:1000:1000::/var/home/core:/bin/bash\n")
+		mustWriteFile(t, subuidPath, "core:100000:65536\n")
+		mustWriteFile(t, subgidPath, "core:100000:65536\n")
+
+		reg, err := users.ParseRegistry([]byte(`
+[users.alpha]
+uid = 2001
+
+[users.beta]
+uid = 2002
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		runner := &fakeRunner{
+			hook: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				if name == "useradd" {
+					user := args[len(args)-1]
+					if user == "alpha" {
+						// Auto-allocated range collides with beta's target range (1131072:65536).
+						for _, p := range []string{subuidPath, subgidPath} {
+							f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0o644)
+							if err != nil {
+								return nil, err
+							}
+							_, _ = f.WriteString("alpha:1131072:65536\n")
+							_ = f.Close()
+						}
+					}
+				}
+				return nil, nil
+			},
+		}
+
+		rec := users.NewReconciler(users.Options{
+			PasswdPath: passwdPath,
+			SubUIDPath: subuidPath,
+			SubGIDPath: subgidPath,
+			LingerDir:  lingerDir,
+			RunUserDir: runUserDir,
+			HomeBase:   filepath.Join(dir, "home"),
+			BusTimeout: 200 * time.Millisecond,
+			Runner:     runner,
+		})
+
+		if _, err := rec.Apply(context.Background(), reg, []string{"alpha", "beta"}, nil); err != nil {
+			t.Fatalf("Apply failed on batch update: %v", err)
+		}
+
+		want := "core:100000:65536\nalpha:1065536:65536\nbeta:1131072:65536\n"
+		if got := mustReadFile(t, subuidPath); got != want {
+			t.Fatalf("subuid mismatch:\ngot:\n%s\nwant:\n%s", got, want)
+		}
+		if got := mustReadFile(t, subgidPath); got != want {
+			t.Fatalf("subgid mismatch:\ngot:\n%s\nwant:\n%s", got, want)
+		}
+	})
+
+	t.Run("two adopted users shifting into each others prior ranges", func(t *testing.T) {
+		dir := t.TempDir()
+		passwdPath := filepath.Join(dir, "passwd")
+		subuidPath := filepath.Join(dir, "subuid")
+		subgidPath := filepath.Join(dir, "subgid")
+		lingerDir := filepath.Join(dir, "linger")
+
+		mustMkdirAll(t, lingerDir)
+		mustWriteFile(t, filepath.Join(lingerDir, "alpha"), "")
+		mustWriteFile(t, filepath.Join(lingerDir, "beta"), "")
+		mustWriteFile(t, passwdPath, "alpha:x:2001:2001::/var/home/alpha:/usr/sbin/nologin\nbeta:x:2002:2002::/var/home/beta:/usr/sbin/nologin\n")
+		mustWriteFile(t, subuidPath, "alpha:1131072:65536\nbeta:1065536:65536\n")
+		mustWriteFile(t, subgidPath, "alpha:1131072:65536\nbeta:1065536:65536\n")
+
+		reg, err := users.ParseRegistry([]byte(`
+[users.alpha]
+uid = 2001
+
+[users.beta]
+uid = 2002
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		rec := users.NewReconciler(users.Options{
+			PasswdPath: passwdPath,
+			SubUIDPath: subuidPath,
+			SubGIDPath: subgidPath,
+			LingerDir:  lingerDir,
+			RunUserDir: filepath.Join(dir, "run_user"),
+			HomeBase:   filepath.Join(dir, "home"),
+			BusTimeout: 200 * time.Millisecond,
+			Runner:     &fakeRunner{},
+		})
+
+		if _, err := rec.Apply(context.Background(), reg, []string{"alpha", "beta"}, nil); err != nil {
+			t.Fatalf("Apply failed on swapped adopted ranges: %v", err)
+		}
+
+		want := "alpha:1065536:65536\nbeta:1131072:65536\n"
+		if got := mustReadFile(t, subuidPath); got != want {
+			t.Fatalf("subuid mismatch:\ngot:\n%s\nwant:\n%s", got, want)
+		}
+		if got := mustReadFile(t, subgidPath); got != want {
+			t.Fatalf("subgid mismatch:\ngot:\n%s\nwant:\n%s", got, want)
+		}
+	})
+}
+
 func mustWriteFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
