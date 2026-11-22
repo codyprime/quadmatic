@@ -79,10 +79,83 @@ func BuildSSHCommand(sshKey, knownHosts string) string {
 // break-glass allowNonFF (or cfg.AllowNonFF) is enabled, and returns the verified commit SHA.
 // Signature verification is never bypassed by allowNonFF.
 func (c *Client) FetchAndVerify(ctx context.Context, appliedSHA string, allowNonFF bool) (string, error) {
+	branch, err := c.validateFetchConfig(appliedSHA, true)
+	if err != nil {
+		return "", err
+	}
+
+	repoDir := c.cfg.RepoDir
+	if err := ensureBareRepo(ctx, repoDir, branch); err != nil {
+		return "", err
+	}
+
+	newSHA, err := c.fetchAndVerifyInto(ctx, repoDir, branch, appliedSHA, allowNonFF, true)
+	if err != nil {
+		return "", err
+	}
+	c.setActiveRepo(repoDir)
+	return newSHA, nil
+}
+
+// FetchAndVerifyDryRun performs a remote SSH fetch and verification inside an ephemeral
+// temporary bare repository so cfg.RepoDir and its refs are never mutated during --dry-run.
+// When cfg.RepoDir already contains a valid git repository, its object/ref history is seeded
+// read-only via `git clone --bare --local` so fast-forward checks against appliedSHA still work.
+// Callers must invoke cleanup() after ExportCommit completes.
+func (c *Client) FetchAndVerifyDryRun(ctx context.Context, appliedSHA string, allowNonFF bool) (newSHA string, cleanup func(), err error) {
+	branch, err := c.validateFetchConfig(appliedSHA, false)
+	if err != nil {
+		return "", nil, err
+	}
+
+	tmpRepo, err := os.MkdirTemp("", "quadmatic-dryrun-repo-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("create dry-run temp repo: %w", err)
+	}
+	cleanupTmp := func() {
+		_ = os.RemoveAll(tmpRepo)
+	}
+
+	seeded := false
+	if strings.TrimSpace(c.cfg.RepoDir) != "" {
+		if info, statErr := os.Stat(c.cfg.RepoDir); statErr == nil && info.IsDir() {
+			if _, revErr := runGit(ctx, c.cfg.RepoDir, nil, "rev-parse", "--git-dir"); revErr == nil {
+				if _, cloneErr := runGit(ctx, "", nil, "clone", "--bare", "--local", "--", c.cfg.RepoDir, tmpRepo); cloneErr != nil {
+					cleanupTmp()
+					return "", nil, fmt.Errorf("seed dry-run repo from %q: %w", c.cfg.RepoDir, cloneErr)
+				}
+				seeded = true
+			}
+		}
+	}
+	if !seeded {
+		if err := ensureBareRepo(ctx, tmpRepo, branch); err != nil {
+			cleanupTmp()
+			return "", nil, err
+		}
+	}
+
+	newSHA, err = c.fetchAndVerifyInto(ctx, tmpRepo, branch, appliedSHA, allowNonFF, false)
+	if err != nil {
+		cleanupTmp()
+		return "", nil, err
+	}
+
+	prevActive := c.activeRepo()
+	c.setActiveRepo(tmpRepo)
+	return newSHA, func() {
+		if c.activeRepo() == tmpRepo {
+			c.setActiveRepo(prevActive)
+		}
+		_ = os.RemoveAll(tmpRepo)
+	}, nil
+}
+
+func (c *Client) validateFetchConfig(appliedSHA string, requireRepoDir bool) (string, error) {
 	if c == nil || c.cfg == nil {
 		return "", errors.New("host config must not be nil")
 	}
-	if err := validateNoControlOrLeadingDash("repo_url", c.cfg.RepoURL); err != nil {
+	if err := validateRepoURL(c.cfg.RepoURL); err != nil {
 		return "", err
 	}
 	branch := c.cfg.Branch
@@ -92,8 +165,10 @@ func (c *Client) FetchAndVerify(ctx context.Context, appliedSHA string, allowNon
 	if err := validateGitRefArg("branch", branch); err != nil {
 		return "", err
 	}
-	if err := validatePathArg("repo_dir", c.cfg.RepoDir); err != nil {
-		return "", err
+	if requireRepoDir || strings.TrimSpace(c.cfg.RepoDir) != "" {
+		if err := validatePathArg("repo_dir", c.cfg.RepoDir); err != nil {
+			return "", err
+		}
 	}
 	if err := validatePathArg("ssh_key", c.cfg.SSHKey); err != nil {
 		return "", err
@@ -109,12 +184,10 @@ func (c *Client) FetchAndVerify(ctx context.Context, appliedSHA string, allowNon
 			return "", err
 		}
 	}
+	return branch, nil
+}
 
-	repoDir := c.cfg.RepoDir
-	if err := ensureBareRepo(ctx, repoDir, branch); err != nil {
-		return "", err
-	}
-
+func (c *Client) fetchAndVerifyInto(ctx context.Context, repoDir, branch, appliedSHA string, allowNonFF, updateLocalBranch bool) (string, error) {
 	// Fetch with '+' into a remote tracking ref so force-pushed tips can still
 	// be retrieved and explicitly evaluated by signature and fast-forward checks
 	// without mutating refs/heads/<branch> beforehand.
@@ -122,7 +195,11 @@ func (c *Client) FetchAndVerify(ctx context.Context, appliedSHA string, allowNon
 	refspec := "+refs/heads/" + branch + ":" + remoteRef
 	sshCmd := BuildSSHCommand(c.cfg.SSHKey, c.cfg.SSHKnownHosts)
 
-	if _, err := runGit(ctx, repoDir, []string{"GIT_SSH_COMMAND=" + sshCmd}, "fetch", "--no-tags", "--", c.cfg.RepoURL, refspec); err != nil {
+	fetchEnv := []string{
+		"GIT_SSH_COMMAND=" + sshCmd,
+		"GIT_ALLOW_PROTOCOL=ssh:file",
+	}
+	if _, err := runGit(ctx, repoDir, fetchEnv, "fetch", "--no-tags", "--", c.cfg.RepoURL, refspec); err != nil {
 		return "", fmt.Errorf("fetch branch %q from %q: %w", branch, c.cfg.RepoURL, err)
 	}
 
@@ -140,11 +217,11 @@ func (c *Client) FetchAndVerify(ctx context.Context, appliedSHA string, allowNon
 		return "", err
 	}
 
-	if _, err := runGit(ctx, repoDir, nil, "update-ref", "refs/heads/"+branch, newSHA); err != nil {
-		return "", fmt.Errorf("update local branch %q to %s: %w", branch, newSHA, err)
+	if updateLocalBranch {
+		if _, err := runGit(ctx, repoDir, nil, "update-ref", "refs/heads/"+branch, newSHA); err != nil {
+			return "", fmt.Errorf("update local branch %q to %s: %w", branch, newSHA, err)
+		}
 	}
-
-	c.setActiveRepo(repoDir)
 	return newSHA, nil
 }
 
@@ -670,6 +747,22 @@ func ensureInsideOrEqual(baseDir, targetPath string) error {
 	return nil
 }
 
+func validateRepoURL(repoURL string) error {
+	if err := validateNoControlOrLeadingDash("repo_url", repoURL); err != nil {
+		return err
+	}
+	trimmed := strings.TrimSpace(repoURL)
+	if idx := strings.Index(trimmed, "::"); idx >= 0 {
+		prefix := trimmed[:idx]
+		// Reject any <helper>:: remote-helper prefix (e.g. ext::, fd::, hg::), case-insensitive,
+		// while permitting "::" inside standard scheme:// URLs or IPv6 bracketed hosts ([...]).
+		if !strings.Contains(prefix, "://") && !strings.Contains(prefix, "/") && !(strings.HasPrefix(prefix, "[") || strings.Contains(prefix, "@[")) {
+			return fmt.Errorf("repo_url %q uses forbidden git remote-helper transport", repoURL)
+		}
+	}
+	return nil
+}
+
 func validateNoControlOrLeadingDash(label, val string) error {
 	if err := validatePathArg(label, val); err != nil {
 		return err
@@ -777,6 +870,7 @@ func formatCommandErr(err error, stderr, stdout []byte) error {
 
 func sanitizedGitEnv(extra []string) []string {
 	blocked := map[string]bool{
+		"GIT_ALLOW_PROTOCOL":               true,
 		"GIT_DIR":                          true,
 		"GIT_WORK_TREE":                    true,
 		"GIT_INDEX_FILE":                   true,

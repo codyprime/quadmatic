@@ -21,6 +21,7 @@ var quadletExtensions = []string{
 	".network",
 	".kube",
 	".image",
+	".build",
 }
 
 type rawVars map[string]any

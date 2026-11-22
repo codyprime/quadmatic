@@ -251,25 +251,14 @@ func computeSubIDRange(uid int, spec UserSpec, cfg SubIDConfig) (start, count in
 // SubIDRange computes the deterministic (start, count) subuid/subgid range for uid,
 // honoring explicit per-user overrides when set. When subuid_start is omitted (0),
 // UID stride is computed strictly from cfg.Count (defaulting to 65536), not spec.SubUIDCount.
+//
+// Invariant: ParseRegistry validates every UserSpec with computeSubIDRange at parse time,
+// so SubIDRange never encounters range errors on validated registries; invalid unvalidated
+// inputs return (0, 0).
 func SubIDRange(uid int, spec UserSpec, cfg SubIDConfig) (start, count int) {
-	stride := cfg.Count
-	if stride <= 0 {
-		stride = defaultSubIDCount
+	start, count, err := computeSubIDRange(uid, spec, cfg)
+	if err != nil {
+		return 0, 0
 	}
-	count = stride
-	if spec.SubUIDCount > 0 {
-		count = spec.SubUIDCount
-	}
-	if spec.SubUIDStart > 0 {
-		return spec.SubUIDStart, count
-	}
-	base := cfg.Base
-	if base <= 0 {
-		base = defaultSubIDBase
-	}
-	uidBase := cfg.UIDBase
-	if uidBase <= 0 {
-		uidBase = defaultSubIDUIDBase
-	}
-	return base + (uid-uidBase)*stride, count
+	return start, count
 }

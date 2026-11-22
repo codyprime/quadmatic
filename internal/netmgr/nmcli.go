@@ -167,8 +167,9 @@ func (r *Reconciler) Snapshot(ctx context.Context, host *manifest.ResolvedHost, 
 	}
 
 	snap := &Snapshot{
-		Profiles:     make(map[string]string),
-		OwnedRecords: slices.Clone(owned),
+		Profiles:       make(map[string]string),
+		ActiveProfiles: make(map[string]bool),
+		OwnedRecords:   slices.Clone(owned),
 	}
 
 	var candidates []string
@@ -215,6 +216,16 @@ func (r *Reconciler) Snapshot(ctx context.Context, host *manifest.ResolvedHost, 
 			return nil, formatCmdErr(fmt.Sprintf("nmcli -t connection show %s", name), out, err)
 		}
 		snap.Profiles[name] = string(out)
+	}
+
+	if len(snap.Profiles) > 0 {
+		activeSet, err := r.listActiveConnectionNames(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for name := range snap.Profiles {
+			snap.ActiveProfiles[name] = activeSet[name]
+		}
 	}
 
 	return snap, nil
@@ -603,7 +614,11 @@ func (r *Reconciler) Restore(ctx context.Context, snap *Snapshot, createdDuringA
 		}
 	}
 	for _, item := range restoreItems {
-		if err := r.restoreProfile(ctx, item.name, item.kind, item.props, activeConns, vrfIPv6[item.name]); err != nil {
+		wasActive := true
+		if snap != nil && snap.ActiveProfiles != nil {
+			wasActive = snap.ActiveProfiles[item.name]
+		}
+		if err := r.restoreProfile(ctx, item.name, item.kind, item.props, activeConns, wasActive, vrfIPv6[item.name]); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -983,7 +998,7 @@ func macvlanAddArgs(connName string, desired map[string]string) []string {
 	return args
 }
 
-func (r *Reconciler) restoreProfile(ctx context.Context, connName, kind string, props map[string]string, activeConns map[string]bool, vrfIPv6 bool) error {
+func (r *Reconciler) restoreProfile(ctx context.Context, connName, kind string, props map[string]string, postActiveConns map[string]bool, wasActive, vrfIPv6 bool) error {
 	var desired map[string]string
 	var addFn func() ([]string, error)
 
@@ -1049,7 +1064,16 @@ func (r *Reconciler) restoreProfile(ctx context.Context, connName, kind string, 
 	if err != nil {
 		return err
 	}
-	if mutated || !activeConns[connName] {
+	if !wasActive {
+		if postActiveConns[connName] {
+			if err := r.downConnection(ctx, connName); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if mutated || !postActiveConns[connName] {
 		if err := r.upConnection(ctx, connName); err != nil {
 			return err
 		}
@@ -1073,6 +1097,14 @@ func (r *Reconciler) upConnection(ctx context.Context, connName string) error {
 	out, err := r.runner.Run(ctx, nil, "nmcli", "connection", "up", connName)
 	if err != nil {
 		return formatCmdErr(fmt.Sprintf("nmcli connection up %s", connName), out, err)
+	}
+	return nil
+}
+
+func (r *Reconciler) downConnection(ctx context.Context, connName string) error {
+	out, err := r.runner.Run(ctx, nil, "nmcli", "connection", "down", connName)
+	if err != nil {
+		return formatCmdErr(fmt.Sprintf("nmcli connection down %s", connName), out, err)
 	}
 	return nil
 }
@@ -1159,7 +1191,8 @@ func (r *Reconciler) ensureL3mdevBeforeLocalFamily(ctx context.Context, ipv6 boo
 		return err
 	}
 	// Always add priority 32765 before deleting priority 0 so the host is never
-	// left without a local lookup rule even momentarily.
+	// left without a local lookup rule even momentarily. Priority 32765 table local
+	// is intentionally kept permanently (fail-safe, matches the Butane boot unit).
 	if !has32765 {
 		args, cmdDesc := ipRulePrefixArgs(ipv6, "add", "prio", strconv.Itoa(vrfLocalRulePriority), "table", "local")
 		if out, err := r.runner.Run(ctx, nil, "ip", args...); err != nil {
@@ -1167,7 +1200,7 @@ func (r *Reconciler) ensureL3mdevBeforeLocalFamily(ctx context.Context, ipv6 boo
 		}
 	}
 	if has0 {
-		args, cmdDesc := ipRulePrefixArgs(ipv6, "del", "prio", strconv.Itoa(defaultLocalRulePriority))
+		args, cmdDesc := ipRulePrefixArgs(ipv6, "del", "prio", strconv.Itoa(defaultLocalRulePriority), "table", "local")
 		if out, err := r.runner.Run(ctx, nil, "ip", args...); err != nil {
 			return formatCmdErr(cmdDesc, out, err)
 		}

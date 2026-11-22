@@ -29,6 +29,7 @@ const (
 	defaultStartVerifyTimeout = 30 * time.Second
 	defaultDHCPTimeout        = 30 * time.Second
 	defaultRollbackTimeout    = 60 * time.Second
+	defaultLockTimeout        = 2 * time.Minute
 	maxVerifyPollInterval     = 250 * time.Millisecond
 	minVerifyPollInterval     = 5 * time.Millisecond
 )
@@ -36,6 +37,7 @@ const (
 // GitClient abstracts Git repository fetch, verification, commit export, and commit file reads.
 type GitClient interface {
 	FetchAndVerify(ctx context.Context, appliedSHA string, allowNonFF bool) (string, error)
+	FetchAndVerifyDryRun(ctx context.Context, appliedSHA string, allowNonFF bool) (string, func(), error)
 	VerifyLocalRepo(ctx context.Context, repoPath, appliedSHA string, allowNonFF, noVerify bool) (string, error)
 	ExportCommit(ctx context.Context, sha, destDir string) error
 	ReadFileAtCommit(ctx context.Context, sha, relPath string) ([]byte, error)
@@ -114,6 +116,7 @@ type EngineDeps struct {
 	UserGIDLookup      func(username string) (int, bool, error)
 	DHCPTimeout        time.Duration
 	RollbackTimeout    time.Duration
+	LockTimeout        time.Duration
 	VerifyPollInterval time.Duration
 }
 
@@ -132,6 +135,7 @@ type Engine struct {
 	userGIDLookup      func(username string) (int, bool, error)
 	dhcpTimeout        time.Duration
 	rollbackTimeout    time.Duration
+	lockTimeout        time.Duration
 	verifyPollInterval time.Duration
 }
 
@@ -200,6 +204,11 @@ func NewEngine(deps EngineDeps) *Engine {
 		rollbackTimeout = defaultRollbackTimeout
 	}
 
+	lockTimeout := deps.LockTimeout
+	if lockTimeout <= 0 {
+		lockTimeout = defaultLockTimeout
+	}
+
 	return &Engine{
 		cfg:                deps.Config,
 		git:                gitClient,
@@ -214,6 +223,7 @@ func NewEngine(deps EngineDeps) *Engine {
 		userGIDLookup:      gidLookup,
 		dhcpTimeout:        dhcpTimeout,
 		rollbackTimeout:    rollbackTimeout,
+		lockTimeout:        lockTimeout,
 		verifyPollInterval: deps.VerifyPollInterval,
 	}
 }
@@ -302,9 +312,15 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 	}
 
 	if !opts.DryRun && e.cfg.StateFile != "" {
-		release, err := acquireReconcileLock(ctx, e.cfg.StateFile+".lock")
+		lockPath := e.cfg.StateFile + ".lock"
+		lockCtx, lockCancel := context.WithTimeout(ctx, e.lockTimeout)
+		release, err := acquireReconcileLock(lockCtx, lockPath)
+		lockCancel()
 		if err != nil {
 			res.FailedStage = "fetch"
+			if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+				return res, fmt.Errorf("timed out after %s waiting for reconcile lock %q: %w", e.lockTimeout, lockPath, err)
+			}
 			return res, err
 		}
 		defer release()
@@ -319,8 +335,14 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 
 	// Stage 1: Fetch & Verify
 	var newSHA string
+	var fetchCleanup func()
 	if opts.LocalRepoPath != "" {
 		newSHA, err = e.git.VerifyLocalRepo(ctx, opts.LocalRepoPath, prevState.AppliedSHA, opts.AllowNonFF, opts.NoVerify)
+	} else if opts.DryRun {
+		newSHA, fetchCleanup, err = e.git.FetchAndVerifyDryRun(ctx, prevState.AppliedSHA, opts.AllowNonFF)
+		if fetchCleanup != nil {
+			defer fetchCleanup()
+		}
 	} else {
 		newSHA, err = e.git.FetchAndVerify(ctx, prevState.AppliedSHA, opts.AllowNonFF)
 	}
@@ -433,9 +455,9 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 	res.ManagedUnitsRootless = plan.managedRootless
 	res.ManagedUnitsRootful = plan.managedRootful
 
-	stage4FailedUnits, priorNonActive, err := e.queryExistingUnitStates(ctx, prevState, plan.desiredUnits, plan.unitsToStop)
+	stage4FailedUnits, priorNonActive, err := e.queryExistingUnitStates(ctx, prevState, userPlan, plan.desiredUnits, plan.unitsToStop)
 	if err != nil {
-		res.FailedStage = "apply"
+		res.FailedStage = "validate"
 		return res, err
 	}
 
@@ -946,7 +968,7 @@ func (e *Engine) verifyUnitActive(ctx context.Context, u unitID, timeout time.Du
 		if err != nil {
 			return fmt.Errorf("check unit state of %s: %w", u.Key, err)
 		}
-		if st.ActiveState == "active" || (st.Type == "oneshot" && st.ActiveState == "inactive" && st.Result == "success") {
+		if isUnitHealthy(st) {
 			return nil
 		}
 		if st.ActiveState == "failed" || (st.ActiveState == "inactive" && st.Result != "" && st.Result != "success") {
@@ -1333,12 +1355,26 @@ func (e *Engine) buildApplyPlan(
 	return p, nil
 }
 
+func isUnitHealthy(st UnitStatusInfo) bool {
+	return st.ActiveState == "active" || (st.Type == "oneshot" && st.ActiveState == "inactive" && st.Result == "success")
+}
+
 func (e *Engine) queryExistingUnitStates(
 	ctx context.Context,
 	prevState *state.State,
+	userPlan *users.Plan,
 	desiredUnits map[string]unitPlanMeta,
 	unitsToStop []unitID,
 ) ([]UnitStatus, map[string]bool, error) {
+	pendingUserScopes := make(map[string]bool)
+	if userPlan != nil {
+		for _, act := range userPlan.Actions {
+			if act.Kind == users.CreateUser || act.Kind == users.EnableLinger {
+				pendingUserScopes[act.User] = true
+			}
+		}
+	}
+
 	var keys []string
 	for k := range desiredUnits {
 		if _, existed := prevState.GeneratedUnits[k]; existed {
@@ -1351,25 +1387,50 @@ func (e *Engine) queryExistingUnitStates(
 	var failed []UnitStatus
 	for _, k := range keys {
 		meta := desiredUnits[k]
-		st, err := e.systemd.ActiveState(ctx, meta.ID.Scope, meta.ID.UnitName)
-		if err != nil {
-			return nil, nil, fmt.Errorf("query systemd state for %s: %w", k, err)
+		if pendingUserScopes[meta.ID.Scope] {
+			nonActive[k] = true
+			continue
 		}
-		if st != "active" {
+		st, err := e.systemd.UnitState(ctx, meta.ID.Scope, meta.ID.UnitName)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, nil, fmt.Errorf("query systemd state for %s: %w", k, err)
+			}
+			e.logger.Warn("failed to query unit state; treating as non-active", "scope", meta.ID.Scope, "unit", meta.ID.UnitName, "err", err)
 			nonActive[k] = true
 			failed = append(failed, UnitStatus{
 				Scope:       meta.ID.Scope,
 				Unit:        meta.ID.UnitName,
-				ActiveState: st,
+				ActiveState: "unknown",
+			})
+			continue
+		}
+		if st.ActiveState != "active" {
+			nonActive[k] = true
+		}
+		if !isUnitHealthy(st) {
+			failed = append(failed, UnitStatus{
+				Scope:       meta.ID.Scope,
+				Unit:        meta.ID.UnitName,
+				ActiveState: st.ActiveState,
 			})
 		}
 	}
 	for _, u := range unitsToStop {
-		st, err := e.systemd.ActiveState(ctx, u.Scope, u.UnitName)
-		if err != nil {
-			return nil, nil, fmt.Errorf("query systemd state for %s: %w", u.Key, err)
+		if pendingUserScopes[u.Scope] {
+			nonActive[u.Key] = true
+			continue
 		}
-		if st != "active" {
+		st, err := e.systemd.UnitState(ctx, u.Scope, u.UnitName)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, nil, fmt.Errorf("query systemd state for %s: %w", u.Key, err)
+			}
+			e.logger.Warn("failed to query unit state for unit to stop; treating as non-active", "scope", u.Scope, "unit", u.UnitName, "err", err)
+			nonActive[u.Key] = true
+			continue
+		}
+		if st.ActiveState != "active" {
 			nonActive[u.Key] = true
 		}
 	}
@@ -1392,15 +1453,15 @@ func (e *Engine) queryPrevStateFailedUnits(ctx context.Context, prevState *state
 		if !ok || scope == "" || unitName == "" {
 			continue
 		}
-		st, err := e.systemd.ActiveState(ctx, scope, unitName)
+		st, err := e.systemd.UnitState(ctx, scope, unitName)
 		if err != nil {
 			return nil, fmt.Errorf("query systemd state for %s: %w", k, err)
 		}
-		if st != "active" {
+		if !isUnitHealthy(st) {
 			failed = append(failed, UnitStatus{
 				Scope:       scope,
 				Unit:        unitName,
-				ActiveState: st,
+				ActiveState: st.ActiveState,
 			})
 		}
 	}

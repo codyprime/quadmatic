@@ -32,6 +32,9 @@ func RenderHost(host *ResolvedHost, env RenderEnv) (*RenderedHost, error) {
 	// Build complete .Host.Components metadata before executing templates so cross-component
 	// references (e.g., Caddy upstream templates) see every component regardless of manifest order.
 	for i, comp := range host.Components {
+		if !comp.Rootful && (comp.UID <= 0 || strings.TrimSpace(comp.DataDir) == "") {
+			return nil, fmt.Errorf("rootless component %q must have positive UID and non-empty DataDir", comp.Name)
+		}
 		netCtx, usedPlaceholder, err := buildNetContext(comp, env)
 		if err != nil {
 			return nil, err
@@ -177,7 +180,10 @@ func buildNetContext(comp ResolvedComponent, env RenderEnv) (*NetContext, bool, 
 		return nil, false, nil
 	}
 	netSpec := comp.Network
-	parentIface := resolveParentIface(netSpec.VLAN, env.ParentIfaces)
+	parentIface, err := resolveParentIface(comp.Name, netSpec.VLAN, env)
+	if err != nil {
+		return nil, false, err
+	}
 
 	if comp.Rootful {
 		return &NetContext{
@@ -217,16 +223,19 @@ func buildNetContext(comp ResolvedComponent, env RenderEnv) (*NetContext, bool, 
 	}, usedPlaceholder, nil
 }
 
-func resolveParentIface(vlan int, parentIfaces map[int]string) string {
-	if parentIfaces != nil {
-		if iface := parentIfaces[vlan]; iface != "" {
-			return iface
+func resolveParentIface(compName string, vlan int, env RenderEnv) (string, error) {
+	if env.ParentIfaces != nil {
+		if iface := env.ParentIfaces[vlan]; iface != "" {
+			return iface, nil
 		}
 	}
 	if vlan == 0 {
-		return "trunk_interface"
+		if !env.DryRun {
+			return "", fmt.Errorf("component %q has vlan=0 without resolved trunk parent interface", compName)
+		}
+		return "trunk_interface", nil
 	}
-	return fmt.Sprintf("qm-vlan%d", vlan)
+	return fmt.Sprintf("qm-vlan%d", vlan), nil
 }
 
 func renderSourceFile(compName string, sf SourceFile, ctx TemplateContext) ([]byte, error) {

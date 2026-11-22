@@ -285,6 +285,17 @@ doneFlags:
 			}
 			return nil, nil
 
+		case "down":
+			if len(rest) < 3 {
+				return nil, errors.New("nmcli connection down missing id")
+			}
+			conName := rest[2]
+			if _, ok := f.conns[conName]; !ok {
+				return []byte(fmt.Sprintf("Error: %s - no such connection profile.", conName)), fmt.Errorf("exit status 10")
+			}
+			delete(f.active, conName)
+			return nil, nil
+
 		case "delete":
 			if len(rest) < 3 {
 				return nil, errors.New("nmcli connection delete missing id")
@@ -460,20 +471,24 @@ func (f *fakeRunner) handleIPRule(isV6 bool, args []string) ([]byte, error) {
 
 	case "del":
 		prio := -1
+		table := ""
 		for i := 1; i+1 < len(args); i += 2 {
-			if args[i] == "prio" || args[i] == "pref" || args[i] == "priority" {
+			switch args[i] {
+			case "prio", "pref", "priority":
 				p, err := strconv.Atoi(args[i+1])
 				if err != nil {
 					return nil, err
 				}
 				prio = p
+			case "table", "lookup":
+				table = args[i+1]
 			}
 		}
 		if prio < 0 {
 			return nil, fmt.Errorf("unsupported ip rule del args: %v", args)
 		}
 		for i, r := range *store {
-			if r.prio == prio {
+			if r.prio == prio && (table == "" || strings.HasSuffix(r.text, "lookup "+table)) {
 				*store = append((*store)[:i], (*store)[i+1:]...)
 				return nil, nil
 			}
@@ -643,10 +658,10 @@ func TestApplyProfilesRootlessCreatesVLANVRFMacvlanAndVRFRules(t *testing.T) {
 		t.Fatalf("liveDNS = %+v, want [10.30.0.1 10.30.0.2]", liveDNS)
 	}
 
-	// Verify safe order of IPv4 l3mdev-before-local rule mutation (add 32765 BEFORE del 0)
+	// Verify safe order of IPv4 l3mdev-before-local rule mutation (add 32765 BEFORE del 0 table local)
 	// and that IPv6 rules were NOT touched when ipv6=false.
 	addIdx := findCallIndex(runner.calls, "ip", "rule", "add", "prio", "32765", "table", "local")
-	delIdx := findCallIndex(runner.calls, "ip", "rule", "del", "prio", "0")
+	delIdx := findCallIndex(runner.calls, "ip", "rule", "del", "prio", "0", "table", "local")
 	if addIdx < 0 || delIdx < 0 || addIdx >= delIdx {
 		t.Fatalf("expected ip rule add prio 32765 before del prio 0, got addIdx=%d delIdx=%d calls=%+v", addIdx, delIdx, runner.calls)
 	}
@@ -721,8 +736,8 @@ func TestL3mdevBeforeLocalRuleHardeningAndDrift(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected ApplyProfiles to fail when ip rule add prio 32765 fails")
 		}
-		if idx := findCallIndex(runner.calls, "ip", "rule", "del", "prio", "0"); idx >= 0 {
-			t.Fatalf("must NEVER run ip rule del prio 0 when add prio 32765 fails")
+		if idx := findCallIndex(runner.calls, "ip", "rule", "del", "prio", "0", "table", "local"); idx >= 0 {
+			t.Fatalf("must NEVER run ip rule del prio 0 table local when add prio 32765 fails")
 		}
 		if !slices.Contains(runner.rules, fakeIPRule{prio: 0, text: "from all lookup local"}) {
 			t.Fatalf("expected prio 0 local rule preserved when add fails, got %+v", runner.rules)
@@ -754,9 +769,9 @@ func TestL3mdevBeforeLocalRuleHardeningAndDrift(t *testing.T) {
 			t.Fatalf("ApplyProfiles error: %v", err)
 		}
 		add4 := findCallIndex(runner.calls, "ip", "rule", "add", "prio", "32765", "table", "local")
-		del4 := findCallIndex(runner.calls, "ip", "rule", "del", "prio", "0")
+		del4 := findCallIndex(runner.calls, "ip", "rule", "del", "prio", "0", "table", "local")
 		add6 := findCallIndex(runner.calls, "ip", "-6", "rule", "add", "prio", "32765", "table", "local")
-		del6 := findCallIndex(runner.calls, "ip", "-6", "rule", "del", "prio", "0")
+		del6 := findCallIndex(runner.calls, "ip", "-6", "rule", "del", "prio", "0", "table", "local")
 		if add4 < 0 || del4 < 0 || add4 >= del4 {
 			t.Fatalf("invalid IPv4 rule mutation order: add=%d del=%d", add4, del4)
 		}
@@ -792,8 +807,8 @@ func TestL3mdevBeforeLocalRuleHardeningAndDrift(t *testing.T) {
 		if findCallIndex(runner.calls, "ip", "rule", "add", "prio", "32765", "table", "local") >= 0 {
 			t.Fatal("should not re-add prio 32765 when already present")
 		}
-		if findCallIndex(runner.calls, "ip", "rule", "del", "prio", "0") < 0 {
-			t.Fatal("expected del prio 0 to heal reintroduced IPv4 rule")
+		if findCallIndex(runner.calls, "ip", "rule", "del", "prio", "0", "table", "local") < 0 {
+			t.Fatal("expected del prio 0 table local to heal reintroduced IPv4 rule")
 		}
 		if drifted, err := r.DetectDrift(ctx, host, owned); err != nil || drifted {
 			t.Fatalf("DetectDrift after IPv4 heal = (%v, %v), want (false, nil)", drifted, err)
@@ -814,7 +829,7 @@ func TestL3mdevBeforeLocalRuleHardeningAndDrift(t *testing.T) {
 			t.Fatalf("ApplyProfiles IPv6 rule heal error: %v", err)
 		}
 		add6 = findCallIndex(runner.calls, "ip", "-6", "rule", "add", "prio", "32765", "table", "local")
-		del6 = findCallIndex(runner.calls, "ip", "-6", "rule", "del", "prio", "0")
+		del6 = findCallIndex(runner.calls, "ip", "-6", "rule", "del", "prio", "0", "table", "local")
 		if add6 < 0 || del6 < 0 || add6 >= del6 {
 			t.Fatalf("expected safe IPv6 rule heal order add<del, got add=%d del=%d", add6, del6)
 		}
@@ -1819,6 +1834,167 @@ func TestUnmanagedVLANFallbackAndPortTypeCompatibility(t *testing.T) {
 		}
 		if mv.props["connection.port-type"] != "vrf" {
 			t.Fatalf("expected healed connection.port-type=vrf, got %+v", mv.props)
+		}
+	})
+}
+
+func TestRestorePreservesPreApplyInactiveProfilesAndCustomPrio0Rule(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Snapshot records ActiveProfiles and Restore downs newly-activated inactive profiles", func(t *testing.T) {
+		runner := newFakeRunner()
+		r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+
+		host := &manifest.ResolvedHost{
+			Hostname: "services-02",
+			Components: []manifest.ResolvedComponent{
+				{
+					Name: "app-a",
+					User: "appa",
+					UID:  2001,
+					Network: &manifest.NetworkSpec{
+						VLAN: 30,
+						MAC:  "02:51:4d:00:07:d1",
+						DNS:  []string{"10.30.0.1"},
+					},
+				},
+				{
+					Name: "app-b",
+					User: "appb",
+					UID:  2002,
+					Network: &manifest.NetworkSpec{
+						VLAN: 30,
+						MAC:  "02:51:4d:00:07:d2",
+						DNS:  []string{"10.30.0.1"},
+					},
+				},
+			},
+		}
+
+		// Apply both components initially.
+		owned, _, _, err := r.ApplyProfiles(ctx, host, nil, time.Second)
+		if err != nil {
+			t.Fatalf("initial ApplyProfiles failed: %v", err)
+		}
+
+		// Simulate operator manually downing qm-2002 (inactive before run) while qm-2001 remains active,
+		// and qmv-2002 stays inactive too.
+		delete(runner.active, "qm-2002")
+		delete(runner.active, "qmv-2002")
+
+		// Next commit changes qm-2001 MAC and modifies qm-2002 MAC, then fails after bringing qm-2002 up.
+		host2 := &manifest.ResolvedHost{
+			Hostname: "services-02",
+			Components: []manifest.ResolvedComponent{
+				host.Components[0],
+				{
+					Name: "app-b",
+					User: "appb",
+					UID:  2002,
+					Network: &manifest.NetworkSpec{
+						VLAN: 30,
+						MAC:  "02:51:4d:00:07:e2",
+						DNS:  []string{"10.30.0.1"},
+					},
+				},
+			},
+		}
+
+		snap, err := r.Snapshot(ctx, host2, owned)
+		if err != nil {
+			t.Fatalf("Snapshot failed: %v", err)
+		}
+		if !snap.ActiveProfiles["qm-2001"] || !snap.ActiveProfiles["qmv-2001"] || !snap.ActiveProfiles["qm-vlan30"] {
+			t.Fatalf("expected active profiles recorded true, got %+v", snap.ActiveProfiles)
+		}
+		if snap.ActiveProfiles["qm-2002"] || snap.ActiveProfiles["qmv-2002"] {
+			t.Fatalf("expected inactive profiles recorded false, got %+v", snap.ActiveProfiles)
+		}
+
+		runner.failHook = func(_ []byte, name string, args []string) ([]byte, error) {
+			// Fail right after qm-2002 is brought up during prune/later step.
+			if name == "nmcli" && len(args) >= 4 && args[0] == "connection" && args[1] == "up" && args[2] == "qm-2002" {
+				// Let qm-2002 activate via fakeRunner, or simulate post-up failure via pruning a stale record.
+				return nil, nil
+			}
+			if name == "nmcli" && len(args) >= 3 && args[0] == "connection" && args[1] == "delete" && args[2] == "qm-stale" {
+				return []byte("prune failed"), errors.New("exit status 1")
+			}
+			return nil, nil
+		}
+		ownedWithStale := append(slices.Clone(owned), state.ManagedNetworkRecord{
+			ConnectionName: "qm-stale", Kind: "macvlan", Owned: true,
+		})
+		partialOwned, _, _, err := r.ApplyProfiles(ctx, host2, ownedWithStale, time.Second)
+		if err == nil {
+			t.Fatal("expected ApplyProfiles to fail on stale prune")
+		}
+		if !runner.active["qm-2002"] || !runner.active["qmv-2002"] {
+			t.Fatalf("expected failed apply to have activated qm-2002 and qmv-2002")
+		}
+
+		runner.failHook = nil
+		runner.calls = nil
+		if err := r.Restore(ctx, snap, partialOwned); err != nil {
+			t.Fatalf("Restore failed: %v", err)
+		}
+
+		// Previously inactive qm-2002 and qmv-2002 must NEVER have `nmcli connection up` called on Restore,
+		// and MUST have `nmcli connection down` called because the failed apply activated them!
+		for _, inactiveName := range []string{"qm-2002", "qmv-2002"} {
+			if findCallIndex(runner.calls, "nmcli", "connection", "up", inactiveName) >= 0 {
+				t.Fatalf("Restore must NOT call nmcli connection up on previously inactive %s", inactiveName)
+			}
+			if findCallIndex(runner.calls, "nmcli", "connection", "down", inactiveName) < 0 {
+				t.Fatalf("Restore must call nmcli connection down on newly-activated %s, calls=%+v", inactiveName, runner.calls)
+			}
+			if runner.active[inactiveName] {
+				t.Fatalf("expected %s to be inactive after Restore", inactiveName)
+			}
+		}
+		if gotMAC := strings.ToLower(runner.conns["qm-2002"].props["802-3-ethernet.cloned-mac-address"]); gotMAC != "02:51:4d:00:07:d2" {
+			t.Fatalf("expected qm-2002 MAC restored to 02:51:4d:00:07:d2, got %q", gotMAC)
+		}
+		// Previously active profiles remain active.
+		for _, activeName := range []string{"qm-vlan30", "qmv-2001", "qm-2001"} {
+			if !runner.active[activeName] {
+				t.Fatalf("expected previously active %s to remain active after Restore", activeName)
+			}
+		}
+	})
+
+	t.Run("del prio 0 table local preserves foreign custom prio 0 rule", func(t *testing.T) {
+		runner := newFakeRunner()
+		customRule := fakeIPRule{prio: 0, text: "from 192.0.2.0/24 lookup custom"}
+		runner.rules = append([]fakeIPRule{customRule}, runner.rules...)
+
+		r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+		host := &manifest.ResolvedHost{
+			Hostname: "services-02",
+			Components: []manifest.ResolvedComponent{
+				{
+					Name: "app",
+					User: "app",
+					UID:  2001,
+					Network: &manifest.NetworkSpec{
+						VLAN: 30,
+						MAC:  "02:51:4d:00:07:d1",
+						DNS:  []string{"10.30.0.1"},
+					},
+				},
+			},
+		}
+		if _, _, _, err := r.ApplyProfiles(ctx, host, nil, time.Second); err != nil {
+			t.Fatalf("ApplyProfiles failed: %v", err)
+		}
+		if findCallIndex(runner.calls, "ip", "rule", "del", "prio", "0", "table", "local") < 0 {
+			t.Fatalf("expected ip rule del prio 0 table local call, got %+v", runner.calls)
+		}
+		if !slices.Contains(runner.rules, customRule) {
+			t.Fatalf("expected foreign custom prio 0 rule preserved, got %+v", runner.rules)
+		}
+		if slices.Contains(runner.rules, fakeIPRule{prio: 0, text: "from all lookup local"}) {
+			t.Fatalf("expected prio 0 table local deleted, got %+v", runner.rules)
 		}
 	})
 }

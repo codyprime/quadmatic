@@ -21,11 +21,13 @@ type Recorder struct {
 	hostname string
 	registry *prometheus.Registry
 
-	lastSyncTimestamp    prometheus.Gauge
-	lastSyncSuccess      prometheus.Gauge
-	syncDurationSeconds  prometheus.Gauge
-	appliedInfo          *prometheus.GaugeVec
-	managedUnits         *prometheus.GaugeVec
+	lastSyncTimestamp   prometheus.Gauge
+	lastSyncSuccess     prometheus.Gauge
+	syncDurationSeconds prometheus.Gauge
+	appliedInfo         *prometheus.GaugeVec
+	managedUnits        *prometheus.GaugeVec
+	// failedUnits tracks non-healthy managed systemd units; the "user" label carries the
+	// unit scope (service username for rootless units, "rootful" for rootful units) per spec §5.8.
 	failedUnits          *prometheus.GaugeVec
 	driftDetected        prometheus.Gauge
 	rollbacksTotal       prometheus.Counter
@@ -59,6 +61,8 @@ func NewRecorder(hostname string) *Recorder {
 			Name: "quadmatic_managed_units",
 			Help: "Number of managed systemd units by scope.",
 		}, []string{"scope"}),
+		// The "user" label carries the unit scope (service username for rootless units,
+		// "rootful" for rootful units) per spec §5.8.
 		failedUnits: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "quadmatic_failed_units",
 			Help: "Managed systemd units that are not active (value is 1).",

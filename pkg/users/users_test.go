@@ -911,6 +911,137 @@ uid = 2002
 	})
 }
 
+func TestAdoptSubIDRollbackOnMigrateFailureAndLingerBeforeSubID(t *testing.T) {
+	runSubcase := func(t *testing.T, subIDsExistedBefore bool) {
+		t.Helper()
+		dir := t.TempDir()
+		passwdPath := filepath.Join(dir, "passwd")
+		subuidPath := filepath.Join(dir, "subuid")
+		subgidPath := filepath.Join(dir, "subgid")
+		lingerDir := filepath.Join(dir, "linger")
+		runUserDir := filepath.Join(dir, "run_user")
+		homeBase := filepath.Join(dir, "home")
+
+		mustMkdirAll(t, lingerDir)
+		mustMkdirAll(t, filepath.Join(runUserDir, "2001"))
+		mustWriteFile(t, filepath.Join(runUserDir, "2001", "bus"), "")
+		mustWriteFile(t, passwdPath, "core:x:1000:1000::/var/home/core:/bin/bash\nopenwebui:x:2001:2001::/var/home/openwebui:/usr/sbin/nologin\n")
+
+		priorSubUID := "core:100000:65536\nopenwebui:200000:65536\n"
+		priorSubGID := "core:100000:65536\nopenwebui:200000:65536\n"
+		if subIDsExistedBefore {
+			mustWriteFile(t, subuidPath, priorSubUID)
+			mustWriteFile(t, subgidPath, priorSubGID)
+		}
+
+		reg, err := users.ParseRegistry([]byte("[users.openwebui]\nuid = 2001\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		failMigrate := true
+		var lingerSawPriorSubIDs bool
+		runner := &fakeRunner{
+			hook: func(_ context.Context, name string, args ...string) ([]byte, error) {
+				if name == "loginctl" && len(args) >= 2 && args[0] == "enable-linger" && args[1] == "openwebui" {
+					if subIDsExistedBefore {
+						lingerSawPriorSubIDs = mustReadFile(t, subuidPath) == priorSubUID && mustReadFile(t, subgidPath) == priorSubGID
+					} else {
+						_, uErr := os.Stat(subuidPath)
+						_, gErr := os.Stat(subgidPath)
+						lingerSawPriorSubIDs = os.IsNotExist(uErr) && os.IsNotExist(gErr)
+					}
+					if err := os.WriteFile(filepath.Join(lingerDir, "openwebui"), nil, 0o644); err != nil {
+						return nil, err
+					}
+				}
+				if name == "systemd-run" && slices.Contains(args, "migrate") && failMigrate {
+					return []byte("migrate failed"), os.ErrPermission
+				}
+				return nil, nil
+			},
+		}
+
+		rec := users.NewReconciler(users.Options{
+			PasswdPath: passwdPath,
+			SubUIDPath: subuidPath,
+			SubGIDPath: subgidPath,
+			LingerDir:  lingerDir,
+			RunUserDir: runUserDir,
+			HomeBase:   homeBase,
+			BusTimeout: 200 * time.Millisecond,
+			Runner:     runner,
+		})
+
+		// Attempt 1: podman system migrate fails -> must run linger BEFORE subids, then restore prior subuid/subgid.
+		if _, err := rec.Apply(context.Background(), reg, []string{"openwebui"}, nil); err == nil {
+			t.Fatal("expected Apply attempt 1 to fail on podman system migrate")
+		}
+		if !lingerSawPriorSubIDs {
+			t.Fatal("expected enable-linger for adopted user to run BEFORE updating /etc/subuid and /etc/subgid")
+		}
+		if subIDsExistedBefore {
+			if got := mustReadFile(t, subuidPath); got != priorSubUID {
+				t.Fatalf("subuid not rolled back on migrate failure:\ngot:\n%s\nwant:\n%s", got, priorSubUID)
+			}
+			if got := mustReadFile(t, subgidPath); got != priorSubGID {
+				t.Fatalf("subgid not rolled back on migrate failure:\ngot:\n%s\nwant:\n%s", got, priorSubGID)
+			}
+		} else {
+			if _, err := os.Stat(subuidPath); !os.IsNotExist(err) {
+				t.Fatalf("expected non-existent subuid removed on migrate rollback, stat err=%v", err)
+			}
+			if _, err := os.Stat(subgidPath); !os.IsNotExist(err) {
+				t.Fatalf("expected non-existent subgid removed on migrate rollback, stat err=%v", err)
+			}
+		}
+
+		// Attempt 2: Plan still plans UpdateSubUID, UpdateSubGID, and MigratePodman, and succeeds on retry.
+		plan2, err := rec.Plan(context.Background(), reg, []string{"openwebui"}, nil)
+		if err != nil {
+			t.Fatalf("Plan attempt 2 failed: %v", err)
+		}
+		wantKinds := []users.ActionKind{
+			users.AdoptUser,
+			users.UpdateSubUID,
+			users.UpdateSubGID,
+			users.MigratePodman,
+		}
+		var gotKinds []users.ActionKind
+		for _, a := range plan2.Actions {
+			gotKinds = append(gotKinds, a.Kind)
+		}
+		if !slices.Equal(gotKinds, wantKinds) {
+			t.Fatalf("attempt 2 Plan actions = %v, want %v", gotKinds, wantKinds)
+		}
+
+		failMigrate = false
+		if _, err := rec.Apply(context.Background(), reg, []string{"openwebui"}, nil); err != nil {
+			t.Fatalf("Apply attempt 2 retry failed: %v", err)
+		}
+		if got := mustReadFile(t, subuidPath); !strings.Contains(got, "openwebui:1065536:65536\n") {
+			t.Fatalf("unexpected subuid after retry:\n%s", got)
+		}
+		if got := mustReadFile(t, subgidPath); !strings.Contains(got, "openwebui:1065536:65536\n") {
+			t.Fatalf("unexpected subgid after retry:\n%s", got)
+		}
+	}
+
+	t.Run("existing_subid_files", func(t *testing.T) {
+		runSubcase(t, true)
+	})
+	t.Run("missing_subid_files", func(t *testing.T) {
+		runSubcase(t, false)
+	})
+
+	t.Run("SubIDRange_invalid_unvalidated_input_returns_zero", func(t *testing.T) {
+		start, count := users.SubIDRange(1000, users.UserSpec{Name: "low", UID: 1000}, users.SubIDConfig{})
+		if start != 0 || count != 0 {
+			t.Fatalf("expected (0, 0) for unvalidated out-of-range uid, got (%d, %d)", start, count)
+		}
+	})
+}
+
 func mustWriteFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {

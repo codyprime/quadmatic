@@ -709,3 +709,156 @@ func mustGit(t *testing.T, dir string, args ...string) string {
 	}
 	return strings.TrimSpace(string(out))
 }
+
+func TestFetchRejectsRemoteHelperTransportsAndRestrictsProtocols(t *testing.T) {
+	fx := setupTestGitFixture(t)
+	ctx := context.Background()
+	_ = fx.commitSigned(t, "app.txt", "ok\n", "signed commit", fx.goodKey)
+	fx.pushToRemote(t, "main", false)
+
+	pwnMarker := filepath.Join(t.TempDir(), "pwned")
+	badURLs := []string{
+		"ext::sh -c touch\\ " + pwnMarker,
+		"EXT::sh -c touch\\ " + pwnMarker,
+		"fd::17,18",
+		"FD::17,18",
+		"hg::https://example.com/repo",
+		"::bare-helper",
+		" ext::sh -c id",
+	}
+	for _, badURL := range badURLs {
+		cfg := fx.newHostConfig(filepath.Join(fx.dir, "mirror-bad.git"))
+		cfg.RepoURL = badURL
+		client := NewClient(cfg)
+		if _, err := client.FetchAndVerify(ctx, "", false); err == nil || !strings.Contains(err.Error(), "remote-helper") {
+			t.Fatalf("FetchAndVerify(%q) expected remote-helper rejection, got err=%v", badURL, err)
+		}
+		if _, cleanup, err := client.FetchAndVerifyDryRun(ctx, "", false); err == nil || !strings.Contains(err.Error(), "remote-helper") {
+			if cleanup != nil {
+				cleanup()
+			}
+			t.Fatalf("FetchAndVerifyDryRun(%q) expected remote-helper rejection, got err=%v", badURL, err)
+		}
+	}
+	if _, err := os.Stat(pwnMarker); !os.IsNotExist(err) {
+		t.Fatalf("remote-helper payload executed!")
+	}
+
+	// Valid IPv6 URLs containing "::" inside bracketed hosts must pass validateRepoURL.
+	for _, ipv6URL := range []string{
+		"ssh://git@[2001:db8::1]/homelab/quadlets.git",
+		"git@[2001:db8::1]:homelab/quadlets.git",
+	} {
+		if err := validateRepoURL(ipv6URL); err != nil {
+			t.Fatalf("validateRepoURL(%q) unexpectedly rejected IPv6 URL: %v", ipv6URL, err)
+		}
+	}
+
+	// Ambient GIT_ALLOW_PROTOCOL=ext:http must be overridden by GIT_ALLOW_PROTOCOL=ssh:file during git fetch.
+	t.Setenv("GIT_ALLOW_PROTOCOL", "ext:http")
+	cfgHTTP := fx.newHostConfig(filepath.Join(fx.dir, "mirror-http.git"))
+	cfgHTTP.RepoURL = "http://127.0.0.1:1/nonexistent.git"
+	if _, err := NewClient(cfgHTTP).FetchAndVerify(ctx, "", false); err == nil || !strings.Contains(strings.ToLower(err.Error()), "not allowed") {
+		t.Fatalf("expected GIT_ALLOW_PROTOCOL=ssh:file to block http:// fetch, got: %v", err)
+	}
+}
+
+func TestFetchAndVerifyDryRunIsolatesRepoDirAndVerifiesFastForward(t *testing.T) {
+	fx := setupTestGitFixture(t)
+	ctx := context.Background()
+
+	// Commit 1: seed cfg.RepoDir via normal FetchAndVerify.
+	fx.writeFile(t, "app.txt", "v1\n", 0o644)
+	sha1 := fx.commitAllSigned(t, "commit 1", fx.goodKey)
+	fx.pushToRemote(t, "main", false)
+
+	mirrorDir := filepath.Join(fx.dir, "mirror.git")
+	cfg := fx.newHostConfig(mirrorDir)
+	client := NewClient(cfg)
+	got1, err := client.FetchAndVerify(ctx, "", false)
+	if err != nil || got1 != sha1 {
+		t.Fatalf("initial FetchAndVerify = (%q, %v), want (%q, nil)", got1, err, sha1)
+	}
+
+	refsBefore := mustGit(t, mirrorDir, "show-ref")
+
+	// Commit 2: push signed fast-forward commit to remote.
+	fx.writeFile(t, "app.txt", "v2\n", 0o644)
+	sha2 := fx.commitAllSigned(t, "commit 2", fx.goodKey)
+	fx.pushToRemote(t, "main", false)
+
+	// FetchAndVerifyDryRun fetches sha2, verifies FF against sha1 seeded from mirrorDir,
+	// exports sha2 cleanly, and leaves mirrorDir refs completely untouched.
+	got2, cleanup, err := client.FetchAndVerifyDryRun(ctx, sha1, false)
+	if err != nil {
+		t.Fatalf("FetchAndVerifyDryRun failed: %v", err)
+	}
+	if got2 != sha2 {
+		cleanup()
+		t.Fatalf("FetchAndVerifyDryRun SHA = %q, want %q", got2, sha2)
+	}
+	tmpRepo := client.activeRepo()
+	if tmpRepo == "" || tmpRepo == mirrorDir {
+		cleanup()
+		t.Fatalf("expected activeRepo to point to temp repo, got %q", tmpRepo)
+	}
+
+	exportDir := t.TempDir()
+	if err := client.ExportCommit(ctx, got2, exportDir); err != nil {
+		cleanup()
+		t.Fatalf("ExportCommit after FetchAndVerifyDryRun failed: %v", err)
+	}
+	exportedBytes, err := os.ReadFile(filepath.Join(exportDir, "app.txt"))
+	if err != nil || string(exportedBytes) != "v2\n" {
+		cleanup()
+		t.Fatalf("exported app.txt = %q (err=%v), want %q", string(exportedBytes), err, "v2\n")
+	}
+
+	cleanup()
+	if _, err := os.Stat(tmpRepo); !os.IsNotExist(err) {
+		t.Fatalf("expected cleanup to remove temp repo %q, stat err=%v", tmpRepo, err)
+	}
+
+	refsAfter := mustGit(t, mirrorDir, "show-ref")
+	if refsAfter != refsBefore {
+		t.Fatalf("cfg.RepoDir refs mutated during FetchAndVerifyDryRun!\nbefore:\n%s\nafter:\n%s", refsBefore, refsAfter)
+	}
+	if _, err := resolveCommitSHA(ctx, mirrorDir, sha2); err == nil {
+		t.Fatalf("did not expect sha2 (%s) to exist inside cfg.RepoDir after dry-run", sha2)
+	}
+
+	// Verify non-FF check fails against seeded appliedSHA without mutating cfg.RepoDir, and cleans up on error.
+	fx.pushResetToRemote(t, "main", sha1)
+	cfg2 := fx.newHostConfig(mirrorDir)
+	client2 := NewClient(cfg2)
+	// First advance mirrorDir to sha2 so mirrorDir holds sha2 history, then force-push remote back to sha1.
+	fx.pushToRemote(t, "main", true)
+	fx.writeFile(t, "app.txt", "v2\n", 0o644)
+	fx.pushResetToRemote(t, "main", sha2)
+	if _, err := client2.FetchAndVerify(ctx, sha1, false); err != nil {
+		t.Fatalf("FetchAndVerify(sha2) failed: %v", err)
+	}
+	fx.pushResetToRemote(t, "main", sha1)
+	if _, badCleanup, err := client2.FetchAndVerifyDryRun(ctx, sha2, false); err == nil {
+		if badCleanup != nil {
+			badCleanup()
+		}
+		t.Fatal("expected FetchAndVerifyDryRun to reject non-FF rollback when allowNonFF=false")
+	}
+
+	// Bootstrap dry-run when cfg.RepoDir does not exist yet succeeds and never creates cfg.RepoDir.
+	nonExistentMirror := filepath.Join(fx.dir, "never-created.git")
+	cfgBoot := fx.newHostConfig(nonExistentMirror)
+	bootClient := NewClient(cfgBoot)
+	bootSHA, bootCleanup, err := bootClient.FetchAndVerifyDryRun(ctx, "", false)
+	if err != nil {
+		t.Fatalf("bootstrap FetchAndVerifyDryRun failed: %v", err)
+	}
+	bootCleanup()
+	if bootSHA != sha1 {
+		t.Fatalf("bootstrap SHA = %q, want %q", bootSHA, sha1)
+	}
+	if _, err := os.Stat(nonExistentMirror); !os.IsNotExist(err) {
+		t.Fatalf("bootstrap FetchAndVerifyDryRun must not create cfg.RepoDir %q", nonExistentMirror)
+	}
+}

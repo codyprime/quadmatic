@@ -146,6 +146,8 @@ func quadletFileToUnitName(name string) string {
 		return strings.TrimSuffix(name, ".image") + "-image.service"
 	case strings.HasSuffix(name, ".kube"):
 		return strings.TrimSuffix(name, ".kube") + ".service"
+	case strings.HasSuffix(name, ".build"):
+		return strings.TrimSuffix(name, ".build") + "-build.service"
 	default:
 		return strings.TrimSuffix(name, ".container") + ".service"
 	}
@@ -491,6 +493,13 @@ doneFlags:
 				f.ensureFakeL3mdevRule(true)
 			}
 			return nil, nil
+		case "down":
+			conName := rest[2]
+			if _, ok := f.conns[conName]; !ok {
+				return []byte("Error: no such connection profile"), errors.New("exit status 10")
+			}
+			delete(f.active, conName)
+			return nil, nil
 		case "delete":
 			conName := rest[2]
 			if _, ok := f.conns[conName]; !ok {
@@ -633,20 +642,24 @@ func (f *fakeNetRunner) handleIPRule(isV6 bool, args []string) ([]byte, error) {
 		return nil, nil
 	case "del":
 		prio := -1
+		table := ""
 		for i := 1; i+1 < len(args); i += 2 {
-			if args[i] == "prio" || args[i] == "pref" || args[i] == "priority" {
+			switch args[i] {
+			case "prio", "pref", "priority":
 				p, err := strconv.Atoi(args[i+1])
 				if err != nil {
 					return nil, err
 				}
 				prio = p
+			case "table", "lookup":
+				table = args[i+1]
 			}
 		}
 		if prio < 0 {
 			return nil, fmt.Errorf("unsupported ip rule del args: %v", args)
 		}
 		for i, r := range *store {
-			if r.prio == prio {
+			if r.prio == prio && (table == "" || strings.HasSuffix(r.text, "lookup "+table)) {
 				*store = append((*store)[:i], (*store)[i+1:]...)
 				return nil, nil
 			}
@@ -1958,7 +1971,7 @@ user = "caddy"
 
 	// Crucially: zero DaemonReload, Start, Restart, or Stop calls during pre-reload Stage 7c rollback!
 	for _, call := range env.systemd.calls {
-		if call.op != "active-state" {
+		if call.op != "unit-state" {
 			t.Fatalf("expected zero mutating systemd calls on Stage 7c rollback, got calls=%v", env.systemd.calls)
 		}
 	}
@@ -2133,7 +2146,7 @@ dns = ["10.30.0.1"]
 		t.Fatalf("FailedUnits = %+v, want %+v", res2.FailedUnits, wantFailed)
 	}
 	for _, call := range env.systemd.calls {
-		if call.op != "active-state" {
+		if call.op != "unit-state" {
 			t.Fatalf("expected zero mutating systemd calls on steady stopped unit, got %v", env.systemd.calls)
 		}
 	}
@@ -2780,6 +2793,13 @@ func (f *failPostRollbackQuerySystemd) ActiveState(ctx context.Context, scope, u
 	return f.Systemd.ActiveState(ctx, scope, unit)
 }
 
+func (f *failPostRollbackQuerySystemd) UnitState(ctx context.Context, scope, unit string) (apply.UnitStatusInfo, error) {
+	if f.rollbackRestartSeen {
+		return apply.UnitStatusInfo{}, errors.New("simulated post-rollback query failure")
+	}
+	return f.Systemd.UnitState(ctx, scope, unit)
+}
+
 func TestReconcilePopulatesFailedUnitsOnStage5Stage6AndRollback(t *testing.T) {
 	env := newTestEnv(t)
 	netWrapper := &failingSnapshotNetmgr{NetmgrReconciler: env.netmgr}
@@ -2899,5 +2919,432 @@ user = "brokenuser"
 	}
 	if !reflect.DeepEqual(resFallback.FailedUnits, wantFailed) {
 		t.Fatalf("post-rollback fallback FailedUnits = %+v, want %+v", resFallback.FailedUnits, wantFailed)
+	}
+}
+
+type reprovisionUsersReconciler struct {
+	*fakeUsersReconciler
+	missingLinger map[string]bool
+}
+
+func (u *reprovisionUsersReconciler) Plan(ctx context.Context, reg *users.Registry, activeUsers []string, prev []string) (*users.Plan, error) {
+	plan, err := u.fakeUsersReconciler.Plan(ctx, reg, activeUsers, prev)
+	if err != nil {
+		return nil, err
+	}
+	for _, user := range activeUsers {
+		if u.missingLinger[user] {
+			spec := reg.Users[user]
+			plan.Actions = append(plan.Actions, users.Action{
+				Kind: users.EnableLinger,
+				User: user,
+				UID:  spec.UID,
+			})
+		}
+	}
+	return plan, nil
+}
+
+func (u *reprovisionUsersReconciler) Apply(ctx context.Context, reg *users.Registry, activeUsers []string, prev []string) (*users.Plan, error) {
+	plan, err := u.fakeUsersReconciler.Apply(ctx, reg, activeUsers, prev)
+	if err != nil {
+		return plan, err
+	}
+	for _, user := range activeUsers {
+		delete(u.missingLinger, user)
+	}
+	return plan, nil
+}
+
+type reprovisionGuardSystemd struct {
+	apply.Systemd
+	users             *fakeUsersReconciler
+	errBeforeCreation string
+	transientErrScope string
+	cancelOnQueryKey  string
+	cancelFunc        context.CancelFunc
+}
+
+func (s *reprovisionGuardSystemd) UnitState(ctx context.Context, scope, unit string) (apply.UnitStatusInfo, error) {
+	if s.cancelOnQueryKey != "" && scope+"/"+unit == s.cancelOnQueryKey {
+		s.cancelFunc()
+		return apply.UnitStatusInfo{}, ctx.Err()
+	}
+	if s.errBeforeCreation != "" && scope == s.errBeforeCreation && s.users.created[scope] == 0 {
+		return apply.UnitStatusInfo{}, fmt.Errorf("user %q does not exist yet on host", scope)
+	}
+	if s.transientErrScope != "" && scope == s.transientErrScope {
+		return apply.UnitStatusInfo{}, fmt.Errorf("dbus connection failed for %s", scope)
+	}
+	return s.Systemd.UnitState(ctx, scope, unit)
+}
+
+func TestReconcileReprovisioningWithPreservedVarRecreatesUserAndUnits(t *testing.T) {
+	env := newTestEnv(t)
+
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml":             []byte("[users.openwebui]\nuid = 2001\n"),
+		"hosts/services-02.toml": []byte("hostname = \"services-02\"\n\n[[component]]\nname = \"open-webui\"\nuser = \"openwebui\"\n"),
+		"components/open-webui/open-webui.container": []byte("[Container]\nImage=ghcr.io/open-webui/open-webui:v1\n"),
+		"components/open-webui/files/config.yaml":    []byte("theme: dark\n"),
+	})
+	sha1 := env.commitRepo("commit 1: baseline")
+
+	// Initial apply populates state.json in /var/lib/quadmatic.
+	if _, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond)); err != nil {
+		t.Fatalf("commit 1 failed: %v", err)
+	}
+
+	// Simulate OS reprovisioning with preserved /var (state.json intact), wiped /etc/passwd,
+	// wiped /var/lib/systemd/linger, and wiped /etc/containers/systemd/users/2001/open-webui.container.
+	if err := os.Remove(env.hostPath("/etc/containers/systemd/users/2001/open-webui.container")); err != nil {
+		t.Fatalf("remove quadlet on reprovisioned root: %v", err)
+	}
+	delete(env.users.created, "openwebui")
+	delete(env.systemd.states, "openwebui/open-webui.service")
+
+	usersRec := &reprovisionUsersReconciler{
+		fakeUsersReconciler: env.users,
+		missingLinger:       map[string]bool{"openwebui": true},
+	}
+	guardSys := &reprovisionGuardSystemd{
+		Systemd:           env.systemd,
+		users:             env.users,
+		errBeforeCreation: "openwebui",
+	}
+	env.engine = apply.NewEngine(apply.EngineDeps{
+		Config:             env.cfg,
+		Git:                env.git,
+		Users:              usersRec,
+		Quadlet:            env.quadlet,
+		Secrets:            env.secretsMgr,
+		Netmgr:             env.netmgr,
+		Systemd:            guardSys,
+		RootDir:            env.rootDir,
+		Chown:              func(string, int, int) error { return nil },
+		DHCPTimeout:        100 * time.Millisecond,
+		VerifyPollInterval: 5 * time.Millisecond,
+	})
+	env.systemd.clearCalls()
+
+	res, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("reprovision Reconcile failed: %v", err)
+	}
+	if res.AppliedSHA != sha1 || !res.DriftDetected {
+		t.Fatalf("unexpected reprovision result: %+v", res)
+	}
+	if env.users.created["openwebui"] != 2001 {
+		t.Fatalf("expected openwebui user recreated with uid 2001, got %+v", env.users.created)
+	}
+	if _, err := os.Stat(env.hostPath("/etc/containers/systemd/users/2001/open-webui.container")); err != nil {
+		t.Fatalf("expected open-webui.container rewritten after reprovision: %v", err)
+	}
+	if env.systemd.countCalls("daemon-reload", "openwebui", "") != 1 {
+		t.Fatalf("expected daemon-reload for recreated openwebui user, calls=%v", env.systemd.calls)
+	}
+	if env.systemd.countCalls("restart", "openwebui", "open-webui.service")+env.systemd.countCalls("start", "openwebui", "open-webui.service") == 0 {
+		t.Fatalf("expected open-webui.service started/restarted after reprovision, calls=%v", env.systemd.calls)
+	}
+	if len(res.FailedUnits) != 0 {
+		t.Fatalf("expected zero FailedUnits after reprovision recovery, got %+v", res.FailedUnits)
+	}
+
+	// Non-context per-unit query error (e.g., user deleted out-of-band / transient D-Bus failure)
+	// must record ActiveState="unknown" instead of failing Stage 4, while context cancellation
+	// must fail with FailedStage="validate".
+	guardSys.errBeforeCreation = ""
+	guardSys.transientErrScope = "openwebui"
+	dryOpts := env.reconcileOpts(100 * time.Millisecond)
+	dryOpts.DryRun = true
+	resTransient, err := env.engine.Reconcile(context.Background(), dryOpts)
+	if err != nil {
+		t.Fatalf("expected non-context per-unit query error not to wedge Stage 4, got: %v", err)
+	}
+	wantUnknown := []apply.UnitStatus{{Scope: "openwebui", Unit: "open-webui.service", ActiveState: "unknown"}}
+	if !reflect.DeepEqual(resTransient.FailedUnits, wantUnknown) {
+		t.Fatalf("FailedUnits = %+v, want %+v", resTransient.FailedUnits, wantUnknown)
+	}
+
+	guardSys.transientErrScope = ""
+	ctxCancel, cancel := context.WithCancel(context.Background())
+	guardSys.cancelOnQueryKey = "openwebui/open-webui.service"
+	guardSys.cancelFunc = cancel
+	resCtx, err := env.engine.Reconcile(ctxCancel, env.reconcileOpts(100*time.Millisecond))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled from Stage 4 query, got %v", err)
+	}
+	if resCtx == nil || resCtx.FailedStage != "validate" {
+		t.Fatalf("expected FailedStage = \"validate\" on pre-apply Stage 4 context error, got %+v", resCtx)
+	}
+}
+
+func TestReconcileHealthyOneshotNotReportedAsFailed(t *testing.T) {
+	env := newTestEnv(t)
+
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml": []byte("[users.db]\nuid = 2001\n\n[users.brokenuser]\nuid = 2002\n"),
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "db-migrate"
+user = "db"
+`),
+		"components/db-migrate/db-migrate.container": []byte("[Container]\nImage=alpine:3.20\n"),
+	})
+	sha1 := env.commitRepo("commit 1: healthy oneshot")
+
+	env.systemd.overrideUnitState["db/db-migrate.service"] = apply.UnitStatusInfo{
+		ActiveState: "inactive",
+		Type:        "oneshot",
+		Result:      "success",
+	}
+
+	res1, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("commit 1 failed: %v", err)
+	}
+	if res1.AppliedSHA != sha1 || len(res1.FailedUnits) != 0 {
+		t.Fatalf("unexpected commit 1 result: %+v", res1)
+	}
+
+	// Subsequent steady tick must NOT report healthy oneshot in FailedUnits.
+	res2, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("subsequent tick failed: %v", err)
+	}
+	if len(res2.FailedUnits) != 0 {
+		t.Fatalf("expected healthy oneshot excluded from Result.FailedUnits on subsequent tick, got %+v", res2.FailedUnits)
+	}
+
+	// Failed apply triggering rollback must also NOT report healthy oneshot in post-rollback FailedUnits.
+	env.systemd.overrideActiveState["brokenuser/broken.service"] = "failed"
+	env.writeRepoFiles(map[string][]byte{
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "db-migrate"
+user = "db"
+
+[[component]]
+name = "broken"
+user = "brokenuser"
+`),
+		"components/broken/broken.container": []byte("[Container]\nImage=example.invalid/broken:latest\n"),
+	})
+	env.commitRepo("commit 2: add failing unit")
+
+	res3, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(50*time.Millisecond))
+	if err == nil || !res3.RolledBack {
+		t.Fatalf("expected commit 2 rollback, got res=%+v err=%v", res3, err)
+	}
+	if len(res3.FailedUnits) != 0 {
+		t.Fatalf("expected healthy oneshot excluded from post-rollback Result.FailedUnits, got %+v", res3.FailedUnits)
+	}
+}
+
+type dryRunSpyGitClient struct {
+	*gitops.Client
+	fetchAndVerifyCalls       int
+	fetchAndVerifyDryRunCalls int
+	cleanupCalls              int
+}
+
+func (g *dryRunSpyGitClient) FetchAndVerify(ctx context.Context, appliedSHA string, allowNonFF bool) (string, error) {
+	g.fetchAndVerifyCalls++
+	return g.Client.FetchAndVerify(ctx, appliedSHA, allowNonFF)
+}
+
+func (g *dryRunSpyGitClient) FetchAndVerifyDryRun(ctx context.Context, appliedSHA string, allowNonFF bool) (string, func(), error) {
+	g.fetchAndVerifyDryRunCalls++
+	sha, cleanup, err := g.Client.FetchAndVerifyDryRun(ctx, appliedSHA, allowNonFF)
+	if cleanup == nil {
+		return sha, nil, err
+	}
+	return sha, func() {
+		g.cleanupCalls++
+		cleanup()
+	}, err
+}
+
+func TestReconcileRemoteDryRunUsesEphemeralGitFetch(t *testing.T) {
+	base := t.TempDir()
+	rootDir := filepath.Join(base, "rootfs")
+	remoteBare := filepath.Join(base, "remote.git")
+	workDir := filepath.Join(base, "work")
+	mirrorDir := filepath.Join(base, "mirror.git")
+	stateFile := filepath.Join(base, "state", "state.json")
+
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	signingKey := filepath.Join(base, "signing_ed25519")
+	if out, err := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-f", signingKey).CombinedOutput(); err != nil {
+		t.Fatalf("ssh-keygen failed: %v\n%s", err, string(out))
+	}
+	pubBytes, err := os.ReadFile(signingKey + ".pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowedSigners := filepath.Join(base, "allowed-signers")
+	if err := os.WriteFile(allowedSigners, []byte("ci@example.lan "+strings.TrimSpace(string(pubBytes))+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deployKey := filepath.Join(base, "deploy_key")
+	knownHosts := filepath.Join(base, "known_hosts")
+	_ = os.WriteFile(deployKey, []byte("dummy\n"), 0o600)
+	_ = os.WriteFile(knownHosts, []byte("example.invalid ssh-ed25519 AAAA\n"), 0o600)
+
+	if out, err := exec.Command("git", "init", "--bare", "-b", "main", remoteBare).CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v\n%s", err, string(out))
+	}
+	initGitRepo(t, workDir)
+	runGitCmd(t, workDir, "config", "gpg.format", "ssh")
+	runGitCmd(t, workDir, "remote", "add", "origin", remoteBare)
+
+	writeWork := func(rel, content string) {
+		p := filepath.Join(workDir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commitSignedAndPush := func(msg string) string {
+		runGitCmd(t, workDir, "add", "-A")
+		runGitCmd(t, workDir, "-c", "user.signingkey="+signingKey, "commit", "-S", "-m", msg)
+		runGitCmd(t, workDir, "push", "origin", "HEAD:refs/heads/main")
+		return strings.TrimSpace(runGitCmd(t, workDir, "rev-parse", "HEAD"))
+	}
+
+	writeWork("users.toml", "[users.caddy]\nuid = 2002\n")
+	writeWork("hosts/services-02.toml", "hostname = \"services-02\"\n\n[[component]]\nname = \"caddy\"\nuser = \"caddy\"\n")
+	writeWork("components/caddy/caddy.container", "[Container]\nImage=docker.io/library/caddy:v1\n")
+	sha1 := commitSignedAndPush("commit 1")
+
+	cfg := &config.HostConfig{
+		Hostname:       "services-02",
+		RepoURL:        remoteBare,
+		Branch:         "main",
+		SSHKey:         deployKey,
+		SSHKnownHosts:  knownHosts,
+		AllowedSigners: allowedSigners,
+		TrunkInterface: "enp3s0",
+		StateFile:      stateFile,
+		RepoDir:        mirrorDir,
+	}
+
+	spyGit := &dryRunSpyGitClient{Client: gitops.NewClient(cfg)}
+	engine := apply.NewEngine(apply.EngineDeps{
+		Config:             cfg,
+		Git:                spyGit,
+		Users:              newFakeUsersReconciler(),
+		Quadlet:            quadlet.NewValidator("/fake/quadlet", &fakeQuadletRunner{}),
+		Secrets:            secrets.NewManager(newFakeSecretRunner()),
+		Netmgr:             netmgr.NewReconciler("enp3s0", newFakeNetRunner(), newZeroSysctl()),
+		Systemd:            newFakeSystemd(),
+		RootDir:            rootDir,
+		Chown:              func(string, int, int) error { return nil },
+		DHCPTimeout:        100 * time.Millisecond,
+		VerifyPollInterval: 5 * time.Millisecond,
+	})
+
+	// Apply commit 1 normally.
+	res1, err := engine.Reconcile(context.Background(), apply.ReconcileOptions{StartVerifyTimeout: 100 * time.Millisecond})
+	if err != nil || res1.AppliedSHA != sha1 {
+		t.Fatalf("commit 1 Reconcile = (%+v, %v), want sha=%s", res1, err, sha1)
+	}
+	refsBefore := strings.TrimSpace(runGitCmd(t, mirrorDir, "show-ref"))
+
+	// Push commit 2 and run remote --dry-run (LocalRepoPath == "", DryRun == true).
+	writeWork("components/caddy/caddy.container", "[Container]\nImage=docker.io/library/caddy:v2\n")
+	sha2 := commitSignedAndPush("commit 2")
+
+	spyGit.fetchAndVerifyCalls = 0
+	spyGit.fetchAndVerifyDryRunCalls = 0
+	spyGit.cleanupCalls = 0
+
+	resDry, err := engine.Reconcile(context.Background(), apply.ReconcileOptions{
+		DryRun:             true,
+		StartVerifyTimeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("remote DryRun Reconcile failed: %v", err)
+	}
+	if spyGit.fetchAndVerifyCalls != 0 {
+		t.Fatalf("remote DryRun must NEVER call FetchAndVerify, got %d calls", spyGit.fetchAndVerifyCalls)
+	}
+	if spyGit.fetchAndVerifyDryRunCalls != 1 {
+		t.Fatalf("expected 1 FetchAndVerifyDryRun call, got %d", spyGit.fetchAndVerifyDryRunCalls)
+	}
+	if spyGit.cleanupCalls != 1 {
+		t.Fatalf("expected FetchAndVerifyDryRun cleanup called once, got %d", spyGit.cleanupCalls)
+	}
+	if !strings.Contains(resDry.PlanSummary, sha2) {
+		t.Fatalf("expected PlanSummary to reference fetched SHA %s, got:\n%s", sha2, resDry.PlanSummary)
+	}
+	refsAfter := strings.TrimSpace(runGitCmd(t, mirrorDir, "show-ref"))
+	if refsAfter != refsBefore {
+		t.Fatalf("remote DryRun mutated cfg.RepoDir refs!\nbefore:\n%s\nafter:\n%s", refsBefore, refsAfter)
+	}
+}
+
+func TestReconcileLockTimeoutReturnsClearError(t *testing.T) {
+	env := newTestEnv(t)
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml":                       []byte("[users.caddy]\nuid = 2002\n"),
+		"hosts/services-02.toml":           []byte("hostname = \"services-02\"\n\n[[component]]\nname = \"caddy\"\nuser = \"caddy\"\n"),
+		"components/caddy/caddy.container": []byte("[Container]\nImage=docker.io/library/caddy:v1\n"),
+	})
+	env.commitRepo("commit 1")
+
+	lockPath := env.stateFile + ".lock"
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("acquire test flock: %v", err)
+	}
+	defer func() {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	}()
+
+	engine := apply.NewEngine(apply.EngineDeps{
+		Config:             env.cfg,
+		Git:                env.git,
+		Users:              env.users,
+		Quadlet:            env.quadlet,
+		Secrets:            env.secretsMgr,
+		Netmgr:             env.netmgr,
+		Systemd:            env.systemd,
+		RootDir:            env.rootDir,
+		Chown:              func(string, int, int) error { return nil },
+		DHCPTimeout:        100 * time.Millisecond,
+		LockTimeout:        60 * time.Millisecond,
+		VerifyPollInterval: 5 * time.Millisecond,
+	})
+
+	res, err := engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err == nil {
+		t.Fatal("expected lock timeout error, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected DeadlineExceeded error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), lockPath) {
+		t.Fatalf("expected lock timeout error to name lock path %q, got: %v", lockPath, err)
+	}
+	if res == nil || res.FailedStage != "fetch" {
+		t.Fatalf("expected FailedStage = \"fetch\", got %+v", res)
 	}
 }

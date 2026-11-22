@@ -1243,7 +1243,7 @@ mac = "02:51:4d:00:07:e1"
 		}
 	})
 
-	t.Run("vlan 0 uses trunk_interface placeholder unless ParentIfaces[0] set", func(t *testing.T) {
+	t.Run("vlan 0 uses trunk_interface placeholder in DryRun and errors when non-DryRun without ParentIfaces[0]", func(t *testing.T) {
 		r := newTestRepo(t)
 		reg := r.parseRegistry(t, "[users.u1]\nuid = 2001\n")
 		r.writeFile(t, "components/app/app.container.tmpl", "parent={{ .Net.ParentInterface }}\n")
@@ -1271,6 +1271,24 @@ dns = ["10.0.0.1"]
 			t.Fatalf("expected trunk_interface placeholder, got %q", gotDefault)
 		}
 
+		// Non-dry-run with vlan=0 and missing ParentIfaces[0] must return an explicit error.
+		if _, err := manifest.RenderHost(resolved, manifest.RenderEnv{DryRun: false}); err == nil {
+			t.Fatal("expected error when DryRun=false, vlan=0, and ParentIfaces[0] is empty")
+		}
+
+		// Non-dry-run with explicit ParentIfaces[0] succeeds.
+		renderedLive, err := manifest.RenderHost(resolved, manifest.RenderEnv{
+			ParentIfaces: map[int]string{0: "enp3s0"},
+			DryRun:       false,
+		})
+		if err != nil {
+			t.Fatalf("RenderHost live explicit failed: %v", err)
+		}
+		gotLive := string(findRenderedFile(t, renderedLive.Components[0].Files, "app.container").Content)
+		if gotLive != "parent=enp3s0\n" {
+			t.Fatalf("expected enp3s0 parent, got %q", gotLive)
+		}
+
 		renderedExplicit, err := manifest.RenderHost(resolved, manifest.RenderEnv{
 			ParentIfaces: map[int]string{0: "enp3s0"},
 			DryRun:       true,
@@ -1281,6 +1299,77 @@ dns = ["10.0.0.1"]
 		gotExplicit := string(findRenderedFile(t, renderedExplicit.Components[0].Files, "app.container").Content)
 		if gotExplicit != "parent=enp3s0\n" {
 			t.Fatalf("expected enp3s0 parent, got %q", gotExplicit)
+		}
+	})
+
+	t.Run("loads and renders .build and .build.tmpl quadlets", func(t *testing.T) {
+		r := newTestRepo(t)
+		reg := r.parseRegistry(t, "[users.builder]\nuid = 2005\n")
+		r.writeFile(t, "components/custom/static.build", "[Build]\nImageTag=localhost/static:1\n")
+		r.writeFile(t, "components/custom/templated.build.tmpl", "[Build]\nImageTag=localhost/app:{{ .Host.Vars.tag }}\n")
+		r.writeFile(t, "components/custom/custom.container", "[Container]\nImage=localhost/app:latest\n")
+		r.writeFile(t, "hosts/node.toml", `
+[vars]
+tag = "v1.2"
+
+[[component]]
+name = "custom"
+user = "builder"
+`)
+		resolved, err := manifest.LoadHost(r.root, "node", reg)
+		if err != nil {
+			t.Fatalf("LoadHost failed: %v", err)
+		}
+		if err := manifest.Validate(resolved, r.root); err != nil {
+			t.Fatalf("Validate failed: %v", err)
+		}
+		rendered, err := manifest.RenderHost(resolved, manifest.RenderEnv{DryRun: true})
+		if err != nil {
+			t.Fatalf("RenderHost failed: %v", err)
+		}
+		comp := findRenderedComponent(t, rendered.Components, "custom")
+		staticBuild := findRenderedFile(t, comp.Files, "static.build")
+		if staticBuild.Kind != manifest.FileKindQuadlet || staticBuild.DestPath != "/etc/containers/systemd/users/2005/static.build" {
+			t.Fatalf("unexpected static.build metadata: %+v", staticBuild)
+		}
+		tmplBuild := findRenderedFile(t, comp.Files, "templated.build")
+		if tmplBuild.Kind != manifest.FileKindQuadlet || tmplBuild.DestPath != "/etc/containers/systemd/users/2005/templated.build" {
+			t.Fatalf("unexpected templated.build metadata: %+v", tmplBuild)
+		}
+		if !strings.Contains(string(tmplBuild.Content), "ImageTag=localhost/app:v1.2") {
+			t.Fatalf("unexpected rendered templated.build content:\n%s", string(tmplBuild.Content))
+		}
+	})
+
+	t.Run("RenderHost rejects rootless component with non-positive UID or empty DataDir", func(t *testing.T) {
+		badUID := &manifest.ResolvedHost{
+			Hostname: "node",
+			Components: []manifest.ResolvedComponent{
+				{
+					Name:    "app",
+					User:    "app",
+					UID:     0,
+					DataDir: "/var/home/app/.config/quadmatic/app",
+				},
+			},
+		}
+		if _, err := manifest.RenderHost(badUID, manifest.RenderEnv{DryRun: true}); err == nil {
+			t.Fatal("expected RenderHost to reject rootless component with UID <= 0")
+		}
+
+		badDataDir := &manifest.ResolvedHost{
+			Hostname: "node",
+			Components: []manifest.ResolvedComponent{
+				{
+					Name:    "app",
+					User:    "app",
+					UID:     2001,
+					DataDir: "   ",
+				},
+			},
+		}
+		if _, err := manifest.RenderHost(badDataDir, manifest.RenderEnv{DryRun: true}); err == nil {
+			t.Fatal("expected RenderHost to reject rootless component with empty DataDir")
 		}
 	})
 

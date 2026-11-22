@@ -44,8 +44,9 @@ type SysctlReader interface {
 
 // Snapshot captures pre-apply owned NetworkManager profiles for transactional rollback.
 type Snapshot struct {
-	Profiles     map[string]string
-	OwnedRecords []state.ManagedNetworkRecord
+	Profiles       map[string]string
+	ActiveProfiles map[string]bool
+	OwnedRecords   []state.ManagedNetworkRecord
 }
 
 type execRunner struct{}

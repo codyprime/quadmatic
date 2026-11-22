@@ -126,7 +126,10 @@ func (r *Reconciler) Plan(ctx context.Context, reg *Registry, activeUsers []stri
 
 	for _, name := range sortedActive {
 		spec := reg.Users[name]
-		targetStart, targetCount := SubIDRange(spec.UID, spec, reg.SubID)
+		targetStart, targetCount, err := computeSubIDRange(spec.UID, spec, reg.SubID)
+		if err != nil {
+			return nil, fmt.Errorf("user %q: %w", name, err)
+		}
 		targetSubID := SubIDEntry{Name: name, Start: targetStart, Count: targetCount}
 
 		if err := CheckSubIDOverlap(nonActiveSubUID, targetSubID); err != nil {
@@ -233,6 +236,8 @@ func (r *Reconciler) Apply(ctx context.Context, reg *Registry, activeUsers []str
 		return nil, err
 	}
 
+	createdUsers := make(map[string]bool)
+	subIDOrMigrateUsers := make(map[string]bool)
 	var subuidUpdates []SubIDEntry
 	var subgidUpdates []SubIDEntry
 	var lingerActions []Action
@@ -244,15 +249,18 @@ func (r *Reconciler) Apply(ctx context.Context, reg *Registry, activeUsers []str
 			if err := r.createUser(ctx, act); err != nil {
 				return plan, err
 			}
+			createdUsers[act.User] = true
 		case AdoptUser:
 			// Explicitly a no-op: never invoke usermod or mutate adopted user attributes.
 		case UpdateSubUID:
+			subIDOrMigrateUsers[act.User] = true
 			subuidUpdates = append(subuidUpdates, SubIDEntry{
 				Name:  act.User,
 				Start: act.Start,
 				Count: act.Count,
 			})
 		case UpdateSubGID:
+			subIDOrMigrateUsers[act.User] = true
 			subgidUpdates = append(subgidUpdates, SubIDEntry{
 				Name:  act.User,
 				Start: act.Start,
@@ -261,8 +269,64 @@ func (r *Reconciler) Apply(ctx context.Context, reg *Registry, activeUsers []str
 		case EnableLinger:
 			lingerActions = append(lingerActions, act)
 		case MigratePodman:
+			subIDOrMigrateUsers[act.User] = true
 			migrateActions = append(migrateActions, act)
 		}
+	}
+
+	var preSubIDLingerActions []Action
+	var postSubIDLingerActions []Action
+	for _, act := range lingerActions {
+		if !createdUsers[act.User] && subIDOrMigrateUsers[act.User] {
+			preSubIDLingerActions = append(preSubIDLingerActions, act)
+		} else {
+			postSubIDLingerActions = append(postSubIDLingerActions, act)
+		}
+	}
+
+	// For adopted users that need both linger and subid/migration updates, enable linger
+	// before mutating /etc/subuid or /etc/subgid so a bus-wait failure never leaves
+	// subids updated without running `podman system migrate`.
+	for _, act := range preSubIDLingerActions {
+		if err := r.enableLingerAndWait(ctx, act); err != nil {
+			return plan, err
+		}
+	}
+
+	var (
+		hasSubIDSnap bool
+		subuidSnap   subIDFileSnapshot
+		subgidSnap   subIDFileSnapshot
+	)
+	if len(migrateActions) > 0 {
+		var err error
+		subuidSnap, err = snapshotSubIDFile(r.opts.SubUIDPath)
+		if err != nil {
+			return plan, err
+		}
+		subgidSnap, err = snapshotSubIDFile(r.opts.SubGIDPath)
+		if err != nil {
+			return plan, err
+		}
+		hasSubIDSnap = true
+	}
+
+	restoreSubIDs := func() error {
+		if !hasSubIDSnap {
+			return nil
+		}
+		var errs []error
+		if len(subuidUpdates) > 0 {
+			if err := restoreSubIDSnapshot(r.opts.SubUIDPath, subuidSnap); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if len(subgidUpdates) > 0 {
+			if err := restoreSubIDSnapshot(r.opts.SubGIDPath, subgidSnap); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		return errors.Join(errs...)
 	}
 
 	if len(subuidUpdates) > 0 {
@@ -272,12 +336,21 @@ func (r *Reconciler) Apply(ctx context.Context, reg *Registry, activeUsers []str
 	}
 	if len(subgidUpdates) > 0 {
 		if err := applySubIDUpdatesAtomic(r.opts.SubGIDPath, subgidUpdates); err != nil {
-			return plan, fmt.Errorf("update %s: %w", r.opts.SubGIDPath, err)
+			updErr := fmt.Errorf("update %s: %w", r.opts.SubGIDPath, err)
+			if len(subuidUpdates) > 0 && hasSubIDSnap {
+				if rbErr := restoreSubIDSnapshot(r.opts.SubUIDPath, subuidSnap); rbErr != nil {
+					return plan, errors.Join(updErr, rbErr)
+				}
+			}
+			return plan, updErr
 		}
 	}
 
-	for _, act := range lingerActions {
+	for _, act := range postSubIDLingerActions {
 		if err := r.enableLingerAndWait(ctx, act); err != nil {
+			if rbErr := restoreSubIDs(); rbErr != nil {
+				return plan, errors.Join(err, rbErr)
+			}
 			return plan, err
 		}
 	}
@@ -295,7 +368,11 @@ func (r *Reconciler) Apply(ctx context.Context, reg *Registry, activeUsers []str
 			"system",
 			"migrate",
 		); err != nil {
-			return plan, fmt.Errorf("podman system migrate for %q: %w", act.User, err)
+			migErr := fmt.Errorf("podman system migrate for %q: %w", act.User, err)
+			if rbErr := restoreSubIDs(); rbErr != nil {
+				return plan, errors.Join(migErr, rbErr)
+			}
+			return plan, migErr
 		}
 	}
 
@@ -363,6 +440,48 @@ func (r *Reconciler) waitForBus(ctx context.Context, user, busPath string) error
 			}
 		}
 	}
+}
+
+type subIDFileSnapshot struct {
+	existed bool
+	data    []byte
+	mode    os.FileMode
+}
+
+func snapshotSubIDFile(path string) (subIDFileSnapshot, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return subIDFileSnapshot{existed: false}, nil
+		}
+		return subIDFileSnapshot{}, fmt.Errorf("snapshot %q: %w", path, err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return subIDFileSnapshot{}, fmt.Errorf("read %q for snapshot: %w", path, err)
+	}
+	return subIDFileSnapshot{
+		existed: true,
+		data:    data,
+		mode:    info.Mode().Perm(),
+	}, nil
+}
+
+func restoreSubIDSnapshot(path string, snap subIDFileSnapshot) error {
+	if !snap.existed {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove %q during rollback: %w", path, err)
+		}
+		return nil
+	}
+	mode := snap.mode
+	if mode == 0 {
+		mode = 0o644
+	}
+	if err := writeFileAtomic(path, snap.data, mode); err != nil {
+		return fmt.Errorf("restore %q during rollback: %w", path, err)
+	}
+	return nil
 }
 
 func isNoLoginShell(shell string) bool {
