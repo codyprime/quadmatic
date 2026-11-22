@@ -257,21 +257,6 @@ func (f *fakeSystemd) Restart(_ context.Context, scope, unit string) error {
 	return nil
 }
 
-func (f *fakeSystemd) ActiveState(_ context.Context, scope, unit string) (string, error) {
-	f.calls = append(f.calls, systemdCall{op: "active-state", scope: scope, unit: unit})
-	key := scope + "/" + unit
-	if ov, ok := f.overrideUnitState[key]; ok {
-		return ov.ActiveState, nil
-	}
-	if st, ok := f.overrideActiveState[key]; ok {
-		return st, nil
-	}
-	if st, ok := f.states[key]; ok {
-		return st, nil
-	}
-	return "inactive", nil
-}
-
 func (f *fakeSystemd) UnitState(_ context.Context, scope, unit string) (apply.UnitStatusInfo, error) {
 	f.calls = append(f.calls, systemdCall{op: "unit-state", scope: scope, unit: unit})
 	key := scope + "/" + unit
@@ -1445,9 +1430,10 @@ func (f *fakeSystemctlRunner) Run(_ context.Context, name string, args ...string
 }
 
 func TestSystemctlCommandsAndValidation(t *testing.T) {
-	runner := &fakeSystemctlRunner{out: []byte("active\n")}
+	runner := &fakeSystemctlRunner{out: []byte("ActiveState=active\nType=simple\nResult=success\n")}
 	sys := apply.NewSystemctl(runner)
 	ctx := context.Background()
+	wantInfo := apply.UnitStatusInfo{ActiveState: "active", Type: "simple", Result: "success"}
 
 	if err := sys.DaemonReload(ctx, "rootful"); err != nil {
 		t.Fatal(err)
@@ -1461,9 +1447,9 @@ func TestSystemctlCommandsAndValidation(t *testing.T) {
 	if err := sys.Restart(ctx, "rootful", "caddy.service"); err != nil {
 		t.Fatal(err)
 	}
-	st, err := sys.ActiveState(ctx, "rootful", "caddy.service")
-	if err != nil || st != "active" {
-		t.Fatalf("ActiveState = (%q, %v), want (\"active\", nil)", st, err)
+	st, err := sys.UnitState(ctx, "rootful", "caddy.service")
+	if err != nil || st != wantInfo {
+		t.Fatalf("UnitState = (%+v, %v), want (%+v, nil)", st, err, wantInfo)
 	}
 
 	if err := sys.DaemonReload(ctx, "openwebui"); err != nil {
@@ -1478,9 +1464,9 @@ func TestSystemctlCommandsAndValidation(t *testing.T) {
 	if err := sys.Restart(ctx, "openwebui", "open-webui.service"); err != nil {
 		t.Fatal(err)
 	}
-	st, err = sys.ActiveState(ctx, "openwebui", "open-webui.service")
-	if err != nil || st != "active" {
-		t.Fatalf("ActiveState rootless = (%q, %v), want (\"active\", nil)", st, err)
+	st, err = sys.UnitState(ctx, "openwebui", "open-webui.service")
+	if err != nil || st != wantInfo {
+		t.Fatalf("UnitState rootless = (%+v, %v), want (%+v, nil)", st, err, wantInfo)
 	}
 
 	wantCalls := []string{
@@ -1488,12 +1474,12 @@ func TestSystemctlCommandsAndValidation(t *testing.T) {
 		"systemctl start caddy.service",
 		"systemctl stop caddy.service",
 		"systemctl restart caddy.service",
-		"systemctl show -p ActiveState --value caddy.service",
+		"systemctl show -p ActiveState -p Type -p Result caddy.service",
 		"systemctl --user -M openwebui@ daemon-reload",
 		"systemctl --user -M openwebui@ start open-webui.service",
 		"systemctl --user -M openwebui@ stop open-webui.service",
 		"systemctl --user -M openwebui@ restart open-webui.service",
-		"systemctl --user -M openwebui@ show -p ActiveState --value open-webui.service",
+		"systemctl --user -M openwebui@ show -p ActiveState -p Type -p Result open-webui.service",
 	}
 	if !reflect.DeepEqual(runner.calls, wantCalls) {
 		t.Fatalf("systemctl calls =\n%v\nwant:\n%v", runner.calls, wantCalls)
@@ -1670,14 +1656,6 @@ func (c *cancelOnStartSystemd) Restart(ctx context.Context, scope, unit string) 
 		c.rollbackCtxErrs = append(c.rollbackCtxErrs, fmt.Errorf("Restart(%s/%s): %w", scope, unit, ctx.Err()))
 	}
 	return c.Systemd.Restart(ctx, scope, unit)
-}
-
-func (c *cancelOnStartSystemd) ActiveState(ctx context.Context, scope, unit string) (string, error) {
-	if !c.inRollback && ctx.Err() != nil {
-		c.inRollback = true
-		return "", ctx.Err()
-	}
-	return c.Systemd.ActiveState(ctx, scope, unit)
 }
 
 func (c *cancelOnStartSystemd) UnitState(ctx context.Context, scope, unit string) (apply.UnitStatusInfo, error) {
@@ -2778,24 +2756,27 @@ func (f *failingSnapshotNetmgr) Snapshot(ctx context.Context, host *manifest.Res
 
 type failPostRollbackQuerySystemd struct {
 	apply.Systemd
-	rollbackRestartSeen bool
+	stopBrokenSeen   bool
+	failNonCtxKey    string
+	waitForCtxCancel bool
 }
 
-func (f *failPostRollbackQuerySystemd) Restart(ctx context.Context, scope, unit string) error {
-	f.rollbackRestartSeen = true
-	return f.Systemd.Restart(ctx, scope, unit)
-}
-
-func (f *failPostRollbackQuerySystemd) ActiveState(ctx context.Context, scope, unit string) (string, error) {
-	if f.rollbackRestartSeen {
-		return "", errors.New("simulated post-rollback query failure")
+func (f *failPostRollbackQuerySystemd) Stop(ctx context.Context, scope, unit string) error {
+	if scope+"/"+unit == "brokenuser/broken.service" {
+		f.stopBrokenSeen = true
 	}
-	return f.Systemd.ActiveState(ctx, scope, unit)
+	return f.Systemd.Stop(ctx, scope, unit)
 }
 
 func (f *failPostRollbackQuerySystemd) UnitState(ctx context.Context, scope, unit string) (apply.UnitStatusInfo, error) {
-	if f.rollbackRestartSeen {
-		return apply.UnitStatusInfo{}, errors.New("simulated post-rollback query failure")
+	if f.stopBrokenSeen {
+		if f.waitForCtxCancel {
+			<-ctx.Done()
+			return apply.UnitStatusInfo{}, ctx.Err()
+		}
+		if f.failNonCtxKey != "" && scope+"/"+unit == f.failNonCtxKey {
+			return apply.UnitStatusInfo{}, errors.New("simulated post-rollback query failure")
+		}
 	}
 	return f.Systemd.UnitState(ctx, scope, unit)
 }
@@ -2898,8 +2879,41 @@ user = "brokenuser"
 		t.Fatalf("post-rollback FailedUnits = %+v, want %+v", res7.FailedUnits, wantFailed)
 	}
 
-	// 4. Fallback to stage4FailedUnits if post-rollback ActiveState query errors.
-	fallbackSys := &failPostRollbackQuerySystemd{Systemd: env.systemd}
+	// 4. Non-context per-unit error in queryPrevStateFailedUnits continues past the error and reports both unknown and failed units.
+	partialFailSys := &failPostRollbackQuerySystemd{
+		Systemd:       env.systemd,
+		failNonCtxKey: "healthy/healthy.service",
+	}
+	env.engine = apply.NewEngine(apply.EngineDeps{
+		Config:             env.cfg,
+		Git:                env.git,
+		Users:              env.users,
+		Quadlet:            env.quadlet,
+		Secrets:            env.secretsMgr,
+		Netmgr:             env.netmgr,
+		Systemd:            partialFailSys,
+		RootDir:            env.rootDir,
+		Chown:              func(string, int, int) error { return nil },
+		DHCPTimeout:        100 * time.Millisecond,
+		VerifyPollInterval: 5 * time.Millisecond,
+	})
+	resPartial, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(50*time.Millisecond))
+	if err == nil || !resPartial.RolledBack || resPartial.AppliedSHA != sha1 {
+		t.Fatalf("expected rollback to %q, got res=%+v err=%v", sha1, resPartial, err)
+	}
+	wantPartialFailed := []apply.UnitStatus{
+		{Scope: "healthy", Unit: "healthy.service", ActiveState: "unknown"},
+		{Scope: "unhealthy", Unit: "unhealthy.service", ActiveState: "failed"},
+	}
+	if !reflect.DeepEqual(resPartial.FailedUnits, wantPartialFailed) {
+		t.Fatalf("post-rollback partial error FailedUnits = %+v, want %+v", resPartial.FailedUnits, wantPartialFailed)
+	}
+
+	// 5. Fallback to stage4FailedUnits when post-rollback UnitState query hits context deadline/cancel.
+	fallbackSys := &failPostRollbackQuerySystemd{
+		Systemd:          env.systemd,
+		waitForCtxCancel: true,
+	}
 	env.engine = apply.NewEngine(apply.EngineDeps{
 		Config:             env.cfg,
 		Git:                env.git,
@@ -2911,6 +2925,7 @@ user = "brokenuser"
 		RootDir:            env.rootDir,
 		Chown:              func(string, int, int) error { return nil },
 		DHCPTimeout:        100 * time.Millisecond,
+		RollbackTimeout:    30 * time.Millisecond,
 		VerifyPollInterval: 5 * time.Millisecond,
 	})
 	resFallback, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(50*time.Millisecond))
@@ -3346,5 +3361,407 @@ func TestReconcileLockTimeoutReturnsClearError(t *testing.T) {
 	}
 	if res == nil || res.FailedStage != "fetch" {
 		t.Fatalf("expected FailedStage = \"fetch\", got %+v", res)
+	}
+}
+
+type oneShotTransientUnitStateSystemd struct {
+	apply.Systemd
+	targetKey string
+	failOnce  bool
+}
+
+func (s *oneShotTransientUnitStateSystemd) UnitState(ctx context.Context, scope, unit string) (apply.UnitStatusInfo, error) {
+	if s.failOnce && scope+"/"+unit == s.targetKey {
+		s.failOnce = false
+		return apply.UnitStatusInfo{}, errors.New("dbus connection timed out")
+	}
+	return s.Systemd.UnitState(ctx, scope, unit)
+}
+
+func TestReconcileStage4TransientErrorDoesNotStopRunningUnitOnRollback(t *testing.T) {
+	env := newTestEnv(t)
+
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml": []byte("[users.a]\nuid = 2001\n\n[users.b]\nuid = 2002\n"),
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "a-app"
+user = "a"
+
+[[component]]
+name = "b-app"
+user = "b"
+`),
+		"components/a-app/a-app.container": []byte("[Container]\nImage=alpine:3.20\n"),
+		"components/a-app/files/cfg.ini":   []byte("v=1\n"),
+		"components/b-app/b-app.container": []byte("[Container]\nImage=alpine:3.20\n"),
+	})
+	sha1 := env.commitRepo("commit 1: a + b running")
+	if _, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond)); err != nil {
+		t.Fatalf("commit 1 failed: %v", err)
+	}
+
+	// Commit 2: updates a-app's data file (restarted in Stage 7d) and updates b-app.
+	env.writeRepoFiles(map[string][]byte{
+		"components/a-app/files/cfg.ini":   []byte("v=2\n"),
+		"components/b-app/b-app.container": []byte("[Container]\nImage=alpine:3.21\n"),
+	})
+	env.commitRepo("commit 2: restart a-app + fail b-app")
+
+	transientSys := &oneShotTransientUnitStateSystemd{
+		Systemd:   env.systemd,
+		targetKey: "a/a-app.service",
+		failOnce:  true,
+	}
+	env.engine = apply.NewEngine(apply.EngineDeps{
+		Config:             env.cfg,
+		Git:                env.git,
+		Users:              env.users,
+		Quadlet:            env.quadlet,
+		Secrets:            env.secretsMgr,
+		Netmgr:             env.netmgr,
+		Systemd:            transientSys,
+		RootDir:            env.rootDir,
+		Chown:              func(string, int, int) error { return nil },
+		DHCPTimeout:        100 * time.Millisecond,
+		VerifyPollInterval: 5 * time.Millisecond,
+	})
+
+	// Dry-run records ActiveState="unknown" for transient Stage 4 error.
+	dryOpts := env.reconcileOpts(100 * time.Millisecond)
+	dryOpts.DryRun = true
+	resDry, err := env.engine.Reconcile(context.Background(), dryOpts)
+	if err != nil {
+		t.Fatalf("dry-run with transient D-Bus error failed: %v", err)
+	}
+	wantUnknown := []apply.UnitStatus{{Scope: "a", Unit: "a-app.service", ActiveState: "unknown"}}
+	if !reflect.DeepEqual(resDry.FailedUnits, wantUnknown) {
+		t.Fatalf("dry-run FailedUnits = %+v, want %+v", resDry.FailedUnits, wantUnknown)
+	}
+
+	// Non-dry-run with transient Stage 4 D-Bus error on running a-app.service and b-app failing Stage 7d
+	// verifyUnitActive -> rollback MUST restart a-app.service, NOT stop it.
+	env.systemd.overrideActiveState["b/b-app.service"] = "failed"
+	env.systemd.clearCalls()
+	transientSys.failOnce = true
+	res2, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(50*time.Millisecond))
+	if err == nil || !res2.RolledBack || res2.FailedStage != "apply" || res2.AppliedSHA != sha1 {
+		t.Fatalf("expected rollback to %q, got res=%+v err=%v", sha1, res2, err)
+	}
+	if got := env.systemd.countCalls("stop", "a", "a-app.service"); got != 0 {
+		t.Fatalf("running unit with transient Stage 4 query error must NOT be stopped on rollback, stop count=%d calls=%v", got, env.systemd.calls)
+	}
+	if got := env.systemd.countCalls("restart", "a", "a-app.service"); got != 2 {
+		t.Fatalf("running unit with transient Stage 4 query error must be restarted (forward + rollback), restart count=%d calls=%v", got, env.systemd.calls)
+	}
+	if env.systemd.states["a/a-app.service"] != "active" {
+		t.Fatalf("expected a-app.service active after rollback, got %q", env.systemd.states["a/a-app.service"])
+	}
+}
+
+func TestReconcileCreateUserReportsFailedUnitsAndEnableLingerStillQueriesSystemd(t *testing.T) {
+	t.Run("CreateUser pending units appear in FailedUnits on dry-run and Stage 5 failure", func(t *testing.T) {
+		env := newTestEnv(t)
+
+		env.writeRepoFiles(map[string][]byte{
+			"users.toml":             []byte("[users.openwebui]\nuid = 2001\n"),
+			"hosts/services-02.toml": []byte("hostname = \"services-02\"\n\n[[component]]\nname = \"open-webui\"\nuser = \"openwebui\"\n"),
+			"components/open-webui/open-webui.container": []byte("[Container]\nImage=ghcr.io/open-webui/open-webui:v1\n"),
+		})
+		sha1 := env.commitRepo("commit 1")
+		if _, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond)); err != nil {
+			t.Fatalf("commit 1 failed: %v", err)
+		}
+
+		// Simulate user wiped from host while state.json still tracks openwebui/open-webui.service.
+		delete(env.users.created, "openwebui")
+		delete(env.systemd.states, "openwebui/open-webui.service")
+
+		guardSys := &reprovisionGuardSystemd{
+			Systemd:           env.systemd,
+			users:             env.users,
+			errBeforeCreation: "openwebui",
+		}
+		env.engine = apply.NewEngine(apply.EngineDeps{
+			Config:             env.cfg,
+			Git:                env.git,
+			Users:              env.users,
+			Quadlet:            env.quadlet,
+			Secrets:            env.secretsMgr,
+			Netmgr:             env.netmgr,
+			Systemd:            guardSys,
+			RootDir:            env.rootDir,
+			Chown:              func(string, int, int) error { return nil },
+			DHCPTimeout:        100 * time.Millisecond,
+			VerifyPollInterval: 5 * time.Millisecond,
+		})
+		env.systemd.clearCalls()
+
+		wantDown := []apply.UnitStatus{{Scope: "openwebui", Unit: "open-webui.service", ActiveState: "inactive"}}
+
+		dryOpts := env.reconcileOpts(100 * time.Millisecond)
+		dryOpts.DryRun = true
+		resDry, err := env.engine.Reconcile(context.Background(), dryOpts)
+		if err != nil {
+			t.Fatalf("dry-run failed: %v", err)
+		}
+		if !reflect.DeepEqual(resDry.FailedUnits, wantDown) {
+			t.Fatalf("dry-run FailedUnits = %+v, want %+v", resDry.FailedUnits, wantDown)
+		}
+		if env.systemd.countCalls("unit-state", "openwebui", "open-webui.service") != 0 {
+			t.Fatalf("expected UnitState skipped for CreateUser scope, calls=%v", env.systemd.calls)
+		}
+
+		env.users.failApply = errors.New("simulated Stage 5 useradd error")
+		res5, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+		if err == nil || res5.FailedStage != "users" || res5.AppliedSHA != sha1 {
+			t.Fatalf("expected Stage 5 failure preserving sha1=%q, got res=%+v err=%v", sha1, res5, err)
+		}
+		if !reflect.DeepEqual(res5.FailedUnits, wantDown) {
+			t.Fatalf("Stage 5 failure FailedUnits = %+v, want %+v", res5.FailedUnits, wantDown)
+		}
+	})
+
+	t.Run("EnableLinger-only user still gets queried and active unit is not marked priorNonActive", func(t *testing.T) {
+		env := newTestEnv(t)
+
+		env.writeRepoFiles(map[string][]byte{
+			"users.toml": []byte("[users.a]\nuid = 2001\n\n[users.b]\nuid = 2002\n"),
+			"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "a-app"
+user = "a"
+
+[[component]]
+name = "b-app"
+user = "b"
+`),
+			"components/a-app/a-app.container": []byte("[Container]\nImage=alpine:3.20\n"),
+			"components/a-app/files/cfg.ini":   []byte("v=1\n"),
+			"components/b-app/b-app.container": []byte("[Container]\nImage=alpine:3.20\n"),
+		})
+		sha1 := env.commitRepo("commit 1")
+		if _, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond)); err != nil {
+			t.Fatalf("commit 1 failed: %v", err)
+		}
+
+		// User 'a' exists (AdoptUser) and only needs EnableLinger; its unit a/a-app.service is active.
+		usersRec := &reprovisionUsersReconciler{
+			fakeUsersReconciler: env.users,
+			missingLinger:       map[string]bool{"a": true},
+		}
+		env.engine = apply.NewEngine(apply.EngineDeps{
+			Config:             env.cfg,
+			Git:                env.git,
+			Users:              usersRec,
+			Quadlet:            env.quadlet,
+			Secrets:            env.secretsMgr,
+			Netmgr:             env.netmgr,
+			Systemd:            env.systemd,
+			RootDir:            env.rootDir,
+			Chown:              func(string, int, int) error { return nil },
+			DHCPTimeout:        100 * time.Millisecond,
+			VerifyPollInterval: 5 * time.Millisecond,
+		})
+
+		env.writeRepoFiles(map[string][]byte{
+			"components/a-app/files/cfg.ini":   []byte("v=2\n"),
+			"components/b-app/b-app.container": []byte("[Container]\nImage=alpine:3.21\n"),
+		})
+		env.commitRepo("commit 2: restart a-app + fail b-app")
+
+		// Dry-run must query UnitState for EnableLinger-only user 'a' and report zero failed units.
+		env.systemd.clearCalls()
+		dryOpts := env.reconcileOpts(100 * time.Millisecond)
+		dryOpts.DryRun = true
+		resDry, err := env.engine.Reconcile(context.Background(), dryOpts)
+		if err != nil {
+			t.Fatalf("dry-run failed: %v", err)
+		}
+		if env.systemd.countCalls("unit-state", "a", "a-app.service") != 1 {
+			t.Fatalf("expected UnitState queried for EnableLinger-only user 'a', calls=%v", env.systemd.calls)
+		}
+		if len(resDry.FailedUnits) != 0 {
+			t.Fatalf("expected zero FailedUnits for active EnableLinger-only unit, got %+v", resDry.FailedUnits)
+		}
+
+		// Failed apply triggering rollback must restart (NOT stop) a/a-app.service.
+		env.systemd.overrideActiveState["b/b-app.service"] = "failed"
+		env.systemd.clearCalls()
+		res2, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(50*time.Millisecond))
+		if err == nil || !res2.RolledBack || res2.AppliedSHA != sha1 {
+			t.Fatalf("expected rollback to %q, got res=%+v err=%v", sha1, res2, err)
+		}
+		if got := env.systemd.countCalls("stop", "a", "a-app.service"); got != 0 {
+			t.Fatalf("active EnableLinger-only unit must NOT be stopped on rollback, stop=%d calls=%v", got, env.systemd.calls)
+		}
+		if got := env.systemd.countCalls("restart", "a", "a-app.service"); got != 2 {
+			t.Fatalf("active EnableLinger-only unit must be restarted (forward + rollback), restart=%d calls=%v", got, env.systemd.calls)
+		}
+	})
+}
+
+func TestReconcileRecreatedUserReupsertsSecretsDespiteMatchingDigest(t *testing.T) {
+	env := newTestEnv(t)
+
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml": []byte("[users.openwebui]\nuid = 2001\n"),
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "open-webui"
+user = "openwebui"
+`),
+		"components/open-webui/component.toml":       []byte("[secrets]\nwebui_secret = \"secrets/open-webui.age\"\n"),
+		"components/open-webui/open-webui.container": []byte("[Container]\nImage=ghcr.io/open-webui/open-webui:v1\nSecret=webui_secret,type=env,target=WEBUI_SECRET_KEY\n"),
+		"secrets/open-webui.age":                     env.encryptSecret("persisted-secret-v1"),
+	})
+	sha1 := env.commitRepo("commit 1: secret baseline")
+
+	res1, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("commit 1 failed: %v", err)
+	}
+	if res1.AppliedSHA != sha1 || env.secRunner.store["openwebui/webui_secret"] != "persisted-secret-v1" {
+		t.Fatalf("unexpected commit 1 state: res=%+v store=%+v", res1, env.secRunner.store)
+	}
+
+	// Simulate `userdel -r openwebui` / fresh-home reprovisioning: user and rootless podman secret
+	// store are gone, while state.json still holds matching secret digest.
+	delete(env.users.created, "openwebui")
+	delete(env.secRunner.store, "openwebui/webui_secret")
+	env.secRunner.calls = nil
+	env.systemd.clearCalls()
+
+	res2, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("recreated user Reconcile failed: %v", err)
+	}
+	if res2.AppliedSHA != sha1 {
+		t.Fatalf("AppliedSHA = %q, want %q", res2.AppliedSHA, sha1)
+	}
+	if !slices.Contains(env.secRunner.calls, "upsert:openwebui/webui_secret") {
+		t.Fatalf("expected secrets.Upsert called for recreated user openwebui despite matching digest, calls=%v", env.secRunner.calls)
+	}
+	if got := env.secRunner.store["openwebui/webui_secret"]; got != "persisted-secret-v1" {
+		t.Fatalf("re-upserted secret value = %q, want %q", got, "persisted-secret-v1")
+	}
+}
+
+type lockGateGitClient struct {
+	*spyGitClient
+	repoPath     string
+	dryRunCalled chan struct{}
+}
+
+func (g *lockGateGitClient) FetchAndVerifyDryRun(ctx context.Context, appliedSHA string, allowNonFF bool) (string, func(), error) {
+	select {
+	case g.dryRunCalled <- struct{}{}:
+	default:
+	}
+	sha, err := g.VerifyLocalRepo(ctx, g.repoPath, appliedSHA, allowNonFF, true)
+	return sha, func() {}, err
+}
+
+func TestReconcileRemoteDryRunSharedLock(t *testing.T) {
+	env := newTestEnv(t)
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml":                       []byte("[users.caddy]\nuid = 2002\n"),
+		"hosts/services-02.toml":           []byte("hostname = \"services-02\"\n\n[[component]]\nname = \"caddy\"\nuser = \"caddy\"\n"),
+		"components/caddy/caddy.container": []byte("[Container]\nImage=docker.io/library/caddy:v1\n"),
+	})
+	sha1 := env.commitRepo("commit 1")
+
+	lockPath := env.stateFile + ".lock"
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Remote dry-run blocks while LOCK_EX is held, and proceeds once released.
+	exFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer exFile.Close()
+	if err := syscall.Flock(int(exFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("acquire LOCK_EX: %v", err)
+	}
+
+	dryCalled := make(chan struct{}, 2)
+	gateGit := &lockGateGitClient{
+		spyGitClient: env.git,
+		repoPath:     env.repoDir,
+		dryRunCalled: dryCalled,
+	}
+	engine := apply.NewEngine(apply.EngineDeps{
+		Config:             env.cfg,
+		Git:                gateGit,
+		Users:              env.users,
+		Quadlet:            env.quadlet,
+		Secrets:            env.secretsMgr,
+		Netmgr:             env.netmgr,
+		Systemd:            env.systemd,
+		RootDir:            env.rootDir,
+		Chown:              func(string, int, int) error { return nil },
+		DHCPTimeout:        100 * time.Millisecond,
+		LockTimeout:        2 * time.Second,
+		VerifyPollInterval: 5 * time.Millisecond,
+	})
+
+	type recOut struct {
+		res *apply.Result
+		err error
+	}
+	done := make(chan recOut, 1)
+	go func() {
+		r, e := engine.Reconcile(context.Background(), apply.ReconcileOptions{
+			DryRun:             true,
+			StartVerifyTimeout: 100 * time.Millisecond,
+		})
+		done <- recOut{res: r, err: e}
+	}()
+
+	select {
+	case <-dryCalled:
+		_ = syscall.Flock(int(exFile.Fd()), syscall.LOCK_UN)
+		t.Fatal("remote dry-run proceeded to FetchAndVerifyDryRun while LOCK_EX was held")
+	case <-time.After(60 * time.Millisecond):
+	}
+
+	if err := syscall.Flock(int(exFile.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("release LOCK_EX: %v", err)
+	}
+
+	var out recOut
+	select {
+	case out = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("remote dry-run did not complete after LOCK_EX was released")
+	}
+	if out.err != nil || !strings.Contains(out.res.PlanSummary, sha1) {
+		t.Fatalf("remote dry-run after LOCK_EX release = (%+v, %v), want sha=%s", out.res, out.err, sha1)
+	}
+
+	// 2. Remote dry-run does NOT block another LOCK_SH holder.
+	shFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shFile.Close()
+	if err := syscall.Flock(int(shFile.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		t.Fatalf("acquire LOCK_SH: %v", err)
+	}
+	defer func() {
+		_ = syscall.Flock(int(shFile.Fd()), syscall.LOCK_UN)
+	}()
+
+	resShared, err := engine.Reconcile(context.Background(), apply.ReconcileOptions{
+		DryRun:             true,
+		StartVerifyTimeout: 100 * time.Millisecond,
+	})
+	if err != nil || !strings.Contains(resShared.PlanSummary, sha1) {
+		t.Fatalf("remote dry-run while LOCK_SH held = (%+v, %v), want success with sha=%s", resShared, err, sha1)
 	}
 }

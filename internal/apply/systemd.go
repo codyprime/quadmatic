@@ -25,7 +25,6 @@ type Systemd interface {
 	Start(ctx context.Context, scope, unit string) error
 	Stop(ctx context.Context, scope, unit string) error
 	Restart(ctx context.Context, scope, unit string) error
-	ActiveState(ctx context.Context, scope, unit string) (string, error)
 	UnitState(ctx context.Context, scope, unit string) (UnitStatusInfo, error)
 }
 
@@ -96,18 +95,6 @@ func (s *Systemctl) Restart(ctx context.Context, scope, unit string) error {
 	}
 	_, err := s.runSystemctl(ctx, scope, "restart", unit)
 	return err
-}
-
-// ActiveState returns systemd's ActiveState property for unit in scope.
-func (s *Systemctl) ActiveState(ctx context.Context, scope, unit string) (string, error) {
-	if err := validateScopeAndUnit(scope, unit); err != nil {
-		return "", err
-	}
-	out, err := s.runSystemctl(ctx, scope, "show", "-p", "ActiveState", "--value", unit)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
 }
 
 // UnitState returns systemd's ActiveState, Type, and Result properties for unit in scope.

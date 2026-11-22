@@ -311,10 +311,18 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 		return res, err
 	}
 
-	if !opts.DryRun && e.cfg.StateFile != "" {
+	if e.cfg.StateFile != "" && (!opts.DryRun || opts.LocalRepoPath == "") {
 		lockPath := e.cfg.StateFile + ".lock"
 		lockCtx, lockCancel := context.WithTimeout(ctx, e.lockTimeout)
-		release, err := acquireReconcileLock(lockCtx, lockPath)
+		var (
+			release func()
+			err     error
+		)
+		if !opts.DryRun {
+			release, err = acquireReconcileLock(lockCtx, lockPath)
+		} else {
+			release, err = acquireReconcileLockShared(lockCtx, lockPath)
+		}
 		lockCancel()
 		if err != nil {
 			res.FailedStage = "fetch"
@@ -387,6 +395,7 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 		res.FailedStage = "validate"
 		return res, err
 	}
+	creatingUsers := collectCreatingUsers(userPlan)
 
 	if hasRootlessNetwork(resolved) {
 		if err := e.netmgr.CheckKernelInvariants(); err != nil {
@@ -433,7 +442,7 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 	}
 
 	// Stage 4: Plan & Drift Detection
-	plan, err := e.buildApplyPlan(rendered, desiredUnits, desiredSecrets, prevState)
+	plan, err := e.buildApplyPlan(rendered, desiredUnits, desiredSecrets, prevState, creatingUsers)
 	if err != nil {
 		res.FailedStage = "validate"
 		return res, err
@@ -455,7 +464,7 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 	res.ManagedUnitsRootless = plan.managedRootless
 	res.ManagedUnitsRootful = plan.managedRootful
 
-	stage4FailedUnits, priorNonActive, err := e.queryExistingUnitStates(ctx, prevState, userPlan, plan.desiredUnits, plan.unitsToStop)
+	stage4FailedUnits, priorNonActive, err := e.queryExistingUnitStates(ctx, prevState, creatingUsers, plan.desiredUnits, plan.unitsToStop)
 	if err != nil {
 		res.FailedStage = "validate"
 		return res, err
@@ -517,6 +526,7 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 			},
 			desiredSecrets,
 			prevState,
+			creatingUsers,
 			plan,
 		)
 		if err != nil {
@@ -604,6 +614,7 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 			},
 			desiredSecrets,
 			prevState,
+			creatingUsers,
 			plan,
 		)
 		if err != nil {
@@ -1104,6 +1115,7 @@ func (e *Engine) rerenderAndRebuildPlan(
 	env manifest.RenderEnv,
 	desiredSecrets map[string]desiredSecret,
 	prevState *state.State,
+	creatingUsers map[string]bool,
 	prevPlan *applyPlan,
 ) (*manifest.RenderedHost, map[string]quadlet.GeneratedUnit, *applyPlan, error) {
 	rendered, err := manifest.RenderHost(resolved, env)
@@ -1114,7 +1126,7 @@ func (e *Engine) rerenderAndRebuildPlan(
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("quadlet validation failed: %w", err)
 	}
-	plan, err := e.buildApplyPlan(rendered, desiredUnits, desiredSecrets, prevState)
+	plan, err := e.buildApplyPlan(rendered, desiredUnits, desiredSecrets, prevState, creatingUsers)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("plan rebuild failed: %w", err)
 	}
@@ -1151,6 +1163,7 @@ func (e *Engine) buildApplyPlan(
 	generatedUnits map[string]quadlet.GeneratedUnit,
 	desiredSecrets map[string]desiredSecret,
 	prevState *state.State,
+	creatingUsers map[string]bool,
 ) (*applyPlan, error) {
 	p := &applyPlan{
 		desiredFiles:       make(map[string]manifest.RenderedFile),
@@ -1270,7 +1283,7 @@ func (e *Engine) buildApplyPlan(
 	sort.Strings(secretKeys)
 	for _, key := range secretKeys {
 		sec := desiredSecrets[key]
-		if prevDigest, ok := prevState.Secrets[key]; !ok || prevDigest != sec.Digest {
+		if prevDigest, ok := prevState.Secrets[key]; !ok || prevDigest != sec.Digest || creatingUsers[sec.Scope] {
 			p.secretsToUpsert = append(p.secretsToUpsert, key)
 			p.changedSecretKeys[key] = true
 		}
@@ -1359,22 +1372,26 @@ func isUnitHealthy(st UnitStatusInfo) bool {
 	return st.ActiveState == "active" || (st.Type == "oneshot" && st.ActiveState == "inactive" && st.Result == "success")
 }
 
+func collectCreatingUsers(userPlan *users.Plan) map[string]bool {
+	creating := make(map[string]bool)
+	if userPlan == nil {
+		return creating
+	}
+	for _, act := range userPlan.Actions {
+		if act.Kind == users.CreateUser {
+			creating[act.User] = true
+		}
+	}
+	return creating
+}
+
 func (e *Engine) queryExistingUnitStates(
 	ctx context.Context,
 	prevState *state.State,
-	userPlan *users.Plan,
+	creatingUsers map[string]bool,
 	desiredUnits map[string]unitPlanMeta,
 	unitsToStop []unitID,
 ) ([]UnitStatus, map[string]bool, error) {
-	pendingUserScopes := make(map[string]bool)
-	if userPlan != nil {
-		for _, act := range userPlan.Actions {
-			if act.Kind == users.CreateUser || act.Kind == users.EnableLinger {
-				pendingUserScopes[act.User] = true
-			}
-		}
-	}
-
 	var keys []string
 	for k := range desiredUnits {
 		if _, existed := prevState.GeneratedUnits[k]; existed {
@@ -1387,8 +1404,13 @@ func (e *Engine) queryExistingUnitStates(
 	var failed []UnitStatus
 	for _, k := range keys {
 		meta := desiredUnits[k]
-		if pendingUserScopes[meta.ID.Scope] {
+		if creatingUsers[meta.ID.Scope] {
 			nonActive[k] = true
+			failed = append(failed, UnitStatus{
+				Scope:       meta.ID.Scope,
+				Unit:        meta.ID.UnitName,
+				ActiveState: "inactive",
+			})
 			continue
 		}
 		st, err := e.systemd.UnitState(ctx, meta.ID.Scope, meta.ID.UnitName)
@@ -1396,8 +1418,7 @@ func (e *Engine) queryExistingUnitStates(
 			if ctx.Err() != nil {
 				return nil, nil, fmt.Errorf("query systemd state for %s: %w", k, err)
 			}
-			e.logger.Warn("failed to query unit state; treating as non-active", "scope", meta.ID.Scope, "unit", meta.ID.UnitName, "err", err)
-			nonActive[k] = true
+			e.logger.Warn("failed to query unit state; assuming previously active", "scope", meta.ID.Scope, "unit", meta.ID.UnitName, "err", err)
 			failed = append(failed, UnitStatus{
 				Scope:       meta.ID.Scope,
 				Unit:        meta.ID.UnitName,
@@ -1417,7 +1438,7 @@ func (e *Engine) queryExistingUnitStates(
 		}
 	}
 	for _, u := range unitsToStop {
-		if pendingUserScopes[u.Scope] {
+		if creatingUsers[u.Scope] {
 			nonActive[u.Key] = true
 			continue
 		}
@@ -1426,8 +1447,7 @@ func (e *Engine) queryExistingUnitStates(
 			if ctx.Err() != nil {
 				return nil, nil, fmt.Errorf("query systemd state for %s: %w", u.Key, err)
 			}
-			e.logger.Warn("failed to query unit state for unit to stop; treating as non-active", "scope", u.Scope, "unit", u.UnitName, "err", err)
-			nonActive[u.Key] = true
+			e.logger.Warn("failed to query unit state for unit to stop; assuming previously active", "scope", u.Scope, "unit", u.UnitName, "err", err)
 			continue
 		}
 		if st.ActiveState != "active" {
@@ -1455,7 +1475,16 @@ func (e *Engine) queryPrevStateFailedUnits(ctx context.Context, prevState *state
 		}
 		st, err := e.systemd.UnitState(ctx, scope, unitName)
 		if err != nil {
-			return nil, fmt.Errorf("query systemd state for %s: %w", k, err)
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("query systemd state for %s: %w", k, err)
+			}
+			e.logger.Warn("failed to query post-rollback unit state", "scope", scope, "unit", unitName, "err", err)
+			failed = append(failed, UnitStatus{
+				Scope:       scope,
+				Unit:        unitName,
+				ActiveState: "unknown",
+			})
+			continue
 		}
 		if !isUnitHealthy(st) {
 			failed = append(failed, UnitStatus{
@@ -1622,6 +1651,9 @@ func formatPlanSummary(
 	fmt.Fprintf(&b, "Host: %s | Target SHA: %s (applied: %s)\n", rendered.Hostname, newSHA, prevSHA)
 	if rendered.UsedPlaceholderDNS {
 		fmt.Fprintf(&b, "Note: placeholder DNS (%s) used for pending dns_from_dhcp interfaces during dry-run/validation\n", manifest.PlaceholderDNS)
+	}
+	if rendered.UsedPlaceholderTrunk {
+		fmt.Fprintf(&b, "Note: placeholder trunk interface (%s) used for vlan=0 components during dry-run/validation\n", manifest.PlaceholderTrunkInterface)
 	}
 
 	compNames := make([]string, 0, len(rendered.Components))
