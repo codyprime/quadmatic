@@ -228,13 +228,23 @@ func (r *Reconciler) DetectDrift(ctx context.Context, host *manifest.ResolvedHos
 		desiredOwnedSet[rl.MacvlanName] = true
 	}
 
-	liveNames, err := r.listConnectionNames(ctx)
-	if err != nil {
-		return false, err
+	needLiveNames := false
+	for _, rec := range owned {
+		if rec.Owned && isManagedConnectionName(rec.ConnectionName) && !desiredOwnedSet[rec.ConnectionName] {
+			needLiveNames = true
+			break
+		}
 	}
-	liveSet := make(map[string]bool, len(liveNames))
-	for _, name := range liveNames {
-		liveSet[name] = true
+	var liveSet map[string]bool
+	if needLiveNames {
+		liveNames, err := r.listConnectionNames(ctx)
+		if err != nil {
+			return false, err
+		}
+		liveSet = make(map[string]bool, len(liveNames))
+		for _, name := range liveNames {
+			liveSet[name] = true
+		}
 	}
 
 	recordedOwnedSet := make(map[string]bool)
@@ -253,9 +263,12 @@ func (r *Reconciler) DetectDrift(ctx context.Context, host *manifest.ResolvedHos
 		}
 	}
 
-	activeConns, err := r.listActiveConnectionNames(ctx)
-	if err != nil {
-		return false, err
+	var activeConns map[string]bool
+	if len(desiredOwnedSet) > 0 {
+		activeConns, err = r.listActiveConnectionNames(ctx)
+		if err != nil {
+			return false, err
+		}
 	}
 
 	for _, v := range plan.vlans {

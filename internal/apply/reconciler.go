@@ -393,13 +393,16 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 		return res, err
 	}
 
-	netDrifted, err := e.netmgr.DetectDrift(ctx, resolved, prevState.Networks)
-	if err != nil {
-		res.FailedStage = "validate"
-		return res, err
-	}
-	if netDrifted {
-		plan.driftDetected = true
+	netDrifted := false
+	if hasAnyNetwork(resolved) || len(prevState.Networks) > 0 || prevState.NFTablesHash != "" {
+		netDrifted, err = e.netmgr.DetectDrift(ctx, resolved, prevState.Networks)
+		if err != nil {
+			res.FailedStage = "validate"
+			return res, err
+		}
+		if netDrifted {
+			plan.driftDetected = true
+		}
 	}
 
 	res.DriftDetected = plan.driftDetected
@@ -1496,6 +1499,15 @@ func collectActiveUsers(host *manifest.ResolvedHost) []string {
 func hasRootlessNetwork(host *manifest.ResolvedHost) bool {
 	for _, c := range host.Components {
 		if !c.Rootful && c.Network != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyNetwork(host *manifest.ResolvedHost) bool {
+	for _, c := range host.Components {
+		if c.Network != nil {
 			return true
 		}
 	}
