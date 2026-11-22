@@ -1119,7 +1119,7 @@ func TestIPv6CustomCgroupPatternIdempotencyAndEdgeCases(t *testing.T) {
 		}
 	})
 
-	t.Run("kernel-only VLAN device (-- connection) reused and stray qmv detected as drift", func(t *testing.T) {
+	t.Run("kernel-only VLAN device (-- connection) reused and stale tracked vs untracked drift", func(t *testing.T) {
 		runner := newFakeRunner()
 		runner.unmanagedDev = []fakeDevice{
 			{device: "enp3s0.3", typ: "vlan", conn: "--", parent: "enp3s0", vlanID: 3},
@@ -1148,11 +1148,47 @@ func TestIPv6CustomCgroupPatternIdempotencyAndEdgeCases(t *testing.T) {
 			t.Fatalf("expected unmanaged enp3s0.3, got %+v", owned[0])
 		}
 
-		// Stray qmv-9999 connection must trigger DetectDrift.
+		// Untracked qm-9999 / qmv-9999 outside state.json must NOT be flagged as drift or deleted.
+		runner.conns["qm-9999"] = &fakeNMConn{name: "qm-9999", props: map[string]string{"connection.type": "macvlan"}}
 		runner.conns["qmv-9999"] = &fakeNMConn{name: "qmv-9999", props: map[string]string{"connection.type": "vrf"}}
 		drifted, err := r.DetectDrift(ctx, host, owned)
+		if err != nil || drifted {
+			t.Fatalf("DetectDrift with untracked qm-9999/qmv-9999 = (%v, %v), want (false, nil)", drifted, err)
+		}
+
+		// Apply must not delete untracked qm-9999/qmv-9999.
+		owned, _, _, err = r.Apply(ctx, host, owned, time.Second)
+		if err != nil {
+			t.Fatalf("Apply with untracked profiles error: %v", err)
+		}
+		if runner.conns["qm-9999"] == nil || runner.conns["qmv-9999"] == nil {
+			t.Fatalf("Apply must not touch untracked qm-9999/qmv-9999, got %+v", runner.conns)
+		}
+
+		// Stale tracked profile in state.json (Owned: true) missing from host and still live in NM
+		// MUST be flagged as drift and healed by Apply.
+		runner.conns["qm-2002"] = &fakeNMConn{name: "qm-2002", props: map[string]string{"connection.type": "macvlan"}}
+		staleOwned := append(slices.Clone(owned), state.ManagedNetworkRecord{
+			ConnectionName: "qm-2002",
+			Kind:           "macvlan",
+			Owned:          true,
+			Component:      "removed",
+			Scope:          "removed",
+		})
+		drifted, err = r.DetectDrift(ctx, host, staleOwned)
 		if err != nil || !drifted {
-			t.Fatalf("DetectDrift with stray qmv-9999 = (%v, %v), want (true, nil)", drifted, err)
+			t.Fatalf("DetectDrift with stale tracked qm-2002 = (%v, %v), want (true, nil)", drifted, err)
+		}
+		healedOwned, _, _, err := r.Apply(ctx, host, staleOwned, time.Second)
+		if err != nil {
+			t.Fatalf("Apply heal stale error: %v", err)
+		}
+		if runner.conns["qm-2002"] != nil {
+			t.Fatal("expected stale tracked qm-2002 to be pruned by Apply")
+		}
+		drifted, err = r.DetectDrift(ctx, host, healedOwned)
+		if err != nil || drifted {
+			t.Fatalf("DetectDrift after pruning stale tracked qm-2002 = (%v, %v), want (false, nil)", drifted, err)
 		}
 	})
 
@@ -1224,4 +1260,82 @@ func TestIPv6CustomCgroupPatternIdempotencyAndEdgeCases(t *testing.T) {
 			t.Fatal("expected error when VRF interface name exceeds 15 characters")
 		}
 	})
+}
+
+func TestApplyProfilesAndApplyNFTablesSeparationAndInodeDrift(t *testing.T) {
+	ctx := context.Background()
+	runner := newFakeRunner()
+	runner.dnsByIface["qm-2001"] = "10.30.0.1\n"
+	r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+
+	host := &manifest.ResolvedHost{
+		Hostname: "services-02",
+		Components: []manifest.ResolvedComponent{
+			{
+				Name: "open-webui",
+				User: "openwebui",
+				UID:  2001,
+				Network: &manifest.NetworkSpec{
+					VLAN:        30,
+					MAC:         "02:51:4d:00:07:d1",
+					DNSFromDHCP: true,
+				},
+				QuadletFiles: []manifest.SourceFile{
+					{RelPath: "open-webui.container"},
+				},
+			},
+		},
+	}
+
+	// Stage 7a: ApplyProfiles must NOT invoke nft at all.
+	owned, liveDNS, err := r.ApplyProfiles(ctx, host, nil, time.Second)
+	if err != nil {
+		t.Fatalf("ApplyProfiles error: %v", err)
+	}
+	if len(owned) != 3 || !slices.Equal(liveDNS["open-webui"], []string{"10.30.0.1"}) {
+		t.Fatalf("unexpected ApplyProfiles result: owned=%+v liveDNS=%+v", owned, liveDNS)
+	}
+	for _, call := range runner.calls {
+		if call.name == "nft" {
+			t.Fatalf("ApplyProfiles must not invoke nft, got %v", call.args)
+		}
+	}
+	if runner.nftTable != "" {
+		t.Fatalf("expected no nft table after ApplyProfiles, got:\n%s", runner.nftTable)
+	}
+
+	// Stage 7d: ApplyNFTables applies table inet quadmatic without invoking nmcli/ip.
+	runner.calls = nil
+	nftHash, err := r.ApplyNFTables(ctx, host)
+	if err != nil {
+		t.Fatalf("ApplyNFTables error: %v", err)
+	}
+	if nftHash == "" || !strings.Contains(runner.nftTable, "table inet quadmatic") {
+		t.Fatalf("expected nft table applied, got hash=%q table=%q", nftHash, runner.nftTable)
+	}
+	for _, call := range runner.calls {
+		if call.name != "nft" {
+			t.Fatalf("ApplyNFTables must only invoke nft, got %s %v", call.name, call.args)
+		}
+	}
+
+	// Simulate a restarted unit leaving a stale numeric cgroupv2 inode in nft list output.
+	runner.nftTable = strings.ReplaceAll(
+		runner.nftTable,
+		`"user.slice/user-2001.slice/user@2001.service/app.slice/open-webui.service"`,
+		`987654321`,
+	)
+	drifted, err := r.DetectDrift(ctx, host, owned)
+	if err != nil || !drifted {
+		t.Fatalf("DetectDrift with stale numeric cgroup inode = (%v, %v), want (true, nil)", drifted, err)
+	}
+
+	// Re-applying ApplyNFTables re-binds the cgroup path and clears drift.
+	if _, err := r.ApplyNFTables(ctx, host); err != nil {
+		t.Fatalf("ApplyNFTables re-bind error: %v", err)
+	}
+	drifted, err = r.DetectDrift(ctx, host, owned)
+	if err != nil || drifted {
+		t.Fatalf("DetectDrift after ApplyNFTables re-bind = (%v, %v), want (false, nil)", drifted, err)
+	}
 }

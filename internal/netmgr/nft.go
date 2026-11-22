@@ -3,6 +3,7 @@ package netmgr
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"path"
 	"regexp"
@@ -89,19 +90,32 @@ func expandCgroupPath(pattern string, uid int, user, compName, unit string) (str
 	return expanded, len(segs), nil
 }
 
-func buildNFTGuardTargets(pattern string, rootless []desiredRootlessNet) ([]nftGuardTarget, error) {
+func collectNFTGuardTargets(pattern string, host *manifest.ResolvedHost) ([]nftGuardTarget, error) {
 	if pattern == "" {
 		pattern = DefaultCgroupPattern
 	}
 	var targets []nftGuardTarget
-	for _, item := range rootless {
-		if !item.OutboundGuard {
+	for _, comp := range host.Components {
+		if comp.Rootful || comp.Network == nil || !outboundGuardEnabled(comp.Network) {
 			continue
 		}
-		cgroups := make([]string, 0, len(item.Units))
-		seen := make(map[string]bool, len(item.Units))
-		for _, unit := range item.Units {
-			cgPath, _, err := expandCgroupPath(pattern, item.UID, item.Scope, item.CompName, unit)
+		if comp.UID <= 0 {
+			return nil, fmt.Errorf("rootless component %q must have positive UID, got %d", comp.Name, comp.UID)
+		}
+		vrfName := fmt.Sprintf("qmv-%d", comp.UID)
+		mvName := fmt.Sprintf("qm-%d", comp.UID)
+		if err := validateIfName("vrf", vrfName); err != nil {
+			return nil, err
+		}
+		if err := validateIfName("macvlan", mvName); err != nil {
+			return nil, err
+		}
+
+		units := resolveComponentWorkloadUnits(comp)
+		cgroups := make([]string, 0, len(units))
+		seen := make(map[string]bool, len(units))
+		for _, unit := range units {
+			cgPath, _, err := expandCgroupPath(pattern, comp.UID, comp.Scope(), comp.Name, unit)
 			if err != nil {
 				return nil, err
 			}
@@ -112,9 +126,9 @@ func buildNFTGuardTargets(pattern string, rootless []desiredRootlessNet) ([]nftG
 		}
 		slices.Sort(cgroups)
 		targets = append(targets, nftGuardTarget{
-			UID:         item.UID,
-			VRFName:     item.VRFName,
-			MacvlanName: item.MacvlanName,
+			UID:         comp.UID,
+			VRFName:     vrfName,
+			MacvlanName: mvName,
 			CgroupPaths: cgroups,
 		})
 	}
@@ -125,6 +139,27 @@ func buildNFTGuardTargets(pattern string, rootless []desiredRootlessNet) ([]nftG
 		return strings.Compare(a.MacvlanName, b.MacvlanName)
 	})
 	return targets, nil
+}
+
+// ApplyNFTables renders and atomically replaces `table inet quadmatic` for all rootless
+// outbound_guard-enabled components in host (or deletes the table if none remain).
+// Intended to run after workload systemd units are active so Linux nftables can resolve
+// cgroupv2 paths to live cgroup inodes.
+func (r *Reconciler) ApplyNFTables(ctx context.Context, host *manifest.ResolvedHost) (string, error) {
+	if r == nil {
+		return "", errors.New("netmgr reconciler is nil")
+	}
+	if host == nil {
+		return "", errors.New("resolved host is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	targets, err := collectNFTGuardTargets(r.cgroupPattern, host)
+	if err != nil {
+		return "", err
+	}
+	return r.applyNFTables(ctx, targets)
 }
 
 func renderNFTablesTable(targets []nftGuardTarget) (string, error) {

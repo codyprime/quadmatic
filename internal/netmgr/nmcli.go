@@ -228,28 +228,27 @@ func (r *Reconciler) DetectDrift(ctx context.Context, host *manifest.ResolvedHos
 		desiredOwnedSet[rl.MacvlanName] = true
 	}
 
+	liveNames, err := r.listConnectionNames(ctx)
+	if err != nil {
+		return false, err
+	}
+	liveSet := make(map[string]bool, len(liveNames))
+	for _, name := range liveNames {
+		liveSet[name] = true
+	}
+
 	recordedOwnedSet := make(map[string]bool)
 	for _, rec := range owned {
 		if !rec.Owned {
 			continue
 		}
-		if !desiredOwnedSet[rec.ConnectionName] {
+		if isManagedConnectionName(rec.ConnectionName) && !desiredOwnedSet[rec.ConnectionName] && liveSet[rec.ConnectionName] {
 			return true, nil
 		}
 		recordedOwnedSet[rec.ConnectionName] = true
 	}
 	for name := range desiredOwnedSet {
 		if !recordedOwnedSet[name] {
-			return true, nil
-		}
-	}
-
-	liveNames, err := r.listConnectionNames(ctx)
-	if err != nil {
-		return false, err
-	}
-	for _, name := range liveNames {
-		if isManagedConnectionName(name) && !desiredOwnedSet[name] {
 			return true, nil
 		}
 	}
@@ -310,33 +309,33 @@ func (r *Reconciler) DetectDrift(ctx context.Context, host *manifest.ResolvedHos
 	return nftDrifted, nil
 }
 
-// Apply reconciles VLAN parents, per-component VRFs and macvlans, live DHCP DNS polling,
-// the cgroupv2-scoped `inet quadmatic` nftables outbound guard, and pruning of unreferenced
-// owned profiles. Even when err != nil, newOwned contains all `qm-*` profiles created or
-// reconciled up to the point of failure so callers can pass them straight to Restore.
-func (r *Reconciler) Apply(
+// ApplyProfiles reconciles VLAN parents, per-component VRFs and macvlans, live DHCP DNS
+// polling, and pruning of unreferenced owned profiles without modifying nftables. Even when
+// err != nil, newOwned contains all `qm-*`/`qmv-*` profiles created or reconciled up to the
+// point of failure so callers can pass them straight to Restore.
+func (r *Reconciler) ApplyProfiles(
 	ctx context.Context,
 	host *manifest.ResolvedHost,
 	prevOwned []state.ManagedNetworkRecord,
 	dhcpTimeout time.Duration,
-) (newOwned []state.ManagedNetworkRecord, liveDNS map[string][]string, nftHash string, err error) {
+) (newOwned []state.ManagedNetworkRecord, liveDNS map[string][]string, err error) {
 	if r == nil {
-		return nil, nil, "", errors.New("netmgr reconciler is nil")
+		return nil, nil, errors.New("netmgr reconciler is nil")
 	}
 	if host == nil {
-		return nil, nil, "", errors.New("resolved host is nil")
+		return nil, nil, errors.New("resolved host is nil")
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, "", err
+		return nil, nil, err
 	}
 
 	plan, err := r.buildDesiredPlan(ctx, host)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, err
 	}
 	if len(plan.rootless) > 0 {
 		if err := r.CheckKernelInvariants(); err != nil {
-			return nil, nil, "", err
+			return nil, nil, err
 		}
 	}
 
@@ -344,12 +343,12 @@ func (r *Reconciler) Apply(
 	if plan.hasNetworks {
 		activeConns, err = r.listActiveConnectionNames(ctx)
 		if err != nil {
-			return nil, nil, "", err
+			return nil, nil, err
 		}
 	}
 
-	// Track desired records incrementally so partial failures still return every qm-* profile
-	// created or updated up to the failure point.
+	// Track desired records incrementally so partial failures still return every qm-*/qmv-*
+	// profile created or updated up to the failure point.
 	newOwned = make([]state.ManagedNetworkRecord, 0, len(plan.vlans)+2*len(plan.rootless))
 
 	for _, v := range plan.vlans {
@@ -378,11 +377,11 @@ func (r *Reconciler) Apply(
 			})
 		}
 		if err != nil {
-			return newOwned, nil, "", err
+			return newOwned, nil, err
 		}
 		if mutated || !activeConns[v.ConnName] {
 			if err := r.upConnection(ctx, v.ConnName); err != nil {
-				return newOwned, nil, "", err
+				return newOwned, nil, err
 			}
 		}
 	}
@@ -403,15 +402,15 @@ func (r *Reconciler) Apply(
 			})
 		}
 		if err != nil {
-			return newOwned, nil, "", err
+			return newOwned, nil, err
 		}
 		if vrfMutated || !activeConns[rl.VRFName] {
 			if err := r.upConnection(ctx, rl.VRFName); err != nil {
-				return newOwned, nil, "", err
+				return newOwned, nil, err
 			}
 		}
 		if err := r.ensureVRFUnreachableRoute(ctx, rl.TableID); err != nil {
-			return newOwned, nil, "", err
+			return newOwned, nil, err
 		}
 
 		mvDesired := desiredMacvlanProps(rl)
@@ -428,32 +427,47 @@ func (r *Reconciler) Apply(
 			})
 		}
 		if err != nil {
-			return newOwned, nil, "", err
+			return newOwned, nil, err
 		}
 		if mvMutated || !activeConns[rl.MacvlanName] {
 			if err := r.upConnection(ctx, rl.MacvlanName); err != nil {
-				return newOwned, nil, "", err
+				return newOwned, nil, err
 			}
 		}
 
 		if rl.DNSFromDHCP {
 			dns, err := r.pollLiveDNS(ctx, rl.MacvlanName, dhcpTimeout)
 			if err != nil {
-				return newOwned, nil, "", fmt.Errorf("component %q (%s): %w", rl.CompName, rl.MacvlanName, err)
+				return newOwned, nil, fmt.Errorf("component %q (%s): %w", rl.CompName, rl.MacvlanName, err)
 			}
 			liveDNS[rl.CompName] = dns
 		}
 	}
 
-	nftHash, err = r.applyNFTables(ctx, plan.nftTargets)
+	if err := r.pruneUnreferenced(ctx, prevOwned, newOwned); err != nil {
+		return newOwned, nil, err
+	}
+
+	return newOwned, liveDNS, nil
+}
+
+// Apply reconciles NetworkManager profiles (ApplyProfiles) followed by the cgroupv2-scoped
+// `inet quadmatic` nftables outbound guard (ApplyNFTables). Even when err != nil, newOwned
+// contains all `qm-*`/`qmv-*` profiles created or reconciled up to the point of failure.
+func (r *Reconciler) Apply(
+	ctx context.Context,
+	host *manifest.ResolvedHost,
+	prevOwned []state.ManagedNetworkRecord,
+	dhcpTimeout time.Duration,
+) (newOwned []state.ManagedNetworkRecord, liveDNS map[string][]string, nftHash string, err error) {
+	newOwned, liveDNS, err = r.ApplyProfiles(ctx, host, prevOwned, dhcpTimeout)
 	if err != nil {
 		return newOwned, nil, "", err
 	}
-
-	if err := r.pruneUnreferenced(ctx, prevOwned, newOwned); err != nil {
+	nftHash, err = r.ApplyNFTables(ctx, host)
+	if err != nil {
 		return newOwned, nil, "", err
 	}
-
 	return newOwned, liveDNS, nftHash, nil
 }
 
@@ -660,7 +674,7 @@ func (r *Reconciler) buildDesiredPlan(ctx context.Context, host *manifest.Resolv
 		return strings.Compare(a.CompName, b.CompName)
 	})
 
-	targets, err := buildNFTGuardTargets(r.cgroupPattern, plan.rootless)
+	targets, err := collectNFTGuardTargets(r.cgroupPattern, host)
 	if err != nil {
 		return nil, err
 	}
