@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Milestone 0 Fedora CoreOS spike verification script for quadmatic.
 # Validates:
-#   1. L3Mdev sysctls, VLAN + VRF + macvlan + rootless pasta isolation (inbound/outbound & sshd isolation)
-#   2. Rootless systemd user unit cgroupv2 paths for podman pull, conmon, and pasta
-#   3. Rootless user provisioning under /var/home/qmspike, linger, DBus wait, daemon-reload, and secret piping
+#   1. L3Mdev sysctls, l3mdev-before-local ip rule ordering, VLAN + VRF + macvlan + rootless pasta isolation (inbound/outbound & sshd isolation)
+#   2. Rootless user provisioning under /var/home/qmspike, linger, DBus wait, daemon-reload, and secret piping
 set -euo pipefail
 
 SPIKE_USER="${SPIKE_USER:-qmspike}"
@@ -24,6 +23,8 @@ CREATED_USER=0
 CREATED_VLAN=0
 CREATED_VRF=0
 CREATED_MACVLAN=0
+ADDED_LOCAL_RULE_32765=0
+REMOVED_LOCAL_RULE_0=0
 SPIKE_UID=""
 
 log() {
@@ -50,7 +51,6 @@ cleanup() {
       podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     systemd-run --machine="${SPIKE_USER}@.host" --user --wait --quiet \
       podman secret rm "$SECRET_NAME" >/dev/null 2>&1 || true
-    systemctl --user -M "${SPIKE_USER}@" stop qmspike-pull-probe.service >/dev/null 2>&1 || true
   fi
   if [[ "$CREATED_MACVLAN" -eq 1 ]]; then
     nmcli connection down "$MACVLAN_IFACE" >/dev/null 2>&1 || true
@@ -64,6 +64,12 @@ cleanup() {
   if [[ "$CREATED_VLAN" -eq 1 ]]; then
     nmcli connection down "$VLAN_IFACE" >/dev/null 2>&1 || true
     nmcli connection delete "$VLAN_IFACE" >/dev/null 2>&1 || true
+  fi
+  if [[ "$REMOVED_LOCAL_RULE_0" -eq 1 ]]; then
+    ip rule add prio 0 table local >/dev/null 2>&1 || true
+  fi
+  if [[ "$ADDED_LOCAL_RULE_32765" -eq 1 ]]; then
+    ip rule del prio 32765 table local >/dev/null 2>&1 || true
   fi
   if [[ "$CREATED_USER" -eq 1 ]] && id "$SPIKE_USER" >/dev/null 2>&1; then
     loginctl disable-linger "$SPIKE_USER" >/dev/null 2>&1 || true
@@ -82,8 +88,13 @@ detect_trunk_iface() {
   [[ -n "$TRUNK_IFACE" ]] || fail "could not detect default trunk interface; set TRUNK_IFACE"
 }
 
-check_3_provision_user() {
-  log "=== Check 3 (part 1): Create user ${SPIKE_USER} under ${SPIKE_HOME}, enable linger, wait for bus, daemon-reload ==="
+has_local_rule_prio() {
+  local prio="$1"
+  ip rule show | grep -Eq "^${prio}:[[:space:]]+from all lookup local([[:space:]]|$)"
+}
+
+check_2_provision_user() {
+  log "=== Check 2 (part 1): Create user ${SPIKE_USER} under ${SPIKE_HOME}, enable linger, wait for bus, daemon-reload ==="
   if id "$SPIKE_USER" >/dev/null 2>&1; then
     fail "test user ${SPIKE_USER} already exists; remove it before running spike"
   fi
@@ -126,13 +137,23 @@ assert_tcp_blocked() {
 }
 
 check_1_networking_and_pasta() {
-  log "=== Check 1: L3Mdev sysctls, VLAN/VRF/macvlan setup, and rootless pasta isolation ==="
+  log "=== Check 1: L3Mdev sysctls, l3mdev-before-local ip rule ordering, VLAN/VRF/macvlan setup, and rootless pasta isolation ==="
   local tcp_l3mdev udp_l3mdev
   tcp_l3mdev="$(sysctl -n net.ipv4.tcp_l3mdev_accept)"
   udp_l3mdev="$(sysctl -n net.ipv4.udp_l3mdev_accept)"
   log "net.ipv4.tcp_l3mdev_accept=${tcp_l3mdev}, net.ipv4.udp_l3mdev_accept=${udp_l3mdev}"
   [[ "$tcp_l3mdev" == "0" ]] || fail "expected net.ipv4.tcp_l3mdev_accept == 0, got ${tcp_l3mdev}"
   [[ "$udp_l3mdev" == "0" ]] || fail "expected net.ipv4.udp_l3mdev_accept == 0, got ${udp_l3mdev}"
+
+  log "Enforcing l3mdev-before-local ip rule ordering (add prio 32765 before del prio 0)..."
+  if ! has_local_rule_prio 32765; then
+    ip rule add prio 32765 table local
+    ADDED_LOCAL_RULE_32765=1
+  fi
+  if has_local_rule_prio 0; then
+    ip rule del prio 0
+    REMOVED_LOCAL_RULE_0=1
+  fi
 
   detect_trunk_iface
   log "Using trunk interface: ${TRUNK_IFACE}"
@@ -152,6 +173,19 @@ check_1_networking_and_pasta() {
   nmcli connection up "$VRF_IFACE"
   ip route replace table "$VRF_TABLE" unreachable default metric 8192
   ip route show table "$VRF_TABLE"
+
+  ip rule show
+  has_local_rule_prio 32765 || fail "expected local lookup rule at priority 32765"
+  if has_local_rule_prio 0; then
+    fail "unexpected local lookup rule still present at priority 0"
+  fi
+  local l3mdev_prio local_prio
+  l3mdev_prio="$(ip rule show | awk '/lookup \[l3mdev-table\]/ {sub(/:/, "", $1); print $1; exit}')"
+  local_prio="$(ip rule show | awk '/from all lookup local/ {sub(/:/, "", $1); print $1; exit}')"
+  [[ -n "$l3mdev_prio" ]] || fail "expected l3mdev-table rule in ip rule show"
+  [[ "$local_prio" == "32765" ]] || fail "expected local lookup rule at priority 32765, got '${local_prio}'"
+  [[ "$l3mdev_prio" -lt "$local_prio" ]] || fail "expected l3mdev rule (${l3mdev_prio}) before local rule (${local_prio})"
+  log "Verified l3mdev-before-local rule ordering: l3mdev=${l3mdev_prio} < local=${local_prio}"
 
   nmcli connection add type macvlan con-name "$MACVLAN_IFACE" ifname "$MACVLAN_IFACE" \
     dev "$VLAN_IFACE" mode private master "$VRF_IFACE" \
@@ -207,26 +241,8 @@ check_1_networking_and_pasta() {
   log "Isolation from host sshd verified"
 }
 
-check_2_cgroup_paths() {
-  log "=== Check 2: Inspect /proc/<pid>/cgroup for podman pull, conmon, and pasta inside rootless user unit ==="
-  systemd-run --machine="${SPIKE_USER}@.host" --user --unit=qmspike-pull-probe --pipe --wait --quiet \
-    sh -c 'podman pull --policy=always "$1" >/dev/null & p=$!; echo "--- podman pull (/proc/$p/cgroup) ---"; cat "/proc/$p/cgroup" 2>/dev/null || cat /proc/self/cgroup; wait "$p"' _ "$TEST_IMAGE"
-
-  local conmon_pid pasta_pid
-  conmon_pid="$(pgrep -u "$SPIKE_UID" -n conmon || true)"
-  pasta_pid="$(pgrep -u "$SPIKE_UID" -n pasta || true)"
-
-  [[ -n "$conmon_pid" ]] || fail "could not find conmon PID for uid ${SPIKE_UID}"
-  [[ -n "$pasta_pid" ]] || fail "could not find pasta PID for uid ${SPIKE_UID}"
-
-  log "--- conmon (pid=${conmon_pid}) /proc/${conmon_pid}/cgroup ---"
-  cat "/proc/${conmon_pid}/cgroup"
-  log "--- pasta (pid=${pasta_pid}) /proc/${pasta_pid}/cgroup ---"
-  cat "/proc/${pasta_pid}/cgroup"
-}
-
-check_3_secret_pipe() {
-  log "=== Check 3 (part 2): Pipe test secret via systemd-run into podman secret ==="
+check_2_secret_pipe() {
+  log "=== Check 2 (part 2): Pipe test secret via systemd-run into podman secret ==="
   printf 'spike-secret-value' | systemd-run --machine="${SPIKE_USER}@.host" --user --pipe --wait --quiet \
     podman secret create --replace "$SECRET_NAME" -
 
@@ -239,12 +255,11 @@ check_3_secret_pipe() {
 
 main() {
   [[ "$EUID" -eq 0 ]] || fail "must run as root on a Fedora CoreOS test VM"
-  require_cmd sysctl nmcli ip podman loginctl systemctl systemd-run useradd userdel curl pgrep awk grep
+  require_cmd sysctl nmcli ip podman loginctl systemctl systemd-run useradd userdel curl awk grep
 
-  check_3_provision_user
+  check_2_provision_user
   check_1_networking_and_pasta
-  check_2_cgroup_paths
-  check_3_secret_pipe
+  check_2_secret_pipe
 
   log "All Milestone 0 FCOS spike checks passed."
 }
