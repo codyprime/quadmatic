@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"filippo.io/age"
-	"github.com/BurntSushi/toml"
 
 	"quadmatic/internal/config"
 	"quadmatic/internal/gitops"
@@ -60,15 +59,14 @@ type SecretsManager interface {
 }
 
 // NetmgrReconciler abstracts NetworkManager VLAN/VRF/macvlan reconciliation, drift detection,
-// nftables outbound_guard application, and transactional snapshot/restore.
+// VRF policy routing rules, and transactional snapshot/restore.
 type NetmgrReconciler interface {
 	CheckKernelInvariants() error
 	ResolveVLANParents(ctx context.Context, host *manifest.ResolvedHost) (map[int]string, error)
 	ReadLiveDNS(ctx context.Context, ifname string) ([]string, error)
-	Snapshot(ctx context.Context, owned []state.ManagedNetworkRecord) (*netmgr.Snapshot, error)
+	Snapshot(ctx context.Context, host *manifest.ResolvedHost, owned []state.ManagedNetworkRecord) (*netmgr.Snapshot, error)
 	DetectDrift(ctx context.Context, host *manifest.ResolvedHost, owned []state.ManagedNetworkRecord) (bool, error)
 	ApplyProfiles(ctx context.Context, host *manifest.ResolvedHost, prevOwned []state.ManagedNetworkRecord, dhcpTimeout time.Duration) ([]state.ManagedNetworkRecord, map[string][]string, map[string]bool, error)
-	ApplyNFTables(ctx context.Context, host *manifest.ResolvedHost) (string, error)
 	Restore(ctx context.Context, snap *netmgr.Snapshot, createdDuringAttempt []state.ManagedNetworkRecord) error
 }
 
@@ -113,6 +111,7 @@ type EngineDeps struct {
 	Logger             *slog.Logger
 	RootDir            string
 	Chown              func(path string, uid, gid int) error
+	UserGIDLookup      func(username string) (int, bool, error)
 	DHCPTimeout        time.Duration
 	RollbackTimeout    time.Duration
 	VerifyPollInterval time.Duration
@@ -130,6 +129,7 @@ type Engine struct {
 	logger             *slog.Logger
 	rootDir            string
 	chown              func(path string, uid, gid int) error
+	userGIDLookup      func(username string) (int, bool, error)
 	dhcpTimeout        time.Duration
 	rollbackTimeout    time.Duration
 	verifyPollInterval time.Duration
@@ -177,6 +177,19 @@ func NewEngine(deps EngineDeps) *Engine {
 		chownFn = func(string, int, int) error { return nil }
 	}
 
+	gidLookup := deps.UserGIDLookup
+	if gidLookup == nil {
+		if deps.RootDir == "" {
+			gidLookup = func(username string) (int, bool, error) {
+				return users.LookupPrimaryGID("/etc/passwd", username)
+			}
+		} else {
+			gidLookup = func(string) (int, bool, error) {
+				return 0, false, nil
+			}
+		}
+	}
+
 	dhcpTimeout := deps.DHCPTimeout
 	if dhcpTimeout <= 0 {
 		dhcpTimeout = defaultDHCPTimeout
@@ -198,6 +211,7 @@ func NewEngine(deps EngineDeps) *Engine {
 		logger:             logger,
 		rootDir:            deps.RootDir,
 		chown:              chownFn,
+		userGIDLookup:      gidLookup,
 		dhcpTimeout:        dhcpTimeout,
 		rollbackTimeout:    rollbackTimeout,
 		verifyPollInterval: deps.VerifyPollInterval,
@@ -212,12 +226,12 @@ type unitID struct {
 }
 
 type desiredSecret struct {
-	Key       string
-	Scope     string
-	Name      string
-	RelPath   string
-	Plaintext []byte
-	Digest    string
+	Key           string
+	Scope         string
+	Name          string
+	SourceRelPath string
+	Plaintext     []byte
+	Digest        string
 }
 
 type unitPlanMeta struct {
@@ -225,8 +239,6 @@ type unitPlanMeta struct {
 	Unit           quadlet.GeneratedUnit
 	Component      string
 	SourceDestPath string
-	DataDir        string
-	OwnerUID       int
 }
 
 type applyPlan struct {
@@ -243,7 +255,6 @@ type applyPlan struct {
 	unitsToStart       []unitID
 	unitsToRestart     []unitID
 	unitsToStop        []unitID
-	affectedScopes     map[string]bool
 	driftDetected      bool
 	managedRootless    int
 	managedRootful     int
@@ -290,6 +301,15 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 		return res, err
 	}
 
+	if !opts.DryRun && e.cfg.StateFile != "" {
+		release, err := acquireReconcileLock(ctx, e.cfg.StateFile+".lock")
+		if err != nil {
+			res.FailedStage = "fetch"
+			return res, err
+		}
+		defer release()
+	}
+
 	prevState, err := state.Load(e.cfg.StateFile)
 	if err != nil {
 		res.FailedStage = "fetch"
@@ -305,7 +325,7 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 		newSHA, err = e.git.FetchAndVerify(ctx, prevState.AppliedSHA, opts.AllowNonFF)
 	}
 	if err != nil {
-		res.FailedStage = classifyGitStage(err, opts.LocalRepoPath != "")
+		res.FailedStage = classifyGitStage(err)
 		return res, err
 	}
 
@@ -366,10 +386,17 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 	}
 	defer clearDesiredSecrets(desiredSecrets)
 
+	stage3UserGIDs, err := e.lookupUserGIDs(activeUsers)
+	if err != nil {
+		res.FailedStage = "validate"
+		return res, err
+	}
+
 	stage3LiveDNS := e.readExistingLiveDNS(ctx, resolved)
 	rendered, err := manifest.RenderHost(resolved, manifest.RenderEnv{
 		LiveDNS:      stage3LiveDNS,
 		ParentIfaces: parentIfaces,
+		UserGIDs:     stage3UserGIDs,
 		DryRun:       true,
 	})
 	if err != nil {
@@ -391,7 +418,7 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 	}
 
 	netDrifted := false
-	if hasAnyNetwork(resolved) || len(prevState.Networks) > 0 || prevState.NFTablesHash != "" {
+	if hasAnyNetwork(resolved) || len(prevState.Networks) > 0 {
 		netDrifted, err = e.netmgr.DetectDrift(ctx, resolved, prevState.Networks)
 		if err != nil {
 			res.FailedStage = "validate"
@@ -422,7 +449,6 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 	hasUserWork := hasMutatingUserAction(userPlan)
 	needsMutate := newSHA != prevState.AppliedSHA ||
 		plan.driftDetected ||
-		netDrifted ||
 		rendered.UsedPlaceholderDNS ||
 		hasUserWork ||
 		len(plan.filesToWrite) > 0 ||
@@ -441,20 +467,63 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 
 	// Stage 5: Users (non-destructive; users are never deleted on rollback)
 	if _, err := e.users.Apply(ctx, reg, activeUsers, prevState.ManagedUsers); err != nil {
+		res.AppliedSHA = prevState.AppliedSHA
 		res.FailedStage = "users"
+		res.FailedUnits = stage4FailedUnits
+		res.ManagedUnitsRootless, res.ManagedUnitsRootful = countStateUnits(prevState)
 		return res, err
 	}
 	managedUsers := unionSortedStrings(prevState.ManagedUsers, activeUsers)
 
+	finalUserGIDs, err := e.lookupUserGIDs(activeUsers)
+	if err != nil {
+		res.AppliedSHA = prevState.AppliedSHA
+		res.FailedStage = "users"
+		res.FailedUnits = stage4FailedUnits
+		res.ManagedUnitsRootless, res.ManagedUnitsRootful = countStateUnits(prevState)
+		return res, err
+	}
+	if userGIDsChanged(resolved, stage3UserGIDs, finalUserGIDs) {
+		rendered, desiredUnits, plan, err = e.rerenderAndRebuildPlan(
+			ctx,
+			resolved,
+			manifest.RenderEnv{
+				LiveDNS:      stage3LiveDNS,
+				ParentIfaces: parentIfaces,
+				UserGIDs:     finalUserGIDs,
+				DryRun:       true,
+			},
+			desiredSecrets,
+			prevState,
+			plan,
+		)
+		if err != nil {
+			res.AppliedSHA = prevState.AppliedSHA
+			res.FailedStage = "validate"
+			res.FailedUnits = stage4FailedUnits
+			res.ManagedUnitsRootless, res.ManagedUnitsRootful = countStateUnits(prevState)
+			return res, err
+		}
+		res.DriftDetected = plan.driftDetected
+		res.ManagedUnitsRootless = plan.managedRootless
+		res.ManagedUnitsRootful = plan.managedRootful
+	}
+
 	// Stage 6: Pre-Apply Rollback Snapshot
 	fileSnap, err := captureFileSnapshot(e.rootDir, prevState.Files, plan.desiredFiles)
 	if err != nil {
+		res.AppliedSHA = prevState.AppliedSHA
 		res.FailedStage = "files"
+		res.FailedUnits = stage4FailedUnits
+		res.ManagedUnitsRootless, res.ManagedUnitsRootful = countStateUnits(prevState)
 		return res, fmt.Errorf("capture file snapshot: %w", err)
 	}
-	netSnap, err := e.netmgr.Snapshot(ctx, prevState.Networks)
+	netSnap, err := e.netmgr.Snapshot(ctx, resolved, prevState.Networks)
 	if err != nil {
+		res.AppliedSHA = prevState.AppliedSHA
 		res.FailedStage = "net"
+		res.FailedUnits = stage4FailedUnits
+		res.ManagedUnitsRootless, res.ManagedUnitsRootful = countStateUnits(prevState)
 		return res, fmt.Errorf("capture network snapshot: %w", err)
 	}
 
@@ -472,6 +541,12 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 		rbErr := e.rollback(rbCtx, prevState, fileSnap, netSnap, tracker, identities, plan, priorNonActive)
 		res.AppliedSHA = prevState.AppliedSHA
 		res.RolledBack = true
+		res.ManagedUnitsRootless, res.ManagedUnitsRootful = countStateUnits(prevState)
+		if postFailed, qErr := e.queryPrevStateFailedUnits(rbCtx, prevState); qErr == nil {
+			res.FailedUnits = postFailed
+		} else {
+			res.FailedUnits = stage4FailedUnits
+		}
 		if rbErr != nil {
 			res.FailedStage = "rollback"
 			e.logger.Error("reconcile rollback failed", "failed_stage", failedStage, "cause", cause, "rollback_err", rbErr)
@@ -496,31 +571,21 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 	}
 
 	if rendered.UsedPlaceholderDNS || !stringSliceMapsEqual(stage3LiveDNS, finalLiveDNS) {
-		rendered, err = manifest.RenderHost(resolved, manifest.RenderEnv{
-			LiveDNS:      finalLiveDNS,
-			ParentIfaces: parentIfaces,
-			DryRun:       false,
-		})
+		rendered, desiredUnits, plan, err = e.rerenderAndRebuildPlan(
+			ctx,
+			resolved,
+			manifest.RenderEnv{
+				LiveDNS:      finalLiveDNS,
+				ParentIfaces: parentIfaces,
+				UserGIDs:     finalUserGIDs,
+				DryRun:       false,
+			},
+			desiredSecrets,
+			prevState,
+			plan,
+		)
 		if err != nil {
-			return runRollback("net", fmt.Errorf("post-DHCP render failed: %w", err))
-		}
-		desiredUnits, err = e.quadlet.ValidateHost(ctx, rendered)
-		if err != nil {
-			return runRollback("net", fmt.Errorf("post-DHCP quadlet validation failed: %w", err))
-		}
-		savedDrift := plan.driftDetected
-		savedHealed := plan.healedFiles
-		plan, err = e.buildApplyPlan(rendered, desiredUnits, desiredSecrets, prevState)
-		if err != nil {
-			return runRollback("net", fmt.Errorf("post-DHCP plan rebuild failed: %w", err))
-		}
-		if savedDrift {
-			plan.driftDetected = true
-		}
-		for k, v := range savedHealed {
-			if v {
-				plan.healedFiles[k] = true
-			}
+			return runRollback("net", fmt.Errorf("post-DHCP %w", err))
 		}
 		res.DriftDetected = plan.driftDetected
 		res.ManagedUnitsRootless = plan.managedRootless
@@ -555,7 +620,7 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 		tracker.upsertedSecrets[key] = secretRef{Scope: sec.Scope, Name: sec.Name}
 	}
 
-	// Stage 7d: Prune, DaemonReload, Start/Restart, Verify Active, ApplyNFTables
+	// Stage 7d: Prune, DaemonReload, Start/Restart, Verify Active
 	for _, u := range plan.unitsToStop {
 		if err := e.systemd.Stop(ctx, u.Scope, u.UnitName); err != nil {
 			return runRollback("apply", err)
@@ -570,8 +635,8 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 		}
 		tracker.prunedFiles = append(tracker.prunedFiles, destPath)
 		if prevRec, ok := prevState.Files[destPath]; ok && prevRec.Kind == manifest.FileKindQuadlet {
-			if scope := scopeFromFilePath(destPath, prevState, resolved); scope != "" {
-				tracker.affectedScopes[scope] = true
+			if prevRec.Scope != "" {
+				tracker.affectedScopes[prevRec.Scope] = true
 			}
 		}
 	}
@@ -621,13 +686,8 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 		}
 	}
 
-	nftHash, err := e.netmgr.ApplyNFTables(ctx, resolved)
-	if err != nil {
-		return runRollback("net", err)
-	}
-
 	// Stage 8: Commit State
-	newState := buildNextState(newSHA, managedUsers, plan, desiredSecrets, newNetRecords, nftHash)
+	newState := buildNextState(newSHA, managedUsers, plan, desiredSecrets, newNetRecords)
 	if err := state.SaveAtomic(e.cfg.StateFile, newState); err != nil {
 		return runRollback("apply", fmt.Errorf("commit state %q: %w", e.cfg.StateFile, err))
 	}
@@ -664,11 +724,21 @@ func (e *Engine) rollback(
 ) error {
 	var errs []error
 
-	// 1. Stop units newly added in this attempt (reverse order so workloads stop before helper units).
+	// 1. Stop units newly added in this attempt (reverse order so workloads stop before helper units),
+	// and stop any restarted units that were previously non-active.
 	for i := len(tracker.addedUnits) - 1; i >= 0; i-- {
 		u := tracker.addedUnits[i]
 		if err := e.systemd.Stop(ctx, u.Scope, u.UnitName); err != nil {
 			errs = append(errs, fmt.Errorf("stop added unit %s: %w", u.Key, err))
+		}
+	}
+	for i := len(tracker.restartedUnits) - 1; i >= 0; i-- {
+		u := tracker.restartedUnits[i]
+		if !priorNonActive[u.Key] {
+			continue
+		}
+		if err := e.systemd.Stop(ctx, u.Scope, u.UnitName); err != nil {
+			errs = append(errs, fmt.Errorf("stop previously-inactive restarted unit %s: %w", u.Key, err))
 		}
 	}
 
@@ -697,7 +767,7 @@ func (e *Engine) rollback(
 		}
 	}
 
-	// 3. Restore NetworkManager profiles and nftables ruleset.
+	// 3. Restore NetworkManager profiles.
 	if err := e.netmgr.Restore(ctx, netSnap, tracker.createdOrMutatedNet); err != nil {
 		errs = append(errs, fmt.Errorf("restore network state: %w", err))
 	}
@@ -718,7 +788,7 @@ func (e *Engine) rollback(
 	}
 
 	if len(secretsToRestore) > 0 && prevState.AppliedSHA != "" {
-		if err := e.restoreSecretsFromCommit(ctx, prevState.AppliedSHA, secretsToRestore, identities); err != nil {
+		if err := e.restoreSecretsFromCommit(ctx, prevState.AppliedSHA, prevState.SecretSourcePaths, secretsToRestore, identities); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -744,6 +814,7 @@ func (e *Engine) rollback(
 func (e *Engine) restoreSecretsFromCommit(
 	ctx context.Context,
 	appliedSHA string,
+	secretSourcePaths map[string]string,
 	toRestore map[string]secretRef,
 	identities []age.Identity,
 ) error {
@@ -758,42 +829,6 @@ func (e *Engine) restoreSecretsFromCommit(
 		}
 	}
 
-	hostBytes, err := e.git.ReadFileAtCommit(ctx, appliedSHA, "hosts/"+e.cfg.Hostname+".toml")
-	if err != nil {
-		return fmt.Errorf("read host manifest at %s for secret rollback: %w", appliedSHA, err)
-	}
-	var rawHost struct {
-		Components []struct {
-			Name    string `toml:"name"`
-			User    string `toml:"user"`
-			Rootful bool   `toml:"rootful"`
-		} `toml:"component"`
-	}
-	if _, err := toml.Decode(string(hostBytes), &rawHost); err != nil {
-		return fmt.Errorf("decode host manifest at %s: %w", appliedSHA, err)
-	}
-
-	secretRelPaths := make(map[string]string, len(toRestore))
-	for _, comp := range rawHost.Components {
-		scope := comp.User
-		if comp.Rootful {
-			scope = RootfulScope
-		}
-		compTOML, err := e.git.ReadFileAtCommit(ctx, appliedSHA, "components/"+comp.Name+"/component.toml")
-		if err != nil {
-			continue
-		}
-		var rawComp struct {
-			Secrets map[string]string `toml:"secrets"`
-		}
-		if _, err := toml.Decode(string(compTOML), &rawComp); err != nil {
-			return fmt.Errorf("decode component %q manifest at %s: %w", comp.Name, appliedSHA, err)
-		}
-		for secName, relPath := range rawComp.Secrets {
-			secretRelPaths[scope+"/"+secName] = relPath
-		}
-	}
-
 	var errs []error
 	keys := make([]string, 0, len(toRestore))
 	for k := range toRestore {
@@ -803,8 +838,8 @@ func (e *Engine) restoreSecretsFromCommit(
 
 	for _, key := range keys {
 		ref := toRestore[key]
-		relPath, ok := secretRelPaths[key]
-		if !ok {
+		relPath, ok := secretSourcePaths[key]
+		if !ok || relPath == "" {
 			errs = append(errs, fmt.Errorf("could not locate .age source path for secret %s at commit %s", key, appliedSHA))
 			continue
 		}
@@ -851,7 +886,9 @@ func collectRollbackRestarts(
 		}
 	}
 	for _, u := range tracker.restartedUnits {
-		addUnit(u)
+		if !priorNonActive[u.Key] {
+			addUnit(u)
+		}
 	}
 
 	// Also catch any previously active unit in prevState whose files were mutated and whose scope was reloaded.
@@ -905,20 +942,20 @@ func (e *Engine) verifyUnitActive(ctx context.Context, u unitID, timeout time.Du
 
 	deadline := time.Now().Add(timeout)
 	for {
-		st, err := e.systemd.ActiveState(ctx, u.Scope, u.UnitName)
+		st, err := e.systemd.UnitState(ctx, u.Scope, u.UnitName)
 		if err != nil {
-			return fmt.Errorf("check active state of %s: %w", u.Key, err)
+			return fmt.Errorf("check unit state of %s: %w", u.Key, err)
 		}
-		switch st {
-		case "active":
+		if st.ActiveState == "active" || (st.Type == "oneshot" && st.ActiveState == "inactive" && st.Result == "success") {
 			return nil
-		case "failed":
-			return fmt.Errorf("unit %s entered failed state", u.Key)
+		}
+		if st.ActiveState == "failed" || (st.ActiveState == "inactive" && st.Result != "" && st.Result != "success") {
+			return fmt.Errorf("unit %s entered failed state (state=%q type=%q result=%q)", u.Key, st.ActiveState, st.Type, st.Result)
 		}
 
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return fmt.Errorf("timed out waiting for unit %s to become active (last state: %q)", u.Key, st)
+			return fmt.Errorf("timed out waiting for unit %s to become active (last state=%q type=%q result=%q)", u.Key, st.ActiveState, st.Type, st.Result)
 		}
 		waitFor := interval
 		if remaining < waitFor {
@@ -967,9 +1004,9 @@ func (e *Engine) prepareSecrets(
 			relPath := comp.Secrets[secName]
 			key := scope + "/" + secName
 			if existing, dup := desired[key]; dup {
-				if existing.RelPath != relPath {
+				if existing.SourceRelPath != relPath {
 					clearDesiredSecrets(desired)
-					return nil, nil, fmt.Errorf("conflicting paths for secret %q in scope %q: %q vs %q", secName, scope, existing.RelPath, relPath)
+					return nil, nil, fmt.Errorf("conflicting paths for secret %q in scope %q: %q vs %q", secName, scope, existing.SourceRelPath, relPath)
 				}
 				continue
 			}
@@ -985,12 +1022,12 @@ func (e *Engine) prepareSecrets(
 				return nil, nil, fmt.Errorf("decrypt secret %q (%s): %w", key, relPath, err)
 			}
 			desired[key] = desiredSecret{
-				Key:       key,
-				Scope:     scope,
-				Name:      secName,
-				RelPath:   relPath,
-				Plaintext: pt,
-				Digest:    secrets.Digest(pt),
+				Key:           key,
+				Scope:         scope,
+				Name:          secName,
+				SourceRelPath: relPath,
+				Plaintext:     pt,
+				Digest:        secrets.Digest(pt),
 			}
 		}
 	}
@@ -1001,6 +1038,75 @@ func clearDesiredSecrets(m map[string]desiredSecret) {
 	for _, sec := range m {
 		clear(sec.Plaintext)
 	}
+}
+
+func (e *Engine) lookupUserGIDs(activeUsers []string) (map[string]int, error) {
+	if len(activeUsers) == 0 || e.userGIDLookup == nil {
+		return nil, nil
+	}
+	gids := make(map[string]int, len(activeUsers))
+	for _, u := range activeUsers {
+		gid, ok, err := e.userGIDLookup(u)
+		if err != nil {
+			return nil, fmt.Errorf("lookup primary GID for user %q: %w", u, err)
+		}
+		if ok {
+			gids[u] = gid
+		}
+	}
+	return gids, nil
+}
+
+func effectiveUserGID(comp manifest.ResolvedComponent, gids map[string]int) int {
+	if gid, ok := gids[comp.User]; ok {
+		return gid
+	}
+	return comp.UID
+}
+
+func userGIDsChanged(host *manifest.ResolvedHost, before, after map[string]int) bool {
+	for _, comp := range host.Components {
+		if comp.Rootful || comp.User == "" {
+			continue
+		}
+		if effectiveUserGID(comp, before) != effectiveUserGID(comp, after) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) rerenderAndRebuildPlan(
+	ctx context.Context,
+	resolved *manifest.ResolvedHost,
+	env manifest.RenderEnv,
+	desiredSecrets map[string]desiredSecret,
+	prevState *state.State,
+	prevPlan *applyPlan,
+) (*manifest.RenderedHost, map[string]quadlet.GeneratedUnit, *applyPlan, error) {
+	rendered, err := manifest.RenderHost(resolved, env)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("render failed: %w", err)
+	}
+	desiredUnits, err := e.quadlet.ValidateHost(ctx, rendered)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("quadlet validation failed: %w", err)
+	}
+	plan, err := e.buildApplyPlan(rendered, desiredUnits, desiredSecrets, prevState)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("plan rebuild failed: %w", err)
+	}
+	if prevPlan != nil {
+		if prevPlan.driftDetected {
+			plan.driftDetected = true
+		}
+		for k, v := range prevPlan.healedFiles {
+			if v {
+				plan.healedFiles[k] = true
+			}
+		}
+	}
+	return rendered, desiredUnits, plan, nil
 }
 
 func (e *Engine) readExistingLiveDNS(ctx context.Context, resolved *manifest.ResolvedHost) map[string][]string {
@@ -1031,13 +1137,9 @@ func (e *Engine) buildApplyPlan(
 		desiredUnits:       make(map[string]unitPlanMeta, len(generatedUnits)),
 		healedFiles:        make(map[string]bool),
 		changedSecretKeys:  make(map[string]bool),
-		affectedScopes:     make(map[string]bool),
 		compByFileDestPath: make(map[string]string),
 	}
 
-	compScope := make(map[string]string, len(rendered.Components))
-	compDataPaths := make(map[string][]string, len(rendered.Components))
-	compFileComps := make(map[string]string)
 	quadletLookup := make(map[string]struct {
 		compName string
 		destPath string
@@ -1046,7 +1148,6 @@ func (e *Engine) buildApplyPlan(
 
 	for _, comp := range rendered.Components {
 		scope := comp.Scope()
-		compScope[comp.Name] = scope
 		scopeCompNames[scope] = append(scopeCompNames[scope], comp.Name)
 		userHomeRoot := ""
 		if !comp.Rootful && comp.User != "" {
@@ -1055,18 +1156,14 @@ func (e *Engine) buildApplyPlan(
 		for _, rf := range comp.Files {
 			p.desiredFiles[rf.DestPath] = rf
 			p.fileCompScope[rf.DestPath] = scope
-			compFileComps[rf.DestPath] = comp.Name
 			p.compByFileDestPath[rf.DestPath] = comp.Name
 			if rf.Kind == manifest.FileKindQuadlet {
 				quadletLookup[scope+"/"+rf.RelPath] = struct {
 					compName string
 					destPath string
 				}{compName: comp.Name, destPath: rf.DestPath}
-			} else {
-				compDataPaths[comp.Name] = append(compDataPaths[comp.Name], rf.DestPath)
-				if userHomeRoot != "" {
-					p.fileChownRoots[rf.DestPath] = userHomeRoot
-				}
+			} else if userHomeRoot != "" {
+				p.fileChownRoots[rf.DestPath] = userHomeRoot
 			}
 		}
 	}
@@ -1131,7 +1228,7 @@ func (e *Engine) buildApplyPlan(
 		if rf.Kind != manifest.FileKindData {
 			continue
 		}
-		compName := compFileComps[destPath]
+		compName := p.compByFileDestPath[destPath]
 		prevRec, existed := prevState.Files[destPath]
 		if !existed || prevRec.SHA256 != rf.SHA256 || prevRec.Mode != rf.Mode || p.healedFiles[destPath] || fileNeedsWrite[destPath] {
 			compDataChanged[compName] = true
@@ -1279,6 +1376,55 @@ func (e *Engine) queryExistingUnitStates(
 	return failed, nonActive, nil
 }
 
+func (e *Engine) queryPrevStateFailedUnits(ctx context.Context, prevState *state.State) ([]UnitStatus, error) {
+	if prevState == nil || len(prevState.GeneratedUnits) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(prevState.GeneratedUnits))
+	for k := range prevState.GeneratedUnits {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var failed []UnitStatus
+	for _, k := range keys {
+		scope, unitName, ok := strings.Cut(k, "/")
+		if !ok || scope == "" || unitName == "" {
+			continue
+		}
+		st, err := e.systemd.ActiveState(ctx, scope, unitName)
+		if err != nil {
+			return nil, fmt.Errorf("query systemd state for %s: %w", k, err)
+		}
+		if st != "active" {
+			failed = append(failed, UnitStatus{
+				Scope:       scope,
+				Unit:        unitName,
+				ActiveState: st,
+			})
+		}
+	}
+	return failed, nil
+}
+
+func countStateUnits(st *state.State) (rootless, rootful int) {
+	if st == nil {
+		return 0, 0
+	}
+	for k := range st.GeneratedUnits {
+		scope, _, ok := strings.Cut(k, "/")
+		if !ok {
+			continue
+		}
+		if scope == RootfulScope {
+			rootful++
+		} else {
+			rootless++
+		}
+	}
+	return rootless, rootful
+}
+
 func correlateUnitOwner(
 	gu quadlet.GeneratedUnit,
 	quadletLookup map[string]struct {
@@ -1297,7 +1443,7 @@ func correlateUnitOwner(
 		}
 	}
 
-	for _, cand := range quadletCandidates(gu.UnitName) {
+	for _, cand := range quadlet.SourceCandidates(gu.UnitName) {
 		if hit, ok := quadletLookup[gu.Scope+"/"+cand]; ok {
 			return hit.compName, hit.destPath
 		}
@@ -1307,30 +1453,6 @@ func correlateUnitOwner(
 		return comps[0], ""
 	}
 	return "", ""
-}
-
-func quadletCandidates(unitName string) []string {
-	if !strings.HasSuffix(unitName, ".service") {
-		return nil
-	}
-	stem := strings.TrimSuffix(unitName, ".service")
-	suffixMap := []struct {
-		unitSuffix string
-		ext        string
-	}{
-		{"-volume", ".volume"},
-		{"-network", ".network"},
-		{"-pod", ".pod"},
-		{"-image", ".image"},
-		{"-kube", ".kube"},
-		{"-build", ".build"},
-	}
-	for _, m := range suffixMap {
-		if strings.HasSuffix(stem, m.unitSuffix) {
-			return []string{strings.TrimSuffix(stem, m.unitSuffix) + m.ext}
-		}
-	}
-	return []string{stem + ".container", stem + ".kube"}
 }
 
 func isHelperQuadletUnit(unitName, srcDestPath string) bool {
@@ -1368,7 +1490,6 @@ func buildNextState(
 	plan *applyPlan,
 	desiredSecrets map[string]desiredSecret,
 	networks []state.ManagedNetworkRecord,
-	nftHash string,
 ) *state.State {
 	st := state.NewEmpty()
 	st.AppliedSHA = sha
@@ -1384,6 +1505,7 @@ func buildNextState(
 			OwnerUID:  rf.OwnerUID,
 			OwnerGID:  rf.OwnerGID,
 			Component: plan.compByFileDestPath[destPath],
+			Scope:     plan.fileCompScope[destPath],
 			Kind:      rf.Kind,
 		}
 	}
@@ -1392,11 +1514,13 @@ func buildNextState(
 	}
 	for key, sec := range desiredSecrets {
 		st.Secrets[key] = sec.Digest
+		if sec.SourceRelPath != "" {
+			st.SecretSourcePaths[key] = sec.SourceRelPath
+		}
 	}
 	if networks != nil {
 		st.Networks = slices.Clone(networks)
 	}
-	st.NFTablesHash = nftHash
 	return st
 }
 
@@ -1436,7 +1560,7 @@ func formatPlanSummary(
 	var b strings.Builder
 	fmt.Fprintf(&b, "Host: %s | Target SHA: %s (applied: %s)\n", rendered.Hostname, newSHA, prevSHA)
 	if rendered.UsedPlaceholderDNS {
-		b.WriteString("Note: placeholder DNS (192.0.2.53) used for pending dns_from_dhcp interfaces during dry-run/validation\n")
+		fmt.Fprintf(&b, "Note: placeholder DNS (%s) used for pending dns_from_dhcp interfaces during dry-run/validation\n", manifest.PlaceholderDNS)
 	}
 
 	compNames := make([]string, 0, len(rendered.Components))
@@ -1517,15 +1641,12 @@ func sortedUnitKeys(units []unitID) []string {
 	return keys
 }
 
-func classifyGitStage(err error, isLocal bool) string {
+func classifyGitStage(err error) string {
 	msg := err.Error()
 	if strings.Contains(msg, "verify SSH commit signature") ||
 		strings.Contains(msg, "non-fast-forward") ||
 		strings.Contains(msg, "allowed_signers") {
 		return "verify"
-	}
-	if isLocal {
-		return "fetch"
 	}
 	return "fetch"
 }
@@ -1572,32 +1693,6 @@ func hasMutatingUserAction(plan *users.Plan) bool {
 		}
 	}
 	return false
-}
-
-func scopeFromFilePath(destPath string, prevState *state.State, resolved *manifest.ResolvedHost) string {
-	if strings.HasPrefix(destPath, "/etc/containers/systemd/users/") {
-		rest := strings.TrimPrefix(destPath, "/etc/containers/systemd/users/")
-		uidStr, _, _ := strings.Cut(rest, "/")
-		for _, c := range resolved.Components {
-			if !c.Rootful && fmt.Sprintf("%d", c.UID) == uidStr {
-				return c.Scope()
-			}
-		}
-		if prevRec, ok := prevState.Files[destPath]; ok && prevRec.Component != "" {
-			if reg := resolved.Registry; reg != nil {
-				for uName, spec := range reg.Users {
-					if fmt.Sprintf("%d", spec.UID) == uidStr {
-						return uName
-					}
-				}
-			}
-		}
-		return ""
-	}
-	if strings.HasPrefix(destPath, "/etc/containers/systemd/") {
-		return RootfulScope
-	}
-	return ""
 }
 
 func inferUserHomeRoot(destPath string) string {

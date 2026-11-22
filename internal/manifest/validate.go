@@ -180,6 +180,25 @@ func portsCollide(a, b portBinding) bool {
 	return false
 }
 
+// NormalizeAndValidateMAC validates that mac is a non-zero 6-byte unicast Ethernet MAC
+// and returns it normalized as lowercase colon-separated hex (net.HardwareAddr.String()).
+func NormalizeAndValidateMAC(mac string) (string, error) {
+	if strings.TrimSpace(mac) == "" {
+		return "", fmt.Errorf("MAC address is required")
+	}
+	hw, err := net.ParseMAC(mac)
+	if err != nil || len(hw) != 6 {
+		return "", fmt.Errorf("invalid Ethernet MAC %q", mac)
+	}
+	if isAllZeroMAC(hw) {
+		return "", fmt.Errorf("invalid all-zero MAC %q", mac)
+	}
+	if hw[0]&0x01 != 0 {
+		return "", fmt.Errorf("MAC %q must be unicast (multicast bit is set)", mac)
+	}
+	return strings.ToLower(hw.String()), nil
+}
+
 func validateComponentNetwork(comp ResolvedComponent, seenMACs, networkUsers map[string]string) error {
 	netSpec := comp.Network
 	if netSpec.VLAN < 0 || netSpec.VLAN > 4094 {
@@ -188,20 +207,10 @@ func validateComponentNetwork(comp ResolvedComponent, seenMACs, networkUsers map
 	if netSpec.MacvlanMode != "" && netSpec.MacvlanMode != "private" && netSpec.MacvlanMode != "bridge" {
 		return fmt.Errorf("component %q invalid macvlan_mode %q (must be private or bridge)", comp.Name, netSpec.MacvlanMode)
 	}
-	if strings.TrimSpace(netSpec.MAC) == "" {
-		return fmt.Errorf("component %q network requires a MAC address", comp.Name)
+	normMAC, err := NormalizeAndValidateMAC(netSpec.MAC)
+	if err != nil {
+		return fmt.Errorf("component %q network: %w", comp.Name, err)
 	}
-	hw, err := net.ParseMAC(netSpec.MAC)
-	if err != nil || len(hw) != 6 {
-		return fmt.Errorf("component %q invalid Ethernet MAC %q", comp.Name, netSpec.MAC)
-	}
-	if isAllZeroMAC(hw) {
-		return fmt.Errorf("component %q invalid all-zero MAC %q", comp.Name, netSpec.MAC)
-	}
-	if hw[0]&0x01 != 0 {
-		return fmt.Errorf("component %q MAC %q must be unicast (multicast bit is set)", comp.Name, netSpec.MAC)
-	}
-	normMAC := strings.ToLower(hw.String())
 	if prevComp, dup := seenMACs[normMAC]; dup {
 		return fmt.Errorf("duplicate MAC %q shared by components %q and %q", normMAC, prevComp, comp.Name)
 	}

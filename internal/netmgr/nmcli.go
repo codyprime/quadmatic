@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/netip"
 	"regexp"
 	"slices"
@@ -46,27 +45,33 @@ type desiredVLAN struct {
 }
 
 type desiredRootlessNet struct {
-	CompName      string
-	Scope         string
-	UID           int
-	ParentIface   string
-	VRFName       string
-	TableID       int
-	MacvlanName   string
-	Mode          string
-	MAC           string
-	IPv6          bool
-	DNSFromDHCP   bool
-	OutboundGuard bool
-	Units         []string
+	CompName    string
+	Scope       string
+	UID         int
+	ParentIface string
+	VRFName     string
+	TableID     int
+	MacvlanName string
+	Mode        string
+	MAC         string
+	IPv6        bool
+	DNSFromDHCP bool
 }
 
 type desiredPlan struct {
 	vlans       []desiredVLAN
 	rootless    []desiredRootlessNet
-	nftTargets  []nftGuardTarget
 	parentMap   map[int]string
 	hasNetworks bool
+}
+
+func (p *desiredPlan) hasRootlessIPv6() bool {
+	for _, rl := range p.rootless {
+		if rl.IPv6 {
+			return true
+		}
+	}
+	return false
 }
 
 // ResolveVLANParents maps each requested VLAN ID in host to either an existing unmanaged
@@ -151,9 +156,9 @@ func (r *Reconciler) ReadLiveDNS(ctx context.Context, ifname string) ([]string, 
 	return parseDNSList(string(out)), nil
 }
 
-// Snapshot captures all currently owned `qm-*` NetworkManager profiles and the live
-// `table inet quadmatic` nftables ruleset prior to mutation.
-func (r *Reconciler) Snapshot(ctx context.Context, owned []state.ManagedNetworkRecord) (*Snapshot, error) {
+// Snapshot captures all currently live managed (`qm-*`/`qmv-*`) NetworkManager profiles
+// referenced by owned or desired by host prior to mutation.
+func (r *Reconciler) Snapshot(ctx context.Context, host *manifest.ResolvedHost, owned []state.ManagedNetworkRecord) (*Snapshot, error) {
 	if r == nil {
 		return nil, errors.New("netmgr reconciler is nil")
 	}
@@ -166,41 +171,58 @@ func (r *Reconciler) Snapshot(ctx context.Context, owned []state.ManagedNetworkR
 		OwnedRecords: slices.Clone(owned),
 	}
 
+	var candidates []string
 	seen := make(map[string]bool)
+	addCandidate := func(name string) {
+		if !isManagedConnectionName(name) || seen[name] {
+			return
+		}
+		seen[name] = true
+		candidates = append(candidates, name)
+	}
+
 	for _, rec := range owned {
-		if !rec.Owned || !isManagedConnectionName(rec.ConnectionName) {
-			continue
+		if rec.Owned {
+			addCandidate(rec.ConnectionName)
 		}
-		if seen[rec.ConnectionName] {
-			continue
+	}
+	if host != nil {
+		plan, err := r.buildDesiredPlan(ctx, host)
+		if err != nil {
+			return nil, err
 		}
-		seen[rec.ConnectionName] = true
-		if err := validateConnName(rec.ConnectionName); err != nil {
+		for _, v := range plan.vlans {
+			if v.Owned {
+				addCandidate(v.ConnName)
+			}
+		}
+		for _, rl := range plan.rootless {
+			addCandidate(rl.VRFName)
+			addCandidate(rl.MacvlanName)
+		}
+	}
+
+	for _, name := range candidates {
+		if err := validateConnName(name); err != nil {
 			return nil, err
 		}
 
-		out, err := r.runner.Run(ctx, nil, "nmcli", "-t", "connection", "show", rec.ConnectionName)
+		out, err := r.runner.Run(ctx, nil, "nmcli", "-t", "connection", "show", name)
 		if err != nil {
 			if isNMNotFoundErr(out, err) {
 				continue
 			}
-			return nil, formatCmdErr(fmt.Sprintf("nmcli -t connection show %s", rec.ConnectionName), out, err)
+			return nil, formatCmdErr(fmt.Sprintf("nmcli -t connection show %s", name), out, err)
 		}
-		snap.Profiles[rec.ConnectionName] = string(out)
+		snap.Profiles[name] = string(out)
 	}
 
-	ruleset, exists, err := r.readNFTables(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if exists {
-		snap.NFTablesRuleset = ruleset
-	}
 	return snap, nil
 }
 
 // DetectDrift reports whether live NetworkManager profiles, VRF unreachable routes,
-// `owned` records, or `table inet quadmatic` diverge from the desired state in host.
+// VRF l3mdev-before-local policy routing rules, or `owned` records diverge from the
+// desired state in host.
 func (r *Reconciler) DetectDrift(ctx context.Context, host *manifest.ResolvedHost, owned []state.ManagedNetworkRecord) (bool, error) {
 	if r == nil {
 		return false, errors.New("netmgr reconciler is nil")
@@ -315,19 +337,25 @@ func (r *Reconciler) DetectDrift(ctx context.Context, host *manifest.ResolvedHos
 		}
 	}
 
-	nftDrifted, err := r.hasNFTablesDrift(ctx, plan.nftTargets)
-	if err != nil {
-		return false, err
+	if len(plan.rootless) > 0 {
+		rulesOK, err := r.hasL3mdevBeforeLocal(ctx, plan.hasRootlessIPv6())
+		if err != nil {
+			return false, err
+		}
+		if !rulesOK {
+			return true, nil
+		}
 	}
-	return nftDrifted, nil
+
+	return false, nil
 }
 
-// ApplyProfiles reconciles VLAN parents, per-component VRFs and macvlans, live DHCP DNS
-// polling, and pruning of unreferenced owned profiles without modifying nftables. Even when
-// err != nil, newOwned contains all `qm-*`/`qmv-*` profiles created or reconciled up to the
-// point of failure so callers can pass them straight to Restore. mutatedComponents reports
-// components whose `qm-<uid>`, `qmv-<uid>`, or parent `qm-vlan<V>` profile was created,
-// modified, or reactivated during this pass.
+// ApplyProfiles reconciles VLAN parents, per-component VRFs and macvlans,
+// l3mdev-before-local VRF policy routing rules, live DHCP DNS polling, and pruning of
+// unreferenced owned profiles. Even when err != nil, newOwned contains all `qm-*`/`qmv-*`
+// profiles created or reconciled up to the point of failure so callers can pass them
+// straight to Restore. mutatedComponents reports components whose `qm-<uid>`, `qmv-<uid>`,
+// or parent `qm-vlan<V>` profile was created, modified, or reactivated during this pass.
 func (r *Reconciler) ApplyProfiles(
 	ctx context.Context,
 	host *manifest.ResolvedHost,
@@ -350,6 +378,9 @@ func (r *Reconciler) ApplyProfiles(
 	}
 	if len(plan.rootless) > 0 {
 		if err := r.CheckKernelInvariants(); err != nil {
+			return nil, nil, nil, err
+		}
+		if err := r.ensureL3mdevBeforeLocal(ctx, plan.hasRootlessIPv6()); err != nil {
 			return nil, nil, nil, err
 		}
 	}
@@ -485,30 +516,11 @@ func (r *Reconciler) ApplyProfiles(
 	return newOwned, liveDNS, mutatedComponents, nil
 }
 
-// Apply reconciles NetworkManager profiles (ApplyProfiles) followed by the cgroupv2-scoped
-// `inet quadmatic` nftables outbound guard (ApplyNFTables). Even when err != nil, newOwned
-// contains all `qm-*`/`qmv-*` profiles created or reconciled up to the point of failure.
-func (r *Reconciler) Apply(
-	ctx context.Context,
-	host *manifest.ResolvedHost,
-	prevOwned []state.ManagedNetworkRecord,
-	dhcpTimeout time.Duration,
-) (newOwned []state.ManagedNetworkRecord, liveDNS map[string][]string, nftHash string, err error) {
-	newOwned, liveDNS, _, err = r.ApplyProfiles(ctx, host, prevOwned, dhcpTimeout)
-	if err != nil {
-		return newOwned, nil, "", err
-	}
-	nftHash, err = r.ApplyNFTables(ctx, host)
-	if err != nil {
-		return newOwned, nil, "", err
-	}
-	return newOwned, liveDNS, nftHash, nil
-}
-
 // Restore deletes newly created `qm-*` profiles from createdDuringAttempt that were not
-// present in snap, restores snapshotted `qm-*` profiles (in vlan -> vrf -> macvlan order),
-// and restores or removes `table inet quadmatic`. Unmanaged (`Owned == false` or non-`qm-`)
-// profiles are never modified or deleted.
+// present in snap and restores snapshotted `qm-*` profiles (in vlan -> vrf -> macvlan order).
+// Unmanaged (`Owned == false` or non-`qm-`) profiles are never modified or deleted.
+// Restore attempts every delete and restore operation even when earlier steps fail, returning
+// all encountered errors joined via errors.Join.
 func (r *Reconciler) Restore(ctx context.Context, snap *Snapshot, createdDuringAttempt []state.ManagedNetworkRecord) error {
 	if r == nil {
 		return errors.New("netmgr reconciler is nil")
@@ -523,6 +535,8 @@ func (r *Reconciler) Restore(ctx context.Context, snap *Snapshot, createdDuringA
 			snapProfiles[k] = v
 		}
 	}
+
+	var errs []error
 
 	toDelete := make(map[string]state.ManagedNetworkRecord)
 	for _, rec := range createdDuringAttempt {
@@ -541,7 +555,7 @@ func (r *Reconciler) Restore(ctx context.Context, snap *Snapshot, createdDuringA
 	sortDeleteRecords(deleteList)
 	for _, rec := range deleteList {
 		if err := r.deleteOwnedRecord(ctx, rec); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
 
@@ -584,20 +598,17 @@ func (r *Reconciler) Restore(ctx context.Context, snap *Snapshot, createdDuringA
 		var err error
 		activeConns, err = r.listActiveConnectionNames(ctx)
 		if err != nil {
-			return err
+			errs = append(errs, err)
+			activeConns = nil
 		}
 	}
 	for _, item := range restoreItems {
 		if err := r.restoreProfile(ctx, item.name, item.kind, item.props, activeConns, vrfIPv6[item.name]); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
 
-	var ruleset string
-	if snap != nil {
-		ruleset = snap.NFTablesRuleset
-	}
-	return r.restoreNFTables(ctx, ruleset)
+	return errors.Join(errs...)
 }
 
 func (r *Reconciler) buildDesiredPlan(ctx context.Context, host *manifest.ResolvedHost) (*desiredPlan, error) {
@@ -656,9 +667,9 @@ func (r *Reconciler) buildDesiredPlan(ctx context.Context, host *manifest.Resolv
 		}
 		seenUsers[comp.UID] = comp.Name
 
-		mac, err := normalizeAndValidateMAC(comp.Name, ns.MAC)
+		mac, err := manifest.NormalizeAndValidateMAC(ns.MAC)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("component %q network: %w", comp.Name, err)
 		}
 		if prevComp, dup := seenMACs[mac]; dup {
 			return nil, fmt.Errorf("duplicate MAC %q shared by components %q and %q", mac, prevComp, comp.Name)
@@ -691,19 +702,17 @@ func (r *Reconciler) buildDesiredPlan(ctx context.Context, host *manifest.Resolv
 		}
 
 		plan.rootless = append(plan.rootless, desiredRootlessNet{
-			CompName:      comp.Name,
-			Scope:         comp.Scope(),
-			UID:           comp.UID,
-			ParentIface:   parentIface,
-			VRFName:       vrfName,
-			TableID:       vrfTableOffset + comp.UID,
-			MacvlanName:   mvName,
-			Mode:          mode,
-			MAC:           mac,
-			IPv6:          ns.IPv6,
-			DNSFromDHCP:   ns.DNSFromDHCP,
-			OutboundGuard: outboundGuardEnabled(ns),
-			Units:         resolveComponentWorkloadUnits(comp),
+			CompName:    comp.Name,
+			Scope:       comp.Scope(),
+			UID:         comp.UID,
+			ParentIface: parentIface,
+			VRFName:     vrfName,
+			TableID:     vrfTableOffset + comp.UID,
+			MacvlanName: mvName,
+			Mode:        mode,
+			MAC:         mac,
+			IPv6:        ns.IPv6,
+			DNSFromDHCP: ns.DNSFromDHCP,
 		})
 	}
 
@@ -716,12 +725,6 @@ func (r *Reconciler) buildDesiredPlan(ctx context.Context, host *manifest.Resolv
 		}
 		return strings.Compare(a.CompName, b.CompName)
 	})
-
-	targets, err := r.collectNFTGuardTargets(host)
-	if err != nil {
-		return nil, err
-	}
-	plan.nftTargets = targets
 
 	return plan, nil
 }
@@ -1127,6 +1130,105 @@ func (r *Reconciler) hasVRFUnreachableRouteFamily(ctx context.Context, tableID i
 	return false, nil
 }
 
+func (r *Reconciler) ensureL3mdevBeforeLocal(ctx context.Context, ipv6 bool) error {
+	if err := r.ensureL3mdevBeforeLocalFamily(ctx, false); err != nil {
+		return err
+	}
+	if ipv6 {
+		if err := r.ensureL3mdevBeforeLocalFamily(ctx, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) hasL3mdevBeforeLocal(ctx context.Context, ipv6 bool) (bool, error) {
+	ok4, err := r.hasL3mdevBeforeLocalFamily(ctx, false)
+	if err != nil || !ok4 {
+		return ok4, err
+	}
+	if !ipv6 {
+		return true, nil
+	}
+	return r.hasL3mdevBeforeLocalFamily(ctx, true)
+}
+
+func (r *Reconciler) ensureL3mdevBeforeLocalFamily(ctx context.Context, ipv6 bool) error {
+	has32765, has0, err := r.inspectLocalRulesFamily(ctx, ipv6)
+	if err != nil {
+		return err
+	}
+	// Always add priority 32765 before deleting priority 0 so the host is never
+	// left without a local lookup rule even momentarily.
+	if !has32765 {
+		args, cmdDesc := ipRulePrefixArgs(ipv6, "add", "prio", strconv.Itoa(vrfLocalRulePriority), "table", "local")
+		if out, err := r.runner.Run(ctx, nil, "ip", args...); err != nil {
+			return formatCmdErr(cmdDesc, out, err)
+		}
+	}
+	if has0 {
+		args, cmdDesc := ipRulePrefixArgs(ipv6, "del", "prio", strconv.Itoa(defaultLocalRulePriority))
+		if out, err := r.runner.Run(ctx, nil, "ip", args...); err != nil {
+			return formatCmdErr(cmdDesc, out, err)
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) hasL3mdevBeforeLocalFamily(ctx context.Context, ipv6 bool) (bool, error) {
+	has32765, has0, err := r.inspectLocalRulesFamily(ctx, ipv6)
+	if err != nil {
+		return false, err
+	}
+	return has32765 && !has0, nil
+}
+
+func (r *Reconciler) inspectLocalRulesFamily(ctx context.Context, ipv6 bool) (has32765, has0 bool, err error) {
+	args, cmdDesc := ipRulePrefixArgs(ipv6, "show")
+	out, err := r.runner.Run(ctx, nil, "ip", args...)
+	if err != nil {
+		return false, false, formatCmdErr(cmdDesc, out, err)
+	}
+	has32765, has0 = parseLocalRuleState(string(out))
+	return has32765, has0, nil
+}
+
+func ipRulePrefixArgs(ipv6 bool, rest ...string) ([]string, string) {
+	args := make([]string, 0, len(rest)+2)
+	if ipv6 {
+		args = append(args, "-6")
+	}
+	args = append(args, "rule")
+	args = append(args, rest...)
+	return args, "ip " + strings.Join(args, " ")
+}
+
+func parseLocalRuleState(raw string) (has32765, has0 bool) {
+	for _, line := range strings.Split(raw, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		prioStr, hasColon := strings.CutSuffix(fields[0], ":")
+		if !hasColon {
+			continue
+		}
+		prio, err := strconv.Atoi(prioStr)
+		if err != nil {
+			continue
+		}
+		if fields[1] == "from" && fields[2] == "all" && (fields[3] == "lookup" || fields[3] == "table") && fields[4] == "local" {
+			switch prio {
+			case vrfLocalRulePriority:
+				has32765 = true
+			case defaultLocalRulePriority:
+				has0 = true
+			}
+		}
+	}
+	return has32765, has0
+}
+
 func (r *Reconciler) pollLiveDNS(ctx context.Context, ifname string, dhcpTimeout time.Duration) ([]string, error) {
 	if dhcpTimeout <= 0 {
 		dhcpTimeout = defaultDHCPTimeout
@@ -1499,30 +1601,6 @@ func collectRequestedVLANs(host *manifest.ResolvedHost) ([]int, bool, error) {
 	}
 	slices.Sort(vlans)
 	return vlans, hasNetworks, nil
-}
-
-func normalizeAndValidateMAC(compName, rawMAC string) (string, error) {
-	if strings.TrimSpace(rawMAC) == "" {
-		return "", fmt.Errorf("component %q network requires a MAC address", compName)
-	}
-	hw, err := net.ParseMAC(rawMAC)
-	if err != nil || len(hw) != 6 {
-		return "", fmt.Errorf("component %q invalid Ethernet MAC %q", compName, rawMAC)
-	}
-	allZero := true
-	for _, b := range hw {
-		if b != 0 {
-			allZero = false
-			break
-		}
-	}
-	if allZero {
-		return "", fmt.Errorf("component %q invalid all-zero MAC %q", compName, rawMAC)
-	}
-	if hw[0]&0x01 != 0 {
-		return "", fmt.Errorf("component %q MAC %q must be unicast", compName, rawMAC)
-	}
-	return strings.ToLower(hw.String()), nil
 }
 
 func validateIfName(kind, name string) error {

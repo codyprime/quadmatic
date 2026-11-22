@@ -11,6 +11,13 @@ import (
 // RootfulScope identifies the host system systemd / rootful Podman scope.
 const RootfulScope = "rootful"
 
+// UnitStatusInfo holds the systemd ActiveState, Type, and Result properties for a unit.
+type UnitStatusInfo struct {
+	ActiveState string
+	Type        string
+	Result      string
+}
+
 // Systemd abstracts systemd daemon and unit lifecycle operations across rootful
 // and rootless user scopes.
 type Systemd interface {
@@ -19,6 +26,7 @@ type Systemd interface {
 	Stop(ctx context.Context, scope, unit string) error
 	Restart(ctx context.Context, scope, unit string) error
 	ActiveState(ctx context.Context, scope, unit string) (string, error)
+	UnitState(ctx context.Context, scope, unit string) (UnitStatusInfo, error)
 }
 
 // CmdRunner executes external systemctl commands.
@@ -65,13 +73,20 @@ func (s *Systemctl) Start(ctx context.Context, scope, unit string) error {
 	return err
 }
 
-// Stop stops unit in scope.
+// Stop stops unit in scope. Exit status 5 (unit not loaded) is treated as a clean no-op.
 func (s *Systemctl) Stop(ctx context.Context, scope, unit string) error {
 	if err := validateScopeAndUnit(scope, unit); err != nil {
 		return err
 	}
 	_, err := s.runSystemctl(ctx, scope, "stop", unit)
-	return err
+	if err != nil {
+		var exitCoder interface{ ExitCode() int }
+		if errors.As(err, &exitCoder) && exitCoder != nil && exitCoder.ExitCode() == 5 {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // Restart restarts unit in scope.
@@ -93,6 +108,41 @@ func (s *Systemctl) ActiveState(ctx context.Context, scope, unit string) (string
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// UnitState returns systemd's ActiveState, Type, and Result properties for unit in scope.
+func (s *Systemctl) UnitState(ctx context.Context, scope, unit string) (UnitStatusInfo, error) {
+	if err := validateScopeAndUnit(scope, unit); err != nil {
+		return UnitStatusInfo{}, err
+	}
+	out, err := s.runSystemctl(ctx, scope, "show", "-p", "ActiveState", "-p", "Type", "-p", "Result", unit)
+	if err != nil {
+		return UnitStatusInfo{}, err
+	}
+	return parseUnitStatusInfo(string(out)), nil
+}
+
+func parseUnitStatusInfo(raw string) UnitStatusInfo {
+	var info UnitStatusInfo
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(k) {
+		case "ActiveState":
+			info.ActiveState = strings.TrimSpace(v)
+		case "Type":
+			info.Type = strings.TrimSpace(v)
+		case "Result":
+			info.Result = strings.TrimSpace(v)
+		}
+	}
+	return info
 }
 
 func (s *Systemctl) runSystemctl(ctx context.Context, scope string, opArgs ...string) ([]byte, error) {

@@ -39,15 +39,14 @@ type PortSpec struct {
 // NetworkSpec configures an optional dedicated virtual network (VLAN + VRF + macvlan)
 // for a component.
 type NetworkSpec struct {
-	VLAN          int      `toml:"vlan"`
-	MAC           string   `toml:"mac"`
-	MacvlanMode   string   `toml:"macvlan_mode"`
-	DNS           []string `toml:"dns"`
-	DNSFromDHCP   bool     `toml:"dns_from_dhcp"`
-	TCPPorts      []string `toml:"tcp_ports"`
-	UDPPorts      []string `toml:"udp_ports"`
-	IPv6          bool     `toml:"ipv6"`
-	OutboundGuard *bool    `toml:"outbound_guard"`
+	VLAN        int      `toml:"vlan"`
+	MAC         string   `toml:"mac"`
+	MacvlanMode string   `toml:"macvlan_mode"`
+	DNS         []string `toml:"dns"`
+	DNSFromDHCP bool     `toml:"dns_from_dhcp"`
+	TCPPorts    []string `toml:"tcp_ports"`
+	UDPPorts    []string `toml:"udp_ports"`
+	IPv6        bool     `toml:"ipv6"`
 }
 
 // FileOverride specifies metadata overrides for a file under components/<name>/files/.
@@ -101,6 +100,7 @@ type ResolvedHost struct {
 type RenderEnv struct {
 	LiveDNS      map[string][]string
 	ParentIfaces map[int]string
+	UserGIDs     map[string]int
 	DryRun       bool
 }
 

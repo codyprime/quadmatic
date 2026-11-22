@@ -2,7 +2,6 @@ package apply
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 
+	"quadmatic/internal/hashutil"
 	"quadmatic/internal/manifest"
 	"quadmatic/internal/state"
 )
@@ -286,7 +286,7 @@ func inspectDiskFile(rootDir, hostPath string) (diskFileInfo, error) {
 	if err != nil {
 		return diskFileInfo{}, fmt.Errorf("read %q: %w", dispPath, err)
 	}
-	out.SHA256 = sha256Hex(data)
+	out.SHA256 = hashutil.SHA256Hex(data)
 	return out, nil
 }
 
@@ -491,9 +491,4 @@ func captureFileSnapshot(
 		}
 	}
 	return snap, nil
-}
-
-func sha256Hex(data []byte) string {
-	sum := sha256.Sum256(data)
-	return fmt.Sprintf("%x", sum)
 }

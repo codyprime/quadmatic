@@ -28,9 +28,6 @@ func TestLoadMissingFileReturnsInitializedEmptyState(t *testing.T) {
 	if !s.AppliedAt.IsZero() {
 		t.Fatalf("expected zero AppliedAt, got %v", s.AppliedAt)
 	}
-	if s.NFTablesHash != "" {
-		t.Fatalf("expected empty NFTablesHash, got %q", s.NFTablesHash)
-	}
 	if s.ManagedUsers == nil {
 		t.Fatal("expected non-nil ManagedUsers slice")
 	}
@@ -43,14 +40,18 @@ func TestLoadMissingFileReturnsInitializedEmptyState(t *testing.T) {
 	if s.Secrets == nil {
 		t.Fatal("expected non-nil Secrets map")
 	}
+	if s.SecretSourcePaths == nil {
+		t.Fatal("expected non-nil SecretSourcePaths map")
+	}
 	if s.Networks == nil {
 		t.Fatal("expected non-nil Networks slice")
 	}
 
 	// Ensure map writes do not panic.
-	s.Files["/etc/containers/systemd/caddy.container"] = FileRecord{SHA256: "abc"}
+	s.Files["/etc/containers/systemd/caddy.container"] = FileRecord{SHA256: "abc", Scope: "rootful"}
 	s.GeneratedUnits["rootful/caddy.service"] = "def"
 	s.Secrets["rootful/api_key"] = "ghi"
+	s.SecretSourcePaths["rootful/api_key"] = "secrets/api_key.age"
 }
 
 func TestLoadPartialJSONInitializesNilMapsAndSlices(t *testing.T) {
@@ -65,7 +66,7 @@ func TestLoadPartialJSONInitializesNilMapsAndSlices(t *testing.T) {
 		},
 		{
 			name:    "explicit nulls and omitted keys",
-			content: `{"applied_sha":"deadbeef","managed_users":null,"files":null,"generated_units":null,"secrets":null,"networks":null}`,
+			content: `{"applied_sha":"deadbeef","managed_users":null,"files":null,"generated_units":null,"secrets":null,"secret_source_paths":null,"networks":null}`,
 			wantSHA: "deadbeef",
 		},
 	}
@@ -84,13 +85,14 @@ func TestLoadPartialJSONInitializesNilMapsAndSlices(t *testing.T) {
 			if s.AppliedSHA != tc.wantSHA {
 				t.Fatalf("expected AppliedSHA %q, got %q", tc.wantSHA, s.AppliedSHA)
 			}
-			if s.ManagedUsers == nil || s.Files == nil || s.GeneratedUnits == nil || s.Secrets == nil || s.Networks == nil {
+			if s.ManagedUsers == nil || s.Files == nil || s.GeneratedUnits == nil || s.Secrets == nil || s.SecretSourcePaths == nil || s.Networks == nil {
 				t.Fatalf("expected all maps and slices to be initialized, got %+v", s)
 			}
 
-			s.Files["/tmp/x"] = FileRecord{SHA256: "123"}
+			s.Files["/tmp/x"] = FileRecord{SHA256: "123", Scope: "rootful"}
 			s.GeneratedUnits["rootful/x.service"] = "456"
 			s.Secrets["rootful/s"] = "789"
+			s.SecretSourcePaths["rootful/s"] = "secrets/s.age"
 		})
 	}
 }
@@ -126,6 +128,7 @@ func TestSaveAtomicAndLoadRoundTrip(t *testing.T) {
 				OwnerUID:  0,
 				OwnerGID:  0,
 				Component: "caddy",
+				Scope:     "rootful",
 				Kind:      "quadlet",
 			},
 			"/var/home/open-webui/.config/open-webui/config.toml": {
@@ -134,6 +137,7 @@ func TestSaveAtomicAndLoadRoundTrip(t *testing.T) {
 				OwnerUID:  10001,
 				OwnerGID:  10001,
 				Component: "open-webui",
+				Scope:     "open-webui",
 				Kind:      "data",
 			},
 		},
@@ -143,6 +147,9 @@ func TestSaveAtomicAndLoadRoundTrip(t *testing.T) {
 		},
 		Secrets: map[string]string{
 			"open-webui/db_password": "eeee5555",
+		},
+		SecretSourcePaths: map[string]string{
+			"open-webui/db_password": "secrets/db_password.age",
 		},
 		Networks: []ManagedNetworkRecord{
 			{
@@ -160,7 +167,6 @@ func TestSaveAtomicAndLoadRoundTrip(t *testing.T) {
 				Scope:          "host",
 			},
 		},
-		NFTablesHash: "ffff6666",
 	}
 
 	if err := SaveAtomic(path, want); err != nil {
@@ -212,7 +218,7 @@ func TestSaveAtomicOverwritesExistingFile(t *testing.T) {
 
 	second := NewEmpty()
 	second.AppliedSHA = "2222222222222222222222222222222222222222"
-	second.NFTablesHash = "abcd"
+	second.SecretSourcePaths["rootful/k"] = "secrets/k.age"
 	if err := SaveAtomic(path, second); err != nil {
 		t.Fatalf("second SaveAtomic failed: %v", err)
 	}

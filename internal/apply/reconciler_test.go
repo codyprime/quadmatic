@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -201,14 +201,20 @@ type systemdCall struct {
 
 type fakeSystemd struct {
 	calls               []systemdCall
-	states              map[string]string // "<scope>/<unit>" -> state
-	overrideActiveState map[string]string // overrides ActiveState return without clearing
+	states              map[string]string               // "<scope>/<unit>" -> state
+	types               map[string]string               // "<scope>/<unit>" -> systemd Type=
+	results             map[string]string               // "<scope>/<unit>" -> systemd Result=
+	overrideActiveState map[string]string               // overrides ActiveState return without clearing
+	overrideUnitState   map[string]apply.UnitStatusInfo // overrides full UnitState return
 }
 
 func newFakeSystemd() *fakeSystemd {
 	return &fakeSystemd{
 		states:              make(map[string]string),
+		types:               make(map[string]string),
+		results:             make(map[string]string),
 		overrideActiveState: make(map[string]string),
+		overrideUnitState:   make(map[string]apply.UnitStatusInfo),
 	}
 }
 
@@ -252,6 +258,9 @@ func (f *fakeSystemd) Restart(_ context.Context, scope, unit string) error {
 func (f *fakeSystemd) ActiveState(_ context.Context, scope, unit string) (string, error) {
 	f.calls = append(f.calls, systemdCall{op: "active-state", scope: scope, unit: unit})
 	key := scope + "/" + unit
+	if ov, ok := f.overrideUnitState[key]; ok {
+		return ov.ActiveState, nil
+	}
 	if st, ok := f.overrideActiveState[key]; ok {
 		return st, nil
 	}
@@ -259,6 +268,33 @@ func (f *fakeSystemd) ActiveState(_ context.Context, scope, unit string) (string
 		return st, nil
 	}
 	return "inactive", nil
+}
+
+func (f *fakeSystemd) UnitState(_ context.Context, scope, unit string) (apply.UnitStatusInfo, error) {
+	f.calls = append(f.calls, systemdCall{op: "unit-state", scope: scope, unit: unit})
+	key := scope + "/" + unit
+	if ov, ok := f.overrideUnitState[key]; ok {
+		return ov, nil
+	}
+	st := "inactive"
+	if ov, ok := f.overrideActiveState[key]; ok {
+		st = ov
+	} else if s, ok := f.states[key]; ok {
+		st = s
+	}
+	typ := f.types[key]
+	if typ == "" {
+		typ = "simple"
+	}
+	res := f.results[key]
+	if res == "" && st == "active" {
+		res = "success"
+	}
+	return apply.UnitStatusInfo{
+		ActiveState: st,
+		Type:        typ,
+		Result:      res,
+	}, nil
 }
 
 // Stateful fake netmgr.Runner & SysctlReader (mirrored from internal/netmgr/netmgr_test.go)
@@ -287,6 +323,11 @@ type fakeNMConn struct {
 	props map[string]string
 }
 
+type fakeIPRule struct {
+	prio int
+	text string
+}
+
 type fakeNetRunner struct {
 	calls      []string
 	conns      map[string]*fakeNMConn
@@ -294,7 +335,8 @@ type fakeNetRunner struct {
 	dnsByIface map[string]string
 	routes     map[int][]string
 	routes6    map[int][]string
-	nftTable   string
+	rules      []fakeIPRule
+	rules6     []fakeIPRule
 }
 
 func newFakeNetRunner() *fakeNetRunner {
@@ -304,6 +346,15 @@ func newFakeNetRunner() *fakeNetRunner {
 		dnsByIface: make(map[string]string),
 		routes:     make(map[int][]string),
 		routes6:    make(map[int][]string),
+		rules: []fakeIPRule{
+			{prio: 0, text: "from all lookup local"},
+			{prio: 32766, text: "from all lookup main"},
+			{prio: 32767, text: "from all lookup default"},
+		},
+		rules6: []fakeIPRule{
+			{prio: 0, text: "from all lookup local"},
+			{prio: 32766, text: "from all lookup main"},
+		},
 	}
 }
 
@@ -311,15 +362,13 @@ func (f *fakeNetRunner) clearCalls() {
 	f.calls = nil
 }
 
-func (f *fakeNetRunner) Run(_ context.Context, stdin []byte, name string, args ...string) ([]byte, error) {
+func (f *fakeNetRunner) Run(_ context.Context, _ []byte, name string, args ...string) ([]byte, error) {
 	f.calls = append(f.calls, name+" "+strings.Join(args, " "))
 	switch name {
 	case "nmcli":
 		return f.handleNMCLI(args)
 	case "ip":
 		return f.handleIP(args)
-	case "nft":
-		return f.handleNFT(string(stdin), args)
 	default:
 		return nil, fmt.Errorf("unexpected net command %q", name)
 	}
@@ -421,18 +470,26 @@ doneFlags:
 			}
 			for j := 3; j+1 < len(rest); j += 2 {
 				k, v := rest[j], rest[j+1]
-				if k == "ethernet.cloned-mac-address" {
+				switch k {
+				case "ethernet.cloned-mac-address":
 					k = "802-3-ethernet.cloned-mac-address"
+				case "connection.master":
+					k = "connection.controller"
 				}
 				c.props[k] = v
 			}
 			return nil, nil
 		case "up":
 			conName := rest[2]
-			if _, ok := f.conns[conName]; !ok {
+			c, ok := f.conns[conName]
+			if !ok {
 				return []byte("Error: no such connection profile"), errors.New("exit status 10")
 			}
 			f.active[conName] = true
+			if c.props["connection.type"] == "vrf" {
+				f.ensureFakeL3mdevRule(false)
+				f.ensureFakeL3mdevRule(true)
+			}
 			return nil, nil
 		case "delete":
 			conName := rest[2]
@@ -445,6 +502,19 @@ doneFlags:
 		}
 	}
 	return nil, fmt.Errorf("unsupported nmcli: %v", args)
+}
+
+func (f *fakeNetRunner) ensureFakeL3mdevRule(isV6 bool) {
+	store := &f.rules
+	if isV6 {
+		store = &f.rules6
+	}
+	for _, r := range *store {
+		if r.text == "from all lookup [l3mdev-table]" {
+			return
+		}
+	}
+	*store = append(*store, fakeIPRule{prio: 1000, text: "from all lookup [l3mdev-table]"})
 }
 
 func parseNMCLIAdd(args []string) map[string]string {
@@ -489,6 +559,9 @@ func (f *fakeNetRunner) handleIP(args []string) ([]byte, error) {
 		isV6 = true
 		args = args[1:]
 	}
+	if len(args) >= 2 && args[0] == "rule" {
+		return f.handleIPRule(isV6, args[1:])
+	}
 	routeStore := f.routes
 	if isV6 {
 		routeStore = f.routes6
@@ -516,6 +589,74 @@ func (f *fakeNetRunner) handleIP(args []string) ([]byte, error) {
 	return nil, fmt.Errorf("unsupported ip command: %v", args)
 }
 
+func (f *fakeNetRunner) handleIPRule(isV6 bool, args []string) ([]byte, error) {
+	store := &f.rules
+	if isV6 {
+		store = &f.rules6
+	}
+	switch args[0] {
+	case "show", "list":
+		sorted := slices.Clone(*store)
+		slices.SortStableFunc(sorted, func(a, b fakeIPRule) int {
+			return a.prio - b.prio
+		})
+		lines := make([]string, 0, len(sorted))
+		for _, r := range sorted {
+			lines = append(lines, fmt.Sprintf("%d:\t%s", r.prio, r.text))
+		}
+		return []byte(strings.Join(lines, "\n")), nil
+	case "add":
+		prio := -1
+		table := ""
+		for i := 1; i+1 < len(args); i += 2 {
+			switch args[i] {
+			case "prio", "pref", "priority":
+				p, err := strconv.Atoi(args[i+1])
+				if err != nil {
+					return nil, err
+				}
+				prio = p
+			case "table", "lookup":
+				table = args[i+1]
+			}
+		}
+		if prio < 0 || table == "" {
+			return nil, fmt.Errorf("unsupported ip rule add args: %v", args)
+		}
+		text := "from all lookup " + table
+		for _, r := range *store {
+			if r.prio == prio && r.text == text {
+				return []byte("RTNETLINK answers: File exists"), errors.New("exit status 2")
+			}
+		}
+		*store = append(*store, fakeIPRule{prio: prio, text: text})
+		return nil, nil
+	case "del":
+		prio := -1
+		for i := 1; i+1 < len(args); i += 2 {
+			if args[i] == "prio" || args[i] == "pref" || args[i] == "priority" {
+				p, err := strconv.Atoi(args[i+1])
+				if err != nil {
+					return nil, err
+				}
+				prio = p
+			}
+		}
+		if prio < 0 {
+			return nil, fmt.Errorf("unsupported ip rule del args: %v", args)
+		}
+		for i, r := range *store {
+			if r.prio == prio {
+				*store = append((*store)[:i], (*store)[i+1:]...)
+				return nil, nil
+			}
+		}
+		return []byte("RTNETLINK answers: No such file or directory"), errors.New("exit status 2")
+	default:
+		return nil, fmt.Errorf("unsupported ip rule command: %v", args)
+	}
+}
+
 func extractTable(args []string) (int, string) {
 	var parts []string
 	tbl := 0
@@ -528,34 +669,6 @@ func extractTable(args []string) (int, string) {
 		parts = append(parts, args[i])
 	}
 	return tbl, strings.Join(parts, " ")
-}
-
-func (f *fakeNetRunner) handleNFT(stdin string, args []string) ([]byte, error) {
-	if len(args) >= 4 && args[0] == "list" {
-		if f.nftTable == "" {
-			return []byte("Error: No such file or directory"), errors.New("exit status 1")
-		}
-		return []byte(f.nftTable), nil
-	}
-	if len(args) >= 4 && args[0] == "delete" {
-		if f.nftTable == "" {
-			return []byte("Error: No such file or directory"), errors.New("exit status 1")
-		}
-		f.nftTable = ""
-		return nil, nil
-	}
-	if len(args) >= 2 && args[0] == "-f" && args[1] == "-" {
-		idx := strings.Index(stdin, "table inet quadmatic {")
-		if idx >= 0 {
-			f.nftTable = strings.TrimSpace(stdin[idx:]) + "\n"
-			return nil, nil
-		}
-		if strings.Contains(stdin, "delete table inet quadmatic") {
-			f.nftTable = ""
-			return nil, nil
-		}
-	}
-	return nil, fmt.Errorf("unsupported nft: %v", args)
 }
 
 type spyGitClient struct {
@@ -637,22 +750,6 @@ func newTestEnv(t *testing.T) *testEnv {
 	gitClient := &spyGitClient{Client: gitops.NewLocalClient(repoDir, cfg)}
 
 	netRec := netmgr.NewReconciler("enp3s0", netRunner, newZeroSysctl())
-	netRec.CgroupExists = func(cgPath string) bool {
-		unit := path.Base(cgPath)
-		uid := extractCgroupUID(cgPath)
-		if uid <= 0 {
-			return false
-		}
-		scope := usersRec.scopeForUID(uid)
-		if scope == "" {
-			return false
-		}
-		key := scope + "/" + unit
-		if st, ok := sysd.overrideActiveState[key]; ok {
-			return st == "active"
-		}
-		return sysd.states[key] == "active"
-	}
 
 	env := &testEnv{
 		t:           t,
@@ -690,19 +787,6 @@ func newTestEnv(t *testing.T) *testEnv {
 		VerifyPollInterval: 5 * time.Millisecond,
 	})
 	return env
-}
-
-func extractCgroupUID(cgPath string) int {
-	for _, seg := range strings.Split(cgPath, "/") {
-		if after, ok := strings.CutPrefix(seg, "user-"); ok {
-			if uidStr, ok := strings.CutSuffix(after, ".slice"); ok {
-				if uid, err := strconv.Atoi(uidStr); err == nil {
-					return uid
-				}
-			}
-		}
-	}
-	return 0
 }
 
 func (e *testEnv) hostPath(dest string) string {
@@ -848,8 +932,13 @@ Secret=webui_secret,type=env,target=WEBUI_SECRET_KEY
 	if len(env.systemd.calls) != 0 {
 		t.Fatalf("DryRun unexpectedly called systemd: %v", env.systemd.calls)
 	}
-	if len(env.netRunner.conns) != 0 || env.netRunner.nftTable != "" {
-		t.Fatalf("DryRun unexpectedly mutated network/nftables: conns=%v nft=%q", env.netRunner.conns, env.netRunner.nftTable)
+	if len(env.netRunner.conns) != 0 {
+		t.Fatalf("DryRun unexpectedly mutated network: conns=%v", env.netRunner.conns)
+	}
+	for _, c := range env.netRunner.calls {
+		if strings.HasPrefix(c, "ip rule add") || strings.HasPrefix(c, "ip rule del") || strings.HasPrefix(c, "ip -6 rule add") || strings.HasPrefix(c, "ip -6 rule del") {
+			t.Fatalf("DryRun unexpectedly mutated ip rules: %v", env.netRunner.calls)
+		}
 	}
 }
 
@@ -1055,9 +1144,18 @@ tcp_ports = ["8080:8080"]
 	if res1.AppliedSHA != sha1 {
 		t.Fatalf("AppliedSHA = %q, want %q", res1.AppliedSHA, sha1)
 	}
-	snapNFT := env.netRunner.nftTable
-	if snapNFT == "" {
-		t.Fatalf("expected commit 1 to create inet quadmatic nftables ruleset")
+	hasRule32765 := false
+	hasRule0 := false
+	for _, r := range env.netRunner.rules {
+		if r.prio == 32765 && r.text == "from all lookup local" {
+			hasRule32765 = true
+		}
+		if r.prio == 0 && r.text == "from all lookup local" {
+			hasRule0 = true
+		}
+	}
+	if !hasRule32765 || hasRule0 {
+		t.Fatalf("expected l3mdev-before-local rule ordering (32765 present, 0 absent), got %+v", env.netRunner.rules)
 	}
 
 	// Commit 2: updates open-webui files, NM MAC/VLAN, secret v2, AND adds broken component that fails start verify
@@ -1119,7 +1217,7 @@ user = "brokenuser"
 		t.Fatalf("expected newly created broken.container removed on rollback, stat err=%v", err)
 	}
 
-	// Verify NM profiles + nftables restored to Commit 1
+	// Verify NM profiles restored to Commit 1
 	if _, ok := env.netRunner.conns["qm-vlan31"]; ok {
 		t.Fatalf("expected commit 2 qm-vlan31 deleted on rollback")
 	}
@@ -1128,9 +1226,6 @@ user = "brokenuser"
 	}
 	if mac := env.netRunner.conns["qm-2001"].props["802-3-ethernet.cloned-mac-address"]; mac != "02:51:4d:00:07:d1" {
 		t.Fatalf("expected qm-2001 MAC restored to 02:51:4d:00:07:d1, got %q", mac)
-	}
-	if env.netRunner.nftTable != snapNFT {
-		t.Fatalf("expected nftables ruleset restored to Commit 1 snapshot:\ngot:\n%s\nwant:\n%s", env.netRunner.nftTable, snapNFT)
 	}
 
 	// Verify secret v1 was re-decrypted via gitops.ReadFileAtCommit and restored via secrets.Upsert
@@ -1403,29 +1498,34 @@ func TestSystemctlCommandsAndValidation(t *testing.T) {
 	}
 }
 
-type failNFTNetmgr struct {
-	apply.NetmgrReconciler
-	failNFT bool
+type failingRestartSystemd struct {
+	apply.Systemd
+	failRestartKey string
+	failActive     bool
 }
 
-func (f *failNFTNetmgr) ApplyNFTables(ctx context.Context, host *manifest.ResolvedHost) (string, error) {
-	if f.failNFT {
-		return "", errors.New("nft -f -: cgroupv2 path missing")
+func (f *failingRestartSystemd) Restart(ctx context.Context, scope, unit string) error {
+	if f.failActive && scope+"/"+unit == f.failRestartKey {
+		f.failActive = false
+		return errors.New("simulated Stage 7d restart failure")
 	}
-	return f.NetmgrReconciler.ApplyNFTables(ctx, host)
+	return f.Systemd.Restart(ctx, scope, unit)
 }
 
-func TestReconcileNFTablesFailureTriggersRollbackAndRootfulAndPrune(t *testing.T) {
+func TestReconcileStage7dFailureTriggersRollbackAndRootfulAndPrune(t *testing.T) {
 	env := newTestEnv(t)
-	nftWrapper := &failNFTNetmgr{NetmgrReconciler: env.netmgr}
+	sysWrapper := &failingRestartSystemd{
+		Systemd:        env.systemd,
+		failRestartKey: "openwebui/open-webui.service",
+	}
 	env.engine = apply.NewEngine(apply.EngineDeps{
 		Config:             env.cfg,
 		Git:                env.git,
 		Users:              env.users,
 		Quadlet:            env.quadlet,
 		Secrets:            env.secretsMgr,
-		Netmgr:             nftWrapper,
-		Systemd:            env.systemd,
+		Netmgr:             env.netmgr,
+		Systemd:            sysWrapper,
 		RootDir:            env.rootDir,
 		Chown:              func(string, int, int) error { return nil },
 		DHCPTimeout:        100 * time.Millisecond,
@@ -1476,8 +1576,8 @@ reason = "USB Coral passthrough"
 		t.Fatalf("expected rootful data file written: %v", err)
 	}
 
-	// Commit 2: drops frigate, updates open-webui secret, but ApplyNFTables fails!
-	nftWrapper.failNFT = true
+	// Commit 2: drops frigate, updates open-webui secret, but Stage 7d Restart fails!
+	sysWrapper.failActive = true
 	env.systemd.clearCalls()
 	env.writeRepoFiles(map[string][]byte{
 		"hosts/services-02.toml": []byte(`hostname = "services-02"
@@ -1497,9 +1597,9 @@ dns = ["10.30.0.1"]
 
 	res2, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
 	if err == nil {
-		t.Fatalf("expected commit 2 to fail on ApplyNFTables")
+		t.Fatalf("expected commit 2 to fail on Stage 7d Restart")
 	}
-	if !res2.RolledBack || res2.FailedStage != "net" || res2.AppliedSHA != sha1 {
+	if !res2.RolledBack || res2.FailedStage != "apply" || res2.AppliedSHA != sha1 {
 		t.Fatalf("unexpected rollback result: %+v", res2)
 	}
 	// Frigate files and service restored, open-webui secret restored to sec-v1
@@ -1513,8 +1613,8 @@ dns = ["10.30.0.1"]
 		t.Fatalf("expected pruned rootful frigate.service restarted on rollback, calls=%v", env.systemd.calls)
 	}
 
-	// Retry Commit 2 once ApplyNFTables succeeds -> frigate is cleanly pruned
-	nftWrapper.failNFT = false
+	// Retry Commit 2 once Stage 7d Restart succeeds -> frigate is cleanly pruned
+	sysWrapper.failActive = false
 	env.systemd.clearCalls()
 	res3, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
 	if err != nil {
@@ -1565,6 +1665,14 @@ func (c *cancelOnStartSystemd) ActiveState(ctx context.Context, scope, unit stri
 		return "", ctx.Err()
 	}
 	return c.Systemd.ActiveState(ctx, scope, unit)
+}
+
+func (c *cancelOnStartSystemd) UnitState(ctx context.Context, scope, unit string) (apply.UnitStatusInfo, error) {
+	if !c.inRollback && ctx.Err() != nil {
+		c.inRollback = true
+		return apply.UnitStatusInfo{}, ctx.Err()
+	}
+	return c.Systemd.UnitState(ctx, scope, unit)
 }
 
 func (c *cancelOnStartSystemd) Stop(ctx context.Context, scope, unit string) error {
@@ -1979,7 +2087,7 @@ user = "caddy"
 	}
 }
 
-func TestReconcileStoppedOutboundGuardUnitDoesNotFailOrDrift(t *testing.T) {
+func TestReconcileStoppedNetworkUnitDoesNotFailOrDrift(t *testing.T) {
 	env := newTestEnv(t)
 
 	env.writeRepoFiles(map[string][]byte{
@@ -1994,11 +2102,10 @@ user = "openwebui"
 vlan = 30
 mac = "02:51:4d:00:07:d1"
 dns = ["10.30.0.1"]
-outbound_guard = true
 `),
 		"components/open-webui/open-webui.container.tmpl": []byte("[Container]\nImage=ghcr.io/open-webui/open-webui:v1\nNetwork={{ .Net.PastaArgs }}\n"),
 	})
-	sha1 := env.commitRepo("commit 1: guarded unit")
+	sha1 := env.commitRepo("commit 1: network unit")
 
 	res1, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
 	if err != nil {
@@ -2007,52 +2114,23 @@ outbound_guard = true
 	if res1.AppliedSHA != sha1 {
 		t.Fatalf("AppliedSHA = %q, want %q", res1.AppliedSHA, sha1)
 	}
-	if env.netRunner.nftTable == "" {
-		t.Fatalf("expected table inet quadmatic created after commit 1")
-	}
 
-	// Manually stop the unit on the host -> cgroupv2 directory disappears, leaving numeric inode in nft list output.
+	// Manually stop the unit on the host.
 	env.systemd.states["openwebui/open-webui.service"] = "inactive"
-	env.netRunner.nftTable = strings.ReplaceAll(
-		env.netRunner.nftTable,
-		`"user.slice/user-2001.slice/user@2001.service/app.slice/open-webui.service"`,
-		`987654321`,
-	)
 	env.systemd.clearCalls()
 	env.netRunner.clearCalls()
 
-	// Next tick cleans stale table inet quadmatic cleanly without failing ApplyNFTables, rolling back, or restarting stopped unit.
+	// Next tick while unit remains stopped reports zero drift, performs zero mutations, and reports FailedUnits.
 	res2, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
 	if err != nil {
-		t.Fatalf("reconcile on manually stopped outbound_guard unit failed: %v", err)
+		t.Fatalf("reconcile on manually stopped network unit failed: %v", err)
 	}
-	if res2.RolledBack || res2.AppliedSHA != sha1 {
-		t.Fatalf("unexpected rollback/SHA on stopped unit: %+v", res2)
-	}
-	if env.netRunner.nftTable != "" {
-		t.Fatalf("expected stale table inet quadmatic deleted, got:\n%s", env.netRunner.nftTable)
-	}
-	if env.systemd.countCalls("start", "openwebui", "open-webui.service") != 0 ||
-		env.systemd.countCalls("restart", "openwebui", "open-webui.service") != 0 {
-		t.Fatalf("manually stopped unit must not be started/restarted, calls=%v", env.systemd.calls)
+	if res2.DriftDetected || res2.RolledBack || res2.AppliedSHA != sha1 {
+		t.Fatalf("expected no drift or rollback on stopped unit, got %+v", res2)
 	}
 	wantFailed := []apply.UnitStatus{{Scope: "openwebui", Unit: "open-webui.service", ActiveState: "inactive"}}
 	if !reflect.DeepEqual(res2.FailedUnits, wantFailed) {
 		t.Fatalf("FailedUnits = %+v, want %+v", res2.FailedUnits, wantFailed)
-	}
-
-	// Following tick while unit remains stopped reports zero drift and performs zero mutations.
-	env.systemd.clearCalls()
-	env.netRunner.clearCalls()
-	res3, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
-	if err != nil {
-		t.Fatalf("subsequent reconcile on stopped unit failed: %v", err)
-	}
-	if res3.DriftDetected || res3.RolledBack {
-		t.Fatalf("expected no perpetual drift or rollback, got %+v", res3)
-	}
-	if !reflect.DeepEqual(res3.FailedUnits, wantFailed) {
-		t.Fatalf("FailedUnits = %+v, want %+v", res3.FailedUnits, wantFailed)
 	}
 	for _, call := range env.systemd.calls {
 		if call.op != "active-state" {
@@ -2060,8 +2138,13 @@ outbound_guard = true
 		}
 	}
 	for _, call := range env.netRunner.calls {
-		if strings.HasPrefix(call, "nft -f") || strings.HasPrefix(call, "nft delete") {
-			t.Fatalf("expected zero mutating nft calls on steady stopped unit, got %v", env.netRunner.calls)
+		if strings.HasPrefix(call, "nmcli connection add") ||
+			strings.HasPrefix(call, "nmcli connection modify") ||
+			strings.HasPrefix(call, "nmcli connection up") ||
+			strings.HasPrefix(call, "nmcli connection delete") ||
+			strings.HasPrefix(call, "ip rule add") ||
+			strings.HasPrefix(call, "ip rule del") {
+			t.Fatalf("expected zero mutating net calls on steady stopped unit, got %v", env.netRunner.calls)
 		}
 	}
 }
@@ -2218,5 +2301,603 @@ user = "brokenuser"
 	}
 	if env.systemd.countCalls("restart", "openwebui", "open-webui.service") != 1 {
 		t.Fatalf("expected rollback to restart open-webui.service after restoring qm-2001, calls=%v", env.systemd.calls)
+	}
+}
+
+func TestReconcileFlockWaitsAndRespectsCancellation(t *testing.T) {
+	env := newTestEnv(t)
+
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml":                       []byte("[users.caddy]\nuid = 2002\n"),
+		"hosts/services-02.toml":           []byte("hostname = \"services-02\"\n\n[[component]]\nname = \"caddy\"\nuser = \"caddy\"\n"),
+		"components/caddy/caddy.container": []byte("[Container]\nImage=docker.io/library/caddy:v1\n"),
+	})
+	sha1 := env.commitRepo("commit 1")
+
+	lockPath := env.stateFile + ".lock"
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("acquire test flock: %v", err)
+	}
+
+	type outcome struct {
+		res *apply.Result
+		err error
+	}
+	doneCh := make(chan outcome, 1)
+	go func() {
+		r, e := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+		doneCh <- outcome{res: r, err: e}
+	}()
+
+	select {
+	case out := <-doneCh:
+		t.Fatalf("Reconcile finished prematurely while flock was held: %+v, err=%v", out.res, out.err)
+	case <-time.After(75 * time.Millisecond):
+	}
+
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("unlock test flock: %v", err)
+	}
+	_ = lockFile.Close()
+
+	select {
+	case out := <-doneCh:
+		if out.err != nil {
+			t.Fatalf("Reconcile after flock release failed: %v", out.err)
+		}
+		if out.res.AppliedSHA != sha1 {
+			t.Fatalf("AppliedSHA = %q, want %q", out.res.AppliedSHA, sha1)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for Reconcile after flock release")
+	}
+
+	// Now hold flock again and cancel ctx while Reconcile is blocked.
+	lockFile2, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockFile2.Close()
+	if err := syscall.Flock(int(lockFile2.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("acquire second test flock: %v", err)
+	}
+	defer func() {
+		_ = syscall.Flock(int(lockFile2.Fd()), syscall.LOCK_UN)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelDone := make(chan outcome, 1)
+	go func() {
+		r, e := env.engine.Reconcile(ctx, env.reconcileOpts(100*time.Millisecond))
+		cancelDone <- outcome{res: r, err: e}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case out := <-cancelDone:
+		if !errors.Is(out.err, context.Canceled) {
+			t.Fatalf("expected context.Canceled when canceled while waiting on flock, got %v", out.err)
+		}
+		if out.res == nil || out.res.FailedStage != "fetch" {
+			t.Fatalf("expected FailedStage = \"fetch\", got %+v", out.res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for canceled Reconcile on held flock")
+	}
+}
+
+type scriptExitRunner struct {
+	calls         []string
+	unloadedUnits map[string]bool
+	unitStates    map[string]string
+	failStartKey  string
+}
+
+func (r *scriptExitRunner) Run(_ context.Context, _ string, args ...string) ([]byte, error) {
+	r.calls = append(r.calls, "systemctl "+strings.Join(args, " "))
+	scope := "rootful"
+	rest := args
+	if len(args) >= 3 && args[0] == "--user" && args[1] == "-M" {
+		scope = strings.TrimSuffix(args[2], "@")
+		rest = args[3:]
+	}
+	if len(rest) == 0 {
+		return nil, errors.New("empty systemctl args")
+	}
+	switch rest[0] {
+	case "daemon-reload":
+		return nil, nil
+	case "start":
+		unit := rest[1]
+		if scope+"/"+unit == r.failStartKey {
+			return []byte("start failed"), errors.New("start failed")
+		}
+		r.unitStates[scope+"/"+unit] = "active"
+		return nil, nil
+	case "stop":
+		unit := rest[1]
+		key := scope + "/" + unit
+		if r.unloadedUnits[key] {
+			err := exec.Command("sh", "-c", "exit 5").Run()
+			return []byte("Unit " + unit + " not loaded."), err
+		}
+		r.unitStates[key] = "inactive"
+		return nil, nil
+	case "restart":
+		unit := rest[1]
+		r.unitStates[scope+"/"+unit] = "active"
+		return nil, nil
+	case "show":
+		unit := rest[len(rest)-1]
+		st := r.unitStates[scope+"/"+unit]
+		if st == "" {
+			st = "inactive"
+		}
+		if slices.Contains(rest, "--value") {
+			return []byte(st + "\n"), nil
+		}
+		return []byte(fmt.Sprintf("ActiveState=%s\nType=simple\nResult=success\n", st)), nil
+	default:
+		return nil, fmt.Errorf("unexpected systemctl args: %v", args)
+	}
+}
+
+func TestSystemctlStopToleratesExitCode5AndRejectsExitCode1(t *testing.T) {
+	exitRunner := func(code int) apply.CmdRunner {
+		return &fakeExitRunner{code: code}
+	}
+
+	sys5 := apply.NewSystemctl(exitRunner(5))
+	if err := sys5.Stop(context.Background(), "openwebui", "open-webui.service"); err != nil {
+		t.Fatalf("Systemctl.Stop with exit code 5 returned error: %v", err)
+	}
+
+	sys1 := apply.NewSystemctl(exitRunner(1))
+	if err := sys1.Stop(context.Background(), "openwebui", "open-webui.service"); err == nil {
+		t.Fatalf("Systemctl.Stop with exit code 1 unexpectedly returned nil")
+	}
+}
+
+type fakeExitRunner struct {
+	code int
+}
+
+func (f *fakeExitRunner) Run(_ context.Context, _ string, _ ...string) ([]byte, error) {
+	err := exec.Command("sh", "-c", fmt.Sprintf("exit %d", f.code)).Run()
+	return []byte("simulated systemctl exit"), err
+}
+
+func TestReconcilePruneAndRollbackWithExitCode5Stop(t *testing.T) {
+	env := newTestEnv(t)
+	sysRunner := &scriptExitRunner{
+		unloadedUnits: make(map[string]bool),
+		unitStates:    make(map[string]string),
+	}
+	sys := apply.NewSystemctl(sysRunner)
+	env.engine = apply.NewEngine(apply.EngineDeps{
+		Config:             env.cfg,
+		Git:                env.git,
+		Users:              env.users,
+		Quadlet:            env.quadlet,
+		Secrets:            env.secretsMgr,
+		Netmgr:             env.netmgr,
+		Systemd:            sys,
+		RootDir:            env.rootDir,
+		Chown:              func(string, int, int) error { return nil },
+		DHCPTimeout:        100 * time.Millisecond,
+		VerifyPollInterval: 5 * time.Millisecond,
+	})
+
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml":                         []byte("[users.caddy]\nuid = 2002\n\n[users.legacy]\nuid = 2003\n\n[users.brokenuser]\nuid = 2004\n"),
+		"hosts/services-02.toml":             []byte("hostname = \"services-02\"\n\n[[component]]\nname = \"caddy\"\nuser = \"caddy\"\n\n[[component]]\nname = \"legacy\"\nuser = \"legacy\"\n"),
+		"components/caddy/caddy.container":   []byte("[Container]\nImage=docker.io/library/caddy:2\n"),
+		"components/legacy/legacy.container": []byte("[Container]\nImage=alpine:3.20\n"),
+	})
+	sha1 := env.commitRepo("commit 1: caddy + legacy")
+	if _, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond)); err != nil {
+		t.Fatalf("commit 1 failed: %v", err)
+	}
+
+	// Mark legacy.service as unloaded so `systemctl stop` exits 5 when pruning it.
+	sysRunner.unloadedUnits["legacy/legacy.service"] = true
+	env.writeRepoFiles(map[string][]byte{
+		"hosts/services-02.toml": []byte("hostname = \"services-02\"\n\n[[component]]\nname = \"caddy\"\nuser = \"caddy\"\n"),
+	})
+	sha2 := env.commitRepo("commit 2: prune unloaded legacy")
+	res2, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("commit 2 pruning unloaded unit failed: %v", err)
+	}
+	if res2.AppliedSHA != sha2 {
+		t.Fatalf("AppliedSHA = %q, want %q", res2.AppliedSHA, sha2)
+	}
+
+	// Commit 3: add broken unit that fails Start and returns exit 5 on rollback Stop.
+	sysRunner.failStartKey = "brokenuser/broken.service"
+	sysRunner.unloadedUnits["brokenuser/broken.service"] = true
+	env.writeRepoFiles(map[string][]byte{
+		"hosts/services-02.toml":             []byte("hostname = \"services-02\"\n\n[[component]]\nname = \"caddy\"\nuser = \"caddy\"\n\n[[component]]\nname = \"broken\"\nuser = \"brokenuser\"\n"),
+		"components/broken/broken.container": []byte("[Container]\nImage=example.invalid/broken:latest\n"),
+	})
+	env.commitRepo("commit 3: add failing unloaded unit")
+
+	res3, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err == nil {
+		t.Fatalf("expected commit 3 to fail and roll back")
+	}
+	if !res3.RolledBack || res3.FailedStage != "apply" || res3.AppliedSHA != sha2 {
+		t.Fatalf("expected clean rollback with FailedStage=\"apply\" and AppliedSHA=%q, got %+v (err=%v)", sha2, res3, err)
+	}
+	if res3.AppliedSHA == sha1 {
+		t.Fatalf("unexpected rollback to sha1")
+	}
+}
+
+func TestSystemctlUnitStateAndVerifyOneshotAndSimpleFailure(t *testing.T) {
+	runner := &fakeSystemctlRunner{
+		out: []byte("ActiveState=inactive\nType=oneshot\nResult=success\n"),
+	}
+	sys := apply.NewSystemctl(runner)
+	info, err := sys.UnitState(context.Background(), "openwebui", "db-migrate.service")
+	if err != nil {
+		t.Fatalf("UnitState failed: %v", err)
+	}
+	wantInfo := apply.UnitStatusInfo{ActiveState: "inactive", Type: "oneshot", Result: "success"}
+	if info != wantInfo {
+		t.Fatalf("UnitState = %+v, want %+v", info, wantInfo)
+	}
+	wantCall := "systemctl --user -M openwebui@ show -p ActiveState -p Type -p Result db-migrate.service"
+	if !slices.Contains(runner.calls, wantCall) {
+		t.Fatalf("expected call %q, got %v", wantCall, runner.calls)
+	}
+
+	// 1. Type=oneshot + inactive + Result=success passes verifyUnitActive immediately.
+	env := newTestEnv(t)
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml":                       []byte("[users.caddy]\nuid = 2002\n"),
+		"hosts/services-02.toml":           []byte("hostname = \"services-02\"\n\n[[component]]\nname = \"caddy\"\nuser = \"caddy\"\n"),
+		"components/caddy/caddy.container": []byte("[Container]\nImage=docker.io/library/caddy:2\n"),
+	})
+	sha1 := env.commitRepo("oneshot commit")
+
+	env.systemd.overrideUnitState["caddy/caddy.service"] = apply.UnitStatusInfo{
+		ActiveState: "inactive",
+		Type:        "oneshot",
+		Result:      "success",
+	}
+	res1, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(2*time.Second))
+	if err != nil {
+		t.Fatalf("oneshot clean exit failed verifyUnitActive: %v", err)
+	}
+	if res1.AppliedSHA != sha1 {
+		t.Fatalf("AppliedSHA = %q, want %q", res1.AppliedSHA, sha1)
+	}
+	if env.systemd.countCalls("unit-state", "caddy", "caddy.service") != 1 {
+		t.Fatalf("expected immediate single UnitState check for clean oneshot, got %d", env.systemd.countCalls("unit-state", "caddy", "caddy.service"))
+	}
+
+	// 2. Type=simple + inactive + Result=exit-code fails verifyUnitActive immediately (without waiting for 5s timeout).
+	env2 := newTestEnv(t)
+	env2.writeRepoFiles(map[string][]byte{
+		"users.toml":                       []byte("[users.caddy]\nuid = 2002\n"),
+		"hosts/services-02.toml":           []byte("hostname = \"services-02\"\n\n[[component]]\nname = \"caddy\"\nuser = \"caddy\"\n"),
+		"components/caddy/caddy.container": []byte("[Container]\nImage=docker.io/library/caddy:2\n"),
+	})
+	env2.commitRepo("simple exit-code commit")
+
+	env2.systemd.overrideUnitState["caddy/caddy.service"] = apply.UnitStatusInfo{
+		ActiveState: "inactive",
+		Type:        "simple",
+		Result:      "exit-code",
+	}
+	start := time.Now()
+	res2, err := env2.engine.Reconcile(context.Background(), env2.reconcileOpts(5*time.Second))
+	elapsed := time.Since(start)
+	if err == nil || !res2.RolledBack || res2.FailedStage != "apply" {
+		t.Fatalf("expected immediate rollback for Type=simple inactive Result=exit-code, got res=%+v err=%v", res2, err)
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("verifyUnitActive waited too long (%v) instead of failing immediately on exit-code", elapsed)
+	}
+	if env2.systemd.countCalls("unit-state", "caddy", "caddy.service") != 1 {
+		t.Fatalf("expected single UnitState poll before immediate failure, got %d", env2.systemd.countCalls("unit-state", "caddy", "caddy.service"))
+	}
+}
+
+func TestReconcileAdoptedUserCustomGIDWritesDataFilesWithPrimaryGID(t *testing.T) {
+	runCase := func(t *testing.T, postStage5Only bool) {
+		t.Helper()
+		env := newTestEnv(t)
+		env.engine = apply.NewEngine(apply.EngineDeps{
+			Config:  env.cfg,
+			Git:     env.git,
+			Users:   env.users,
+			Quadlet: env.quadlet,
+			Secrets: env.secretsMgr,
+			Netmgr:  env.netmgr,
+			Systemd: env.systemd,
+			RootDir: env.rootDir,
+			Chown: func(p string, uid, gid int) error {
+				env.chownCalls = append(env.chownCalls, fmt.Sprintf("%s:%d:%d", p, uid, gid))
+				return nil
+			},
+			UserGIDLookup: func(username string) (int, bool, error) {
+				if username != "openwebui" {
+					return 0, false, nil
+				}
+				if postStage5Only && env.users.applyCalls == 0 {
+					return 0, false, nil
+				}
+				return 3000, true, nil
+			},
+			DHCPTimeout:        100 * time.Millisecond,
+			VerifyPollInterval: 5 * time.Millisecond,
+		})
+
+		env.writeRepoFiles(map[string][]byte{
+			"users.toml":             []byte("[users.openwebui]\nuid = 2001\n"),
+			"hosts/services-02.toml": []byte("hostname = \"services-02\"\n\n[[component]]\nname = \"open-webui\"\nuser = \"openwebui\"\n"),
+			"components/open-webui/open-webui.container": []byte("[Container]\nImage=ghcr.io/open-webui/open-webui:v1\n"),
+			"components/open-webui/files/config.yaml":    []byte("theme: dark\n"),
+		})
+		env.commitRepo("adopted user custom gid")
+
+		if _, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond)); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+
+		wantChownSuffix := "config.yaml:2001:3000"
+		foundDataChown := false
+		for _, c := range env.chownCalls {
+			if strings.Contains(c, ":2001:3000") {
+				foundDataChown = true
+			}
+			if strings.Contains(c, "config.yaml") && !strings.Contains(c, wantChownSuffix) {
+				t.Fatalf("unexpected chown call for config.yaml: %q (want suffix %q)", c, wantChownSuffix)
+			}
+		}
+		if !foundDataChown {
+			t.Fatalf("expected chown call with 2001:3000, got %v", env.chownCalls)
+		}
+
+		st, err := state.Load(env.stateFile)
+		if err != nil {
+			t.Fatalf("state.Load: %v", err)
+		}
+		rec, ok := st.Files["/var/home/openwebui/.config/quadmatic/open-webui/config.yaml"]
+		if !ok {
+			t.Fatalf("expected config.yaml recorded in state.Files, got %+v", st.Files)
+		}
+		if rec.OwnerUID != 2001 || rec.OwnerGID != 3000 {
+			t.Fatalf("state FileRecord ownership = %d:%d, want 2001:3000", rec.OwnerUID, rec.OwnerGID)
+		}
+	}
+
+	t.Run("resolved_at_stage3", func(t *testing.T) {
+		runCase(t, false)
+	})
+	t.Run("resolved_after_stage5_rerender", func(t *testing.T) {
+		runCase(t, true)
+	})
+}
+
+func TestReconcileRollbackStopsPreviouslyInactiveRestartedUnit(t *testing.T) {
+	env := newTestEnv(t)
+
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml": []byte("[users.a]\nuid = 2001\n\n[users.b]\nuid = 2002\n"),
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "a-app"
+user = "a"
+
+[[component]]
+name = "b-app"
+user = "b"
+`),
+		"components/a-app/a-app.container": []byte("[Container]\nImage=alpine:3.20\n"),
+		"components/a-app/files/cfg.ini":   []byte("v=1\n"),
+		"components/b-app/b-app.container": []byte("[Container]\nImage=alpine:3.20\n"),
+	})
+	sha1 := env.commitRepo("commit 1")
+
+	if _, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond)); err != nil {
+		t.Fatalf("commit 1 failed: %v", err)
+	}
+
+	// Manually stop a-app.service before Commit 2.
+	env.systemd.states["a/a-app.service"] = "inactive"
+	env.systemd.clearCalls()
+
+	// Commit 2: updates a-app's data file (putting a-app in unitsToRestart) and updates b-app
+	// which fails verifyUnitActive after a-app has already been restarted.
+	env.systemd.overrideActiveState["b/b-app.service"] = "failed"
+	env.writeRepoFiles(map[string][]byte{
+		"components/a-app/files/cfg.ini":   []byte("v=2\n"),
+		"components/b-app/b-app.container": []byte("[Container]\nImage=alpine:3.21\n"),
+	})
+	env.commitRepo("commit 2: data file restart + b-app failure")
+
+	res2, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(50*time.Millisecond))
+	if err == nil || !res2.RolledBack || res2.FailedStage != "apply" || res2.AppliedSHA != sha1 {
+		t.Fatalf("expected rollback to %q, got res=%+v err=%v", sha1, res2, err)
+	}
+
+	// a-app.service was restarted once in forward Stage 7d, stopped once on rollback, and NEVER restarted in rollback.
+	if got := env.systemd.countCalls("restart", "a", "a-app.service"); got != 1 {
+		t.Fatalf("a-app.service restart count = %d, want 1 (forward only); calls=%v", got, env.systemd.calls)
+	}
+	if got := env.systemd.countCalls("stop", "a", "a-app.service"); got != 1 {
+		t.Fatalf("a-app.service stop count = %d, want 1 (rollback stop); calls=%v", got, env.systemd.calls)
+	}
+	if env.systemd.states["a/a-app.service"] != "inactive" {
+		t.Fatalf("expected a-app.service restored to inactive, got %q", env.systemd.states["a/a-app.service"])
+	}
+	cfgBytes, err := os.ReadFile(env.hostPath("/var/home/a/.config/quadmatic/a-app/cfg.ini"))
+	if err != nil || string(cfgBytes) != "v=1\n" {
+		t.Fatalf("expected cfg.ini rolled back to v=1, got %q (err=%v)", string(cfgBytes), err)
+	}
+}
+
+type failingSnapshotNetmgr struct {
+	apply.NetmgrReconciler
+	failSnapshot bool
+}
+
+func (f *failingSnapshotNetmgr) Snapshot(ctx context.Context, host *manifest.ResolvedHost, owned []state.ManagedNetworkRecord) (*netmgr.Snapshot, error) {
+	if f.failSnapshot {
+		return nil, errors.New("simulated Stage 6 net snapshot error")
+	}
+	return f.NetmgrReconciler.Snapshot(ctx, host, owned)
+}
+
+type failPostRollbackQuerySystemd struct {
+	apply.Systemd
+	rollbackRestartSeen bool
+}
+
+func (f *failPostRollbackQuerySystemd) Restart(ctx context.Context, scope, unit string) error {
+	f.rollbackRestartSeen = true
+	return f.Systemd.Restart(ctx, scope, unit)
+}
+
+func (f *failPostRollbackQuerySystemd) ActiveState(ctx context.Context, scope, unit string) (string, error) {
+	if f.rollbackRestartSeen {
+		return "", errors.New("simulated post-rollback query failure")
+	}
+	return f.Systemd.ActiveState(ctx, scope, unit)
+}
+
+func TestReconcilePopulatesFailedUnitsOnStage5Stage6AndRollback(t *testing.T) {
+	env := newTestEnv(t)
+	netWrapper := &failingSnapshotNetmgr{NetmgrReconciler: env.netmgr}
+	env.engine = apply.NewEngine(apply.EngineDeps{
+		Config:             env.cfg,
+		Git:                env.git,
+		Users:              env.users,
+		Quadlet:            env.quadlet,
+		Secrets:            env.secretsMgr,
+		Netmgr:             netWrapper,
+		Systemd:            env.systemd,
+		RootDir:            env.rootDir,
+		Chown:              func(string, int, int) error { return nil },
+		DHCPTimeout:        100 * time.Millisecond,
+		VerifyPollInterval: 5 * time.Millisecond,
+	})
+
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml": []byte("[users.healthy]\nuid = 2001\n\n[users.unhealthy]\nuid = 2002\n\n[users.brokenuser]\nuid = 2003\n"),
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "healthy"
+user = "healthy"
+
+[[component]]
+name = "unhealthy"
+user = "unhealthy"
+`),
+		"components/healthy/healthy.container":     []byte("[Container]\nImage=alpine:3.20\n"),
+		"components/unhealthy/unhealthy.container": []byte("[Container]\nImage=alpine:3.20\n"),
+	})
+	sha1 := env.commitRepo("commit 1: healthy + unhealthy")
+	if _, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond)); err != nil {
+		t.Fatalf("commit 1 failed: %v", err)
+	}
+
+	// Mark unhealthy.service as failed out-of-band before Commit 2.
+	env.systemd.states["unhealthy/unhealthy.service"] = "failed"
+	wantFailed := []apply.UnitStatus{{Scope: "unhealthy", Unit: "unhealthy.service", ActiveState: "failed"}}
+
+	// Commit 2: update healthy so Stage 5/6 runs.
+	env.writeRepoFiles(map[string][]byte{
+		"components/healthy/healthy.container": []byte("[Container]\nImage=alpine:3.21\n"),
+	})
+	env.commitRepo("commit 2: update healthy")
+
+	// 1. Stage 5 (users) failure preserves AppliedSHA and FailedUnits.
+	env.users.failApply = errors.New("simulated useradd error")
+	res5, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err == nil {
+		t.Fatalf("expected Stage 5 error")
+	}
+	if res5.FailedStage != "users" || res5.AppliedSHA != sha1 || !reflect.DeepEqual(res5.FailedUnits, wantFailed) {
+		t.Fatalf("Stage 5 failure result = %+v, want FailedStage=users AppliedSHA=%q FailedUnits=%+v", res5, sha1, wantFailed)
+	}
+	env.users.failApply = nil
+
+	// 2. Stage 6 (net Snapshot) failure preserves AppliedSHA and FailedUnits.
+	netWrapper.failSnapshot = true
+	res6, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err == nil {
+		t.Fatalf("expected Stage 6 net snapshot error")
+	}
+	if res6.FailedStage != "net" || res6.AppliedSHA != sha1 || !reflect.DeepEqual(res6.FailedUnits, wantFailed) {
+		t.Fatalf("Stage 6 failure result = %+v, want FailedStage=net AppliedSHA=%q FailedUnits=%+v", res6, sha1, wantFailed)
+	}
+	netWrapper.failSnapshot = false
+
+	// 3. Stage 7 rollback re-queries prevState.GeneratedUnits and populates res.FailedUnits.
+	env.systemd.overrideActiveState["brokenuser/broken.service"] = "failed"
+	env.writeRepoFiles(map[string][]byte{
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "healthy"
+user = "healthy"
+
+[[component]]
+name = "unhealthy"
+user = "unhealthy"
+
+[[component]]
+name = "broken"
+user = "brokenuser"
+`),
+		"components/broken/broken.container": []byte("[Container]\nImage=example.invalid/broken:latest\n"),
+	})
+	env.commitRepo("commit 3: add broken unit")
+
+	res7, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(50*time.Millisecond))
+	if err == nil || !res7.RolledBack || res7.AppliedSHA != sha1 {
+		t.Fatalf("expected rollback to %q, got res=%+v err=%v", sha1, res7, err)
+	}
+	if !reflect.DeepEqual(res7.FailedUnits, wantFailed) {
+		t.Fatalf("post-rollback FailedUnits = %+v, want %+v", res7.FailedUnits, wantFailed)
+	}
+
+	// 4. Fallback to stage4FailedUnits if post-rollback ActiveState query errors.
+	fallbackSys := &failPostRollbackQuerySystemd{Systemd: env.systemd}
+	env.engine = apply.NewEngine(apply.EngineDeps{
+		Config:             env.cfg,
+		Git:                env.git,
+		Users:              env.users,
+		Quadlet:            env.quadlet,
+		Secrets:            env.secretsMgr,
+		Netmgr:             env.netmgr,
+		Systemd:            fallbackSys,
+		RootDir:            env.rootDir,
+		Chown:              func(string, int, int) error { return nil },
+		DHCPTimeout:        100 * time.Millisecond,
+		VerifyPollInterval: 5 * time.Millisecond,
+	})
+	resFallback, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(50*time.Millisecond))
+	if err == nil || !resFallback.RolledBack || resFallback.AppliedSHA != sha1 {
+		t.Fatalf("expected rollback to %q, got res=%+v err=%v", sha1, resFallback, err)
+	}
+	if !reflect.DeepEqual(resFallback.FailedUnits, wantFailed) {
+		t.Fatalf("post-rollback fallback FailedUnits = %+v, want %+v", resFallback.FailedUnits, wantFailed)
 	}
 }

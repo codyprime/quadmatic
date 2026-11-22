@@ -25,6 +25,7 @@ type FileRecord struct {
 	OwnerUID  int         `json:"owner_uid"`
 	OwnerGID  int         `json:"owner_gid"`
 	Component string      `json:"component"`
+	Scope     string      `json:"scope,omitempty"`
 	Kind      string      `json:"kind"`
 }
 
@@ -39,26 +40,27 @@ type ManagedNetworkRecord struct {
 
 // State represents the persisted host convergence state stored in state.json.
 type State struct {
-	Version        int                    `json:"version"`
-	AppliedSHA     string                 `json:"applied_sha"`
-	AppliedAt      time.Time              `json:"applied_at"`
-	ManagedUsers   []string               `json:"managed_users"`
-	Files          map[string]FileRecord  `json:"files"`
-	GeneratedUnits map[string]string      `json:"generated_units"`
-	Secrets        map[string]string      `json:"secrets"`
-	Networks       []ManagedNetworkRecord `json:"networks"`
-	NFTablesHash   string                 `json:"nftables_hash"`
+	Version           int                    `json:"version"`
+	AppliedSHA        string                 `json:"applied_sha"`
+	AppliedAt         time.Time              `json:"applied_at"`
+	ManagedUsers      []string               `json:"managed_users"`
+	Files             map[string]FileRecord  `json:"files"`
+	GeneratedUnits    map[string]string      `json:"generated_units"`
+	Secrets           map[string]string      `json:"secrets"`
+	SecretSourcePaths map[string]string      `json:"secret_source_paths,omitempty"`
+	Networks          []ManagedNetworkRecord `json:"networks"`
 }
 
 // NewEmpty returns a new empty State with initialized maps and slices at CurrentVersion.
 func NewEmpty() *State {
 	return &State{
-		Version:        CurrentVersion,
-		ManagedUsers:   []string{},
-		Files:          make(map[string]FileRecord),
-		GeneratedUnits: make(map[string]string),
-		Secrets:        make(map[string]string),
-		Networks:       []ManagedNetworkRecord{},
+		Version:           CurrentVersion,
+		ManagedUsers:      []string{},
+		Files:             make(map[string]FileRecord),
+		GeneratedUnits:    make(map[string]string),
+		Secrets:           make(map[string]string),
+		SecretSourcePaths: make(map[string]string),
+		Networks:          []ManagedNetworkRecord{},
 	}
 }
 
@@ -74,6 +76,9 @@ func (s *State) initNilFields() {
 	}
 	if s.Secrets == nil {
 		s.Secrets = make(map[string]string)
+	}
+	if s.SecretSourcePaths == nil {
+		s.SecretSourcePaths = make(map[string]string)
 	}
 	if s.Networks == nil {
 		s.Networks = []ManagedNetworkRecord{}

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,21 +20,19 @@ const (
 	// ManagedVRFPrefix is the connection/interface name prefix for quadmatic-owned VRF profiles.
 	ManagedVRFPrefix = "qmv-"
 
-	// DefaultCgroupPattern is the default systemd cgroupv2 hierarchy pattern used for
-	// nftables outbound_guard matching on rootless quadlet services.
-	DefaultCgroupPattern = "user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{unit}"
-
-	vrfTableOffset      = 10000
-	vrfDefaultMetric    = "8192"
-	maxIfNameLen        = 15
-	tcpL3mdevAcceptPath = "/proc/sys/net/ipv4/tcp_l3mdev_accept"
-	udpL3mdevAcceptPath = "/proc/sys/net/ipv4/udp_l3mdev_accept"
-	defaultDHCPTimeout  = 30 * time.Second
-	maxDHCPPollInterval = 250 * time.Millisecond
-	minDHCPPollInterval = 10 * time.Millisecond
+	vrfTableOffset           = 10000
+	vrfDefaultMetric         = "8192"
+	vrfLocalRulePriority     = 32765
+	defaultLocalRulePriority = 0
+	maxIfNameLen             = 15
+	tcpL3mdevAcceptPath      = "/proc/sys/net/ipv4/tcp_l3mdev_accept"
+	udpL3mdevAcceptPath      = "/proc/sys/net/ipv4/udp_l3mdev_accept"
+	defaultDHCPTimeout       = 30 * time.Second
+	maxDHCPPollInterval      = 250 * time.Millisecond
+	minDHCPPollInterval      = 10 * time.Millisecond
 )
 
-// Runner executes external networking commands (`nmcli`, `ip`, `nft`) with optional stdin.
+// Runner executes external networking commands (`nmcli`, `ip`) with optional stdin.
 type Runner interface {
 	Run(ctx context.Context, stdin []byte, name string, args ...string) ([]byte, error)
 }
@@ -45,12 +42,10 @@ type SysctlReader interface {
 	ReadSysctl(path string) (string, error)
 }
 
-// Snapshot captures pre-apply owned NetworkManager profiles and the live nftables table
-// for transactional rollback.
+// Snapshot captures pre-apply owned NetworkManager profiles for transactional rollback.
 type Snapshot struct {
-	Profiles        map[string]string
-	NFTablesRuleset string
-	OwnedRecords    []state.ManagedNetworkRecord
+	Profiles     map[string]string
+	OwnedRecords []state.ManagedNetworkRecord
 }
 
 type execRunner struct{}
@@ -73,16 +68,11 @@ func (osSysctlReader) ReadSysctl(path string) (string, error) {
 	return string(data), nil
 }
 
-// Reconciler manages NetworkManager VLAN, VRF, and macvlan profiles plus the cgroupv2-scoped
-// `inet quadmatic` nftables outbound guard.
+// Reconciler manages NetworkManager VLAN, VRF, and macvlan profiles plus VRF policy routing rules.
 type Reconciler struct {
 	trunkInterface string
 	runner         Runner
 	sysctl         SysctlReader
-	cgroupPattern  string
-	// CgroupExists reports whether a cgroupv2 path currently exists on the host.
-	// Defaults to checking that /sys/fs/cgroup/<cgPath> is a directory.
-	CgroupExists func(cgPath string) bool
 }
 
 // NewReconciler constructs a Reconciler for trunkInterface using runner and sysctl
@@ -98,55 +88,7 @@ func NewReconciler(trunkInterface string, runner Runner, sysctl SysctlReader) *R
 		trunkInterface: strings.TrimSpace(trunkInterface),
 		runner:         runner,
 		sysctl:         sysctl,
-		cgroupPattern:  DefaultCgroupPattern,
-		CgroupExists:   defaultCgroupExists,
 	}
-}
-
-func defaultCgroupExists(cgPath string) bool {
-	return CgroupExistsUnderRoot("/sys/fs/cgroup")(cgPath)
-}
-
-// CgroupExistsUnderRoot returns a CgroupExists predicate checking whether
-// <root>/<cgPath> exists and is a directory.
-func CgroupExistsUnderRoot(root string) func(string) bool {
-	return func(cgPath string) bool {
-		clean := strings.Trim(cgPath, "/")
-		if clean == "" {
-			return false
-		}
-		info, err := os.Stat(filepath.Join(root, filepath.FromSlash(clean)))
-		return err == nil && info.IsDir()
-	}
-}
-
-func (r *Reconciler) checkCgroupExists(cgPath string) bool {
-	if r != nil && r.CgroupExists != nil {
-		return r.CgroupExists(cgPath)
-	}
-	return defaultCgroupExists(cgPath)
-}
-
-// SetCgroupPattern overrides the cgroupv2 path pattern used by outbound_guard rules.
-// Supported placeholders are {uid}, {unit}, {user}, and {component}.
-func (r *Reconciler) SetCgroupPattern(pattern string) error {
-	if r == nil {
-		return errors.New("netmgr reconciler is nil")
-	}
-	trimmed := strings.Trim(strings.TrimSpace(pattern), "/")
-	if trimmed == "" {
-		return errors.New("cgroup pattern must not be empty")
-	}
-	if strings.ContainsAny(trimmed, "\x00\r\n\"\\") {
-		return fmt.Errorf("cgroup pattern %q contains forbidden characters", pattern)
-	}
-	for _, seg := range strings.Split(trimmed, "/") {
-		if seg == "" || seg == "." || seg == ".." {
-			return fmt.Errorf("cgroup pattern %q contains invalid path segment %q", pattern, seg)
-		}
-	}
-	r.cgroupPattern = trimmed
-	return nil
 }
 
 // CheckKernelInvariants verifies that net.ipv4.tcp_l3mdev_accept and

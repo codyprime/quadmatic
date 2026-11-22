@@ -108,15 +108,14 @@ type rawComponentManifest struct {
 }
 
 type rawNetworkSpec struct {
-	VLAN          *int      `toml:"vlan"`
-	MAC           *string   `toml:"mac"`
-	MacvlanMode   *string   `toml:"macvlan_mode"`
-	DNS           *[]string `toml:"dns"`
-	DNSFromDHCP   *bool     `toml:"dns_from_dhcp"`
-	TCPPorts      *[]string `toml:"tcp_ports"`
-	UDPPorts      *[]string `toml:"udp_ports"`
-	IPv6          *bool     `toml:"ipv6"`
-	OutboundGuard *bool     `toml:"outbound_guard"`
+	VLAN        *int      `toml:"vlan"`
+	MAC         *string   `toml:"mac"`
+	MacvlanMode *string   `toml:"macvlan_mode"`
+	DNS         *[]string `toml:"dns"`
+	DNSFromDHCP *bool     `toml:"dns_from_dhcp"`
+	TCPPorts    *[]string `toml:"tcp_ports"`
+	UDPPorts    *[]string `toml:"udp_ports"`
+	IPv6        *bool     `toml:"ipv6"`
 }
 
 type rawFileOverride struct {
@@ -336,26 +335,24 @@ func mergePortsMap(base map[string]PortSpec, overrides map[string]rawPortValue) 
 }
 
 func resolvePortValue(v rawPortValue, base *PortSpec) PortSpec {
-	if v.shorthand {
-		var port int
-		if v.port != nil {
-			port = *v.port
-		}
-		return PortSpec{
-			Port:     port,
-			Protocol: defaultProtocol,
-			HostIP:   defaultHostIP,
-		}
-	}
 	spec := PortSpec{
 		Protocol: defaultProtocol,
 		HostIP:   defaultHostIP,
 	}
 	if base != nil {
 		spec = *base
+		if spec.Protocol == "" {
+			spec.Protocol = defaultProtocol
+		}
+		if spec.HostIP == "" {
+			spec.HostIP = defaultHostIP
+		}
 	}
 	if v.port != nil {
 		spec.Port = *v.port
+	}
+	if v.shorthand {
+		return spec
 	}
 	if v.protocol != nil {
 		if *v.protocol == "" {
@@ -392,10 +389,6 @@ func mergeNetwork(base, override *rawNetworkSpec) *NetworkSpec {
 	if merged.MacvlanMode == "" {
 		merged.MacvlanMode = defaultMacvlanMode
 	}
-	if merged.OutboundGuard == nil {
-		guard := true
-		merged.OutboundGuard = &guard
-	}
 	return merged
 }
 
@@ -426,10 +419,6 @@ func applyRawNetwork(dst *NetworkSpec, src *rawNetworkSpec) {
 	}
 	if src.IPv6 != nil {
 		dst.IPv6 = *src.IPv6
-	}
-	if src.OutboundGuard != nil {
-		v := *src.OutboundGuard
-		dst.OutboundGuard = &v
 	}
 }
 

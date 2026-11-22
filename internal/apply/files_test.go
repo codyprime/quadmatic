@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"quadmatic/internal/hashutil"
 	"quadmatic/internal/manifest"
 	"quadmatic/internal/state"
 )
@@ -156,7 +157,7 @@ func TestRootedFileOpsHappyPathAndRootChown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("inspectDiskFile failed: %v", err)
 	}
-	if !info.Exists || !info.Regular || info.Mode != 0o640 || info.SHA256 != sha256Hex([]byte("hello: world\n")) {
+	if !info.Exists || !info.Regular || info.Mode != 0o640 || info.SHA256 != hashutil.SHA256Hex([]byte("hello: world\n")) {
 		t.Fatalf("unexpected diskFileInfo: %+v", info)
 	}
 

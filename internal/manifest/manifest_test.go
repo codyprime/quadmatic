@@ -94,6 +94,7 @@ welcome_msg = "base"
 
 [ports]
 http = { port = 8080, protocol = "tcp" }
+dns = { port = 53, protocol = "udp", host_ip = "10.0.3.12" }
 metrics = 9090
 
 [network]
@@ -137,12 +138,12 @@ extra = "host-val"
 
 [component.ports]
 http = { port = 8081, host_ip = "10.0.3.12" }
+dns = 5353
 admin = 8443
 
 [component.network]
 mac = "02:51:4d:00:07:d2"
 ipv6 = true
-outbound_guard = false
 
 [[component]]
 name = "frigate"
@@ -181,6 +182,9 @@ reason = "USB Coral passthrough"
 	if got := ow.Ports["http"]; got.Port != 8081 || got.Protocol != "tcp" || got.HostIP != "10.0.3.12" {
 		t.Fatalf("unexpected merged http port: %+v", got)
 	}
+	if got := ow.Ports["dns"]; got.Port != 5353 || got.Protocol != "udp" || got.HostIP != "10.0.3.12" {
+		t.Fatalf("expected shorthand port override to preserve protocol and host_ip, got: %+v", got)
+	}
 	if got := ow.Ports["metrics"]; got.Port != 9090 || got.Protocol != "tcp" || got.HostIP != "0.0.0.0" {
 		t.Fatalf("unexpected preserved metrics port: %+v", got)
 	}
@@ -195,9 +199,6 @@ reason = "USB Coral passthrough"
 	}
 	if !ow.Network.IPv6 {
 		t.Fatalf("expected overridden ipv6=true")
-	}
-	if ow.Network.OutboundGuard == nil || *ow.Network.OutboundGuard {
-		t.Fatalf("expected overridden outbound_guard=false, got %v", ow.Network.OutboundGuard)
 	}
 
 	fr := findComponent(t, resolved.Components, "frigate")
@@ -378,7 +379,7 @@ tcp_ports = ["8080:8080"]
 }
 
 func TestValidateNetworkConstraints(t *testing.T) {
-	baseRegistry := "[users.u1]\nuid = 2001\n[users.u2]\nuid = 2002\n[users.longuid]\nuid = 123456789012\nsubuid_start = 3000000\n"
+	baseRegistry := "[users.u1]\nuid = 2001\n[users.u2]\nuid = 2002\n"
 
 	cases := []struct {
 		name      string
@@ -546,22 +547,6 @@ dns = ["10.0.30.1"]
 			wantErr: "macvlan_mode",
 		},
 		{
-			name: "rejects qmv-<uid> exceeding 15 characters",
-			setupRepo: func(t *testing.T, r *testRepo) {
-				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
-				r.writeFile(t, "hosts/node.toml", `
-[[component]]
-name = "c1"
-user = "longuid"
-[component.network]
-vlan = 30
-mac = "02:51:4d:00:07:d1"
-dns = ["10.0.30.1"]
-`)
-			},
-			wantErr: "15 characters",
-		},
-		{
 			name: "rejects invalid tcp_ports",
 			setupRepo: func(t *testing.T, r *testRepo) {
 				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
@@ -727,6 +712,66 @@ mac = "02:51:4d:00:07:e1"
 			t.Fatalf("expected valid secret name to pass validation, got: %v", err)
 		}
 	})
+
+	t.Run("rejects qmv-<uid> exceeding 15 characters on synthetic host", func(t *testing.T) {
+		r := newTestRepo(t)
+		r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
+		synthetic := &manifest.ResolvedHost{
+			Hostname: "node",
+			Components: []manifest.ResolvedComponent{
+				{
+					Name: "c1",
+					User: "longuid",
+					UID:  123456789012,
+					Network: &manifest.NetworkSpec{
+						VLAN: 30,
+						MAC:  "02:51:4d:00:07:d1",
+						DNS:  []string{"10.0.30.1"},
+					},
+				},
+			},
+		}
+		err := manifest.Validate(synthetic, r.root)
+		if err == nil || !strings.Contains(err.Error(), "15 characters") {
+			t.Fatalf("expected error containing \"15 characters\", got: %v", err)
+		}
+	})
+}
+
+func TestNormalizeAndValidateMAC(t *testing.T) {
+	validCases := []struct {
+		in   string
+		want string
+	}{
+		{in: "02:51:4d:00:07:d1", want: "02:51:4d:00:07:d1"},
+		{in: "02:51:4D:00:07:D1", want: "02:51:4d:00:07:d1"},
+		{in: "02-51-4D-00-07-D1", want: "02:51:4d:00:07:d1"},
+		{in: "0251.4d00.07d1", want: "02:51:4d:00:07:d1"},
+	}
+	for _, tc := range validCases {
+		got, err := manifest.NormalizeAndValidateMAC(tc.in)
+		if err != nil {
+			t.Fatalf("NormalizeAndValidateMAC(%q) unexpected error: %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Fatalf("NormalizeAndValidateMAC(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+
+	invalidCases := []string{
+		"",
+		"   ",
+		"not-a-mac",
+		"00:00:00:00:00:00",
+		"01:00:5e:00:00:01",
+		"ff:ff:ff:ff:ff:ff",
+		"02:51:4d:00:07:d1:00:01",
+	}
+	for _, in := range invalidCases {
+		if got, err := manifest.NormalizeAndValidateMAC(in); err == nil {
+			t.Fatalf("NormalizeAndValidateMAC(%q) expected error, got %q", in, got)
+		}
+	}
 }
 
 func TestValidateRejectsPathTraversal(t *testing.T) {
@@ -1236,6 +1281,54 @@ dns = ["10.0.0.1"]
 		gotExplicit := string(findRenderedFile(t, renderedExplicit.Components[0].Files, "app.container").Content)
 		if gotExplicit != "parent=enp3s0\n" {
 			t.Fatalf("expected enp3s0 parent, got %q", gotExplicit)
+		}
+	})
+
+	t.Run("UserGIDs overrides rootless data file OwnerGID and falls back to comp.UID", func(t *testing.T) {
+		r := newTestRepo(t)
+		reg := r.parseRegistry(t, "[users.u1]\nuid = 2001\n[users.u2]\nuid = 2002\n")
+		r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
+		r.writeFile(t, "components/c1/files/app.conf", "k=v\n")
+		r.writeFile(t, "components/c2/c2.container", "[Container]\nImage=alpine\n")
+		r.writeFile(t, "components/c2/files/other.conf", "k=v2\n")
+		r.writeFile(t, "hosts/node.toml", `
+[[component]]
+name = "c1"
+user = "u1"
+
+[[component]]
+name = "c2"
+user = "u2"
+`)
+		resolved, err := manifest.LoadHost(r.root, "node", reg)
+		if err != nil {
+			t.Fatalf("LoadHost failed: %v", err)
+		}
+		if err := manifest.Validate(resolved, r.root); err != nil {
+			t.Fatalf("Validate failed: %v", err)
+		}
+		rendered, err := manifest.RenderHost(resolved, manifest.RenderEnv{
+			UserGIDs: map[string]int{"u1": 3000},
+			DryRun:   true,
+		})
+		if err != nil {
+			t.Fatalf("RenderHost failed: %v", err)
+		}
+
+		c1 := findRenderedComponent(t, rendered.Components, "c1")
+		c1Unit := findRenderedFile(t, c1.Files, "c1.container")
+		if c1Unit.OwnerUID != 0 || c1Unit.OwnerGID != 0 {
+			t.Fatalf("expected rootless quadlet owned by 0:0, got %d:%d", c1Unit.OwnerUID, c1Unit.OwnerGID)
+		}
+		c1Data := findRenderedFile(t, c1.Files, "app.conf")
+		if c1Data.OwnerUID != 2001 || c1Data.OwnerGID != 3000 {
+			t.Fatalf("expected c1 data owned by 2001:3000, got %d:%d", c1Data.OwnerUID, c1Data.OwnerGID)
+		}
+
+		c2 := findRenderedComponent(t, rendered.Components, "c2")
+		c2Data := findRenderedFile(t, c2.Files, "other.conf")
+		if c2Data.OwnerUID != 2002 || c2Data.OwnerGID != 2002 {
+			t.Fatalf("expected c2 data fallback owned by 2002:2002, got %d:%d", c2Data.OwnerUID, c2Data.OwnerGID)
 		}
 	})
 }

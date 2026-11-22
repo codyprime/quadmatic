@@ -2,12 +2,13 @@ package manifest
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"fmt"
 	"path"
 	"strconv"
 	"strings"
 	"text/template"
+
+	"quadmatic/internal/hashutil"
 )
 
 // RenderHost renders all component quadlet and data templates using Go text/template
@@ -89,13 +90,16 @@ func RenderHost(host *ResolvedHost, env RenderEnv) (*RenderedHost, error) {
 				Mode:     quadletFileMode,
 				OwnerUID: 0,
 				OwnerGID: 0,
-				SHA256:   sha256Hex(content),
+				SHA256:   hashutil.SHA256Hex(content),
 			})
 		}
 
 		ownerUID, ownerGID := 0, 0
 		if !comp.Rootful {
 			ownerUID, ownerGID = comp.UID, comp.UID
+			if gid, ok := env.UserGIDs[comp.User]; ok {
+				ownerGID = gid
+			}
 		}
 		for _, df := range comp.DataFiles {
 			content, err := renderSourceFile(comp.Name, df, tmplCtx)
@@ -118,7 +122,7 @@ func RenderHost(host *ResolvedHost, env RenderEnv) (*RenderedHost, error) {
 				Mode:     mode,
 				OwnerUID: ownerUID,
 				OwnerGID: ownerGID,
-				SHA256:   sha256Hex(content),
+				SHA256:   hashutil.SHA256Hex(content),
 			})
 		}
 
@@ -248,11 +252,6 @@ func lookupFileOverride(overrides map[string]FileOverride, df SourceFile) (FileO
 	return ov, ok
 }
 
-func sha256Hex(data []byte) string {
-	sum := sha256.Sum256(data)
-	return fmt.Sprintf("%x", sum)
-}
-
 func clonePortsMap(src map[string]PortSpec) map[string]PortSpec {
 	out := make(map[string]PortSpec, len(src))
 	for k, v := range src {
@@ -282,10 +281,6 @@ func cloneNetworkSpec(src *NetworkSpec) *NetworkSpec {
 	}
 	if src.UDPPorts != nil {
 		cp.UDPPorts = append([]string(nil), src.UDPPorts...)
-	}
-	if src.OutboundGuard != nil {
-		v := *src.OutboundGuard
-		cp.OutboundGuard = &v
 	}
 	return &cp
 }

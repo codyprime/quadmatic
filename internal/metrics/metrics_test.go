@@ -234,6 +234,36 @@ func TestRecorderPreservesUnitMetricsAcrossPreApplyErrors(t *testing.T) {
 	if fam, ok := families["quadmatic_failed_units"]; ok && len(fam.GetMetric()) > 0 {
 		t.Fatalf("expected failed_units cleared on post-validate failure, got %+v", fam.GetMetric())
 	}
+
+	// Post-validate failures (users/files/net/apply rollback) keep reporting failed units
+	// whenever Result.FailedUnits is populated.
+	for _, tc := range []struct {
+		stage      string
+		rolledBack bool
+	}{
+		{stage: "users", rolledBack: false},
+		{stage: "net", rolledBack: false},
+		{stage: "apply", rolledBack: true},
+		{stage: "rollback", rolledBack: true},
+	} {
+		rec.RecordResult(&apply.Result{
+			AppliedSHA:           "sha-good",
+			FailedStage:          tc.stage,
+			RolledBack:           tc.rolledBack,
+			ManagedUnitsRootless: 2,
+			ManagedUnitsRootful:  1,
+			FailedUnits: []apply.UnitStatus{
+				{Scope: "openwebui", Unit: "open-webui.service", ActiveState: "failed"},
+				{Scope: "caddy", Unit: "caddy.service", ActiveState: "inactive"},
+			},
+			Duration: 300 * time.Millisecond,
+		}, errors.New(tc.stage+" failed"))
+
+		_, families = scrapeMetrics(t, rec.Handler())
+		assertGaugeValue(t, families, "quadmatic_last_sync_success", nil, 0)
+		assertGaugeValue(t, families, "quadmatic_failed_units", map[string]string{"user": "openwebui", "unit": "open-webui.service"}, 1)
+		assertGaugeValue(t, families, "quadmatic_failed_units", map[string]string{"user": "caddy", "unit": "caddy.service"}, 1)
+	}
 }
 
 func TestNewServerRejectsWildcardBind(t *testing.T) {
