@@ -200,8 +200,8 @@ check_1_networking_and_pasta() {
 
 check_2_cgroup_paths() {
   log "=== Check 2: Inspect /proc/<pid>/cgroup for podman pull, conmon, and pasta inside rootless user unit ==="
-  systemd-run --machine="${SPIKE_USER}@.host" --user --unit=qmspike-pull-probe --quiet \
-    sh -c 'podman pull "'"$TEST_IMAGE"'" >/dev/null & p=$!; sleep 0.2; if [ -r "/proc/$p/cgroup" ]; then echo "--- podman pull (/proc/$p/cgroup) ---"; cat "/proc/$p/cgroup"; fi; wait "$p"'
+  systemd-run --machine="${SPIKE_USER}@.host" --user --unit=qmspike-pull-probe --pipe --wait --quiet \
+    sh -c 'podman pull --policy=always "$1" >/dev/null & p=$!; echo "--- podman pull (/proc/$p/cgroup) ---"; cat "/proc/$p/cgroup" 2>/dev/null || cat /proc/self/cgroup; wait "$p"' _ "$TEST_IMAGE"
 
   local conmon_pid pasta_pid
   conmon_pid="$(pgrep -u "$SPIKE_UID" -n conmon || true)"
