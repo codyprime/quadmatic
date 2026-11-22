@@ -290,10 +290,21 @@ doneFlags:
 				return nil, errors.New("nmcli connection down missing id")
 			}
 			conName := rest[2]
-			if _, ok := f.conns[conName]; !ok {
+			c, ok := f.conns[conName]
+			if !ok {
 				return []byte(fmt.Sprintf("Error: %s - no such connection profile.", conName)), fmt.Errorf("exit status 10")
 			}
+			if !f.active[conName] {
+				return []byte(fmt.Sprintf("Error: Connection '%s' is not an active connection.", conName)), fmt.Errorf("exit status 10")
+			}
 			delete(f.active, conName)
+			if c.props["connection.type"] == "vrf" {
+				for portName, portConn := range f.conns {
+					if portConn.props["connection.controller"] == conName {
+						delete(f.active, portName)
+					}
+				}
+			}
 			return nil, nil
 
 		case "delete":
@@ -1940,13 +1951,19 @@ func TestRestorePreservesPreApplyInactiveProfilesAndCustomPrio0Rule(t *testing.T
 		}
 
 		// Previously inactive qm-2002 and qmv-2002 must NEVER have `nmcli connection up` called on Restore,
-		// and MUST have `nmcli connection down` called because the failed apply activated them!
+		// and MUST have `nmcli connection down` called in deleteRank order (macvlan -> vrf -> vlan).
+		var downOrder []string
+		for _, c := range runner.calls {
+			if c.name == "nmcli" && len(c.args) >= 3 && c.args[0] == "connection" && c.args[1] == "down" {
+				downOrder = append(downOrder, c.args[2])
+			}
+		}
+		if !slices.Equal(downOrder, []string{"qm-2002", "qmv-2002"}) {
+			t.Fatalf("down order = %v, want [qm-2002 qmv-2002] (macvlan -> vrf); calls=%+v", downOrder, runner.calls)
+		}
 		for _, inactiveName := range []string{"qm-2002", "qmv-2002"} {
 			if findCallIndex(runner.calls, "nmcli", "connection", "up", inactiveName) >= 0 {
 				t.Fatalf("Restore must NOT call nmcli connection up on previously inactive %s", inactiveName)
-			}
-			if findCallIndex(runner.calls, "nmcli", "connection", "down", inactiveName) < 0 {
-				t.Fatalf("Restore must call nmcli connection down on newly-activated %s, calls=%+v", inactiveName, runner.calls)
 			}
 			if runner.active[inactiveName] {
 				t.Fatalf("expected %s to be inactive after Restore", inactiveName)
@@ -1960,6 +1977,98 @@ func TestRestorePreservesPreApplyInactiveProfilesAndCustomPrio0Rule(t *testing.T
 			if !runner.active[activeName] {
 				t.Fatalf("expected previously active %s to remain active after Restore", activeName)
 			}
+		}
+	})
+
+	t.Run("Restore downs vlan/vrf/macvlan in deleteRank order, handles re-added autoconnect, and ignores not-active exit 10", func(t *testing.T) {
+		runner := newFakeRunner()
+		r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+
+		host := &manifest.ResolvedHost{
+			Hostname: "services-02",
+			Components: []manifest.ResolvedComponent{
+				{
+					Name: "app-a",
+					User: "appa",
+					UID:  2001,
+					Network: &manifest.NetworkSpec{
+						VLAN: 30,
+						MAC:  "02:51:4d:00:07:d1",
+						DNS:  []string{"10.30.0.1"},
+					},
+				},
+			},
+		}
+		owned, _, _, err := r.ApplyProfiles(ctx, host, nil, time.Second)
+		if err != nil {
+			t.Fatalf("initial ApplyProfiles failed: %v", err)
+		}
+
+		// Mark all three profiles (vlan, vrf, macvlan) inactive before snapshot.
+		delete(runner.active, "qm-2001")
+		delete(runner.active, "qmv-2001")
+		delete(runner.active, "qm-vlan30")
+
+		snap, err := r.Snapshot(ctx, host, owned)
+		if err != nil {
+			t.Fatalf("Snapshot failed: %v", err)
+		}
+
+		// Simulate failed apply that activated qm-vlan30 and qmv-2001, and deleted qm-2001;
+		// then during Restore, `nmcli connection add` for qm-2001 (autoconnect=yes) auto-activates it.
+		delete(runner.conns, "qm-2001")
+		runner.active["qm-vlan30"] = true
+		runner.active["qmv-2001"] = true
+
+		runner.failHook = func(_ []byte, name string, args []string) ([]byte, error) {
+			if name == "nmcli" && len(args) >= 4 && args[0] == "connection" && args[1] == "add" && args[3] == "macvlan" {
+				// Simulate NM auto-activating newly re-added autoconnect=yes macvlan profile.
+				runner.active["qm-2001"] = true
+			}
+			return nil, nil
+		}
+
+		runner.calls = nil
+		if err := r.Restore(ctx, snap, owned); err != nil {
+			t.Fatalf("Restore failed: %v", err)
+		}
+
+		var downOrder []string
+		for _, c := range runner.calls {
+			if c.name == "nmcli" && len(c.args) >= 3 && c.args[0] == "connection" && c.args[1] == "down" {
+				downOrder = append(downOrder, c.args[2])
+			}
+		}
+		if !slices.Equal(downOrder, []string{"qm-2001", "qmv-2001", "qm-vlan30"}) {
+			t.Fatalf("down order = %v, want [qm-2001 qmv-2001 qm-vlan30]", downOrder)
+		}
+		for _, name := range []string{"qm-2001", "qmv-2001", "qm-vlan30"} {
+			if runner.active[name] {
+				t.Fatalf("expected %s inactive after Restore", name)
+			}
+		}
+
+		// Simulate `nmcli connection down` returning "not an active connection" (exit 10)
+		// (for example, if listActiveConnectionNames fails or profile raced down right before `down`).
+		runner.calls = nil
+		runner.failHook = func(_ []byte, name string, args []string) ([]byte, error) {
+			if name == "nmcli" && len(args) >= 3 && args[0] == "connection" && args[1] == "down" {
+				return []byte("Error: Connection is not an active connection."), fmt.Errorf("exit status 10")
+			}
+			return nil, nil
+		}
+		if err := r.Restore(ctx, snap, owned); err != nil {
+			t.Fatalf("expected Restore to treat not-an-active-connection (exit 10) on down as no-op, got: %v", err)
+		}
+		// Ensure `down` was actually invoked against the inactive snapshot (since all were inactive,
+		// listActiveConnectionNames returns empty unless forced; force active or test with failHook on down).
+		runner.active["qm-2001"] = true
+		runner.calls = nil
+		if err := r.Restore(ctx, snap, owned); err != nil {
+			t.Fatalf("expected Restore to treat not-an-active-connection (exit 10) on down as no-op when invoked, got: %v", err)
+		}
+		if findCallIndex(runner.calls, "nmcli", "connection", "down", "qm-2001") < 0 {
+			t.Fatalf("expected nmcli connection down qm-2001 to be invoked, calls=%+v", runner.calls)
 		}
 	})
 

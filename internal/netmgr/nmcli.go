@@ -571,21 +571,31 @@ func (r *Reconciler) Restore(ctx context.Context, snap *Snapshot, createdDuringA
 	}
 
 	type snapItem struct {
-		name  string
-		kind  string
-		props map[string]string
+		name      string
+		kind      string
+		props     map[string]string
+		wasActive bool
 	}
 	var restoreItems []snapItem
+	hasActiveRestoreItem := false
 	for name, raw := range snapProfiles {
 		if !isManagedConnectionName(name) {
 			continue
 		}
 		props := parseSnapshotProfile(name, raw)
 		kind := inferProfileKind(name, props)
+		wasActive := true
+		if snap != nil && snap.ActiveProfiles != nil {
+			wasActive = snap.ActiveProfiles[name]
+		}
+		if wasActive {
+			hasActiveRestoreItem = true
+		}
 		restoreItems = append(restoreItems, snapItem{
-			name:  name,
-			kind:  kind,
-			props: props,
+			name:      name,
+			kind:      kind,
+			props:     props,
+			wasActive: wasActive,
 		})
 	}
 	slices.SortFunc(restoreItems, func(a, b snapItem) int {
@@ -605,7 +615,7 @@ func (r *Reconciler) Restore(ctx context.Context, snap *Snapshot, createdDuringA
 	}
 
 	var activeConns map[string]bool
-	if len(restoreItems) > 0 {
+	if hasActiveRestoreItem {
 		var err error
 		activeConns, err = r.listActiveConnectionNames(ctx)
 		if err != nil {
@@ -613,13 +623,37 @@ func (r *Reconciler) Restore(ctx context.Context, snap *Snapshot, createdDuringA
 			activeConns = nil
 		}
 	}
+	var inactiveItems []snapItem
 	for _, item := range restoreItems {
-		wasActive := true
-		if snap != nil && snap.ActiveProfiles != nil {
-			wasActive = snap.ActiveProfiles[item.name]
-		}
-		if err := r.restoreProfile(ctx, item.name, item.kind, item.props, activeConns, wasActive, vrfIPv6[item.name]); err != nil {
+		if err := r.restoreProfile(ctx, item.name, item.kind, item.props, activeConns, item.wasActive, vrfIPv6[item.name]); err != nil {
 			errs = append(errs, err)
+		}
+		if !item.wasActive {
+			inactiveItems = append(inactiveItems, item)
+		}
+	}
+
+	if len(inactiveItems) > 0 {
+		// Deactivate previously-inactive profiles after property restoration in delete order
+		// (macvlan -> vrf -> vlan) against a refreshed active set so re-added autoconnect=yes
+		// profiles are caught and controller teardown never races port deactivation.
+		slices.SortFunc(inactiveItems, func(a, b snapItem) int {
+			if ra, rb := deleteRank(a.kind, a.name), deleteRank(b.kind, b.name); ra != rb {
+				return ra - rb
+			}
+			return strings.Compare(a.name, b.name)
+		})
+		postRestoreActive, err := r.listActiveConnectionNames(ctx)
+		if err != nil {
+			errs = append(errs, err)
+			postRestoreActive = nil
+		}
+		for _, item := range inactiveItems {
+			if postRestoreActive == nil || postRestoreActive[item.name] {
+				if err := r.downConnection(ctx, item.name); err != nil {
+					errs = append(errs, err)
+				}
+			}
 		}
 	}
 
@@ -1065,11 +1099,6 @@ func (r *Reconciler) restoreProfile(ctx context.Context, connName, kind string, 
 		return err
 	}
 	if !wasActive {
-		if postActiveConns[connName] {
-			if err := r.downConnection(ctx, connName); err != nil {
-				return err
-			}
-		}
 		return nil
 	}
 
@@ -1104,6 +1133,9 @@ func (r *Reconciler) upConnection(ctx context.Context, connName string) error {
 func (r *Reconciler) downConnection(ctx context.Context, connName string) error {
 	out, err := r.runner.Run(ctx, nil, "nmcli", "connection", "down", connName)
 	if err != nil {
+		if isNMNotActiveErr(out, err) {
+			return nil
+		}
 		return formatCmdErr(fmt.Sprintf("nmcli connection down %s", connName), out, err)
 	}
 	return nil
@@ -1736,6 +1768,15 @@ func parseDNSList(raw string) []string {
 		}
 	}
 	return out
+}
+
+func isNMNotActiveErr(out []byte, err error) bool {
+	if isNMNotFoundErr(out, err) {
+		return true
+	}
+	combined := strings.ToLower(string(out) + " " + err.Error())
+	return strings.Contains(combined, "not an active connection") ||
+		strings.Contains(combined, "not active")
 }
 
 func isNMNotFoundErr(out []byte, err error) bool {
