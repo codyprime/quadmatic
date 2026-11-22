@@ -1,0 +1,104 @@
+title: "quadmatic — 8-Stage Transactional Reconcile & Rollback Pipeline"
+direction: down
+style:
+  theme: gruvbox-dark
+  look: clean
+  font: sans
+  route: elbow
+  spacing: compact
+  compactness: 0.7
+
+nodes:
+  - id: lock
+    label: "0. Lock Acquisition\nLOCK_EX (daemon/apply) · LOCK_SH (remote dry-run)\nbounded timeout on state.json.lock"
+    color: gray
+    width: 330
+    rank: 0
+  - id: s1
+    label: "1. Fetch & Verify (internal/gitops)\nSSH pull · verify-commit (allowed-signers) · FF guard\ndry-run: temp bare repo + alternates"
+    color: orange
+    width: 330
+    rank: 1
+    group: preflight
+  - id: s23
+    label: "2-3. Load, Validate & Dry-Run Render\nusers.toml · hosts/<h>.toml · component.toml\ncollisions · containment · in-memory age · quadlet --dryrun"
+    color: yellow
+    width: 330
+    rank: 2
+    group: preflight
+  - id: s4
+    label: "4. Plan, Drift & Unit Health\ndisk + NM + ip rule drift · UnitState health\nformatPlanSummary (paths, secrets, units)"
+    color: cyan
+    width: 330
+    rank: 3
+    group: preflight
+  - id: dryexit
+    label: "--dry-run / No-Op Exit\nprints plan · updates metrics\nzero host mutations"
+    shape: ellipse
+    color: gray
+    width: 230
+    rank: 4
+    order: 2
+  - id: s5
+    label: "5. Users (pkg/users — non-destructive)\nuseradd / adopt · linger-before-subid · primary GID\natomic subid + selective per-user migrate rollback"
+    color: green
+    width: 330
+    rank: 4
+    order: 1
+    group: mutate
+  - id: s6
+    label: "6. Pre-Apply Rollback Snapshot\nfiles snapshot (prev + desired)\nnetmgr.Snapshot (owned + desired + ActiveProfiles)"
+    color: blue
+    width: 330
+    rank: 5
+    group: mutate
+  - id: s7a
+    label: "7a. Networks (internal/netmgr)\nVLAN · VRF + unreachable default · macvlan DHCP\nl3mdev-before-local · post-DHCP re-render & validate"
+    color: cyan
+    width: 330
+    rank: 6
+    group: stage7
+  - id: s7bc
+    label: "7b-7c. Files & Secrets\nos.Root atomic writes (quadlets + data)\nstdin-only podman secret create --replace"
+    color: teal
+    width: 330
+    rank: 7
+    group: stage7
+  - id: s7d
+    label: "7d. Prune, Reload & Verify\nstop removed (exit 5 ok) · prune owned · daemon-reload\nstart/restart changed · verify UnitState"
+    color: indigo
+    width: 330
+    rank: 8
+    group: stage7
+  - id: rollback
+    label: "Transactional Rollback (detached ctx)\n1. stop added & prior-inactive restarted units\n2. restore file snapshot · delete added files\n3. netmgr.Restore (profiles + active states)\n4. re-decrypt prior secrets via SecretSourcePaths\n5. daemon-reload + restart active restored units"
+    color: red
+    width: 310
+    rank: 7
+    order: 2
+  - id: s8
+    label: "8. Commit State & Metrics\natomic state.json (SHA, hashes, Scope, SecretSourcePaths)\nupdate Prometheus gauges & counters"
+    color: green
+    width: 330
+    rank: 9
+
+edges:
+  - {from: lock, to: s1}
+  - {from: s1, to: s23}
+  - {from: s23, to: s4}
+  - {from: s4, to: dryexit, label: "dry-run / clean", style: dashed, exit: left, enter: top}
+  - {from: s4, to: s5, label: "changes needed"}
+  - {from: s5, to: s6}
+  - {from: s6, to: s7a}
+  - {from: s7a, to: s7bc}
+  - {from: s7bc, to: s7d}
+  - {from: s7d, to: s8, label: "all verified"}
+  - {from: s7a, to: rollback, label: "on error", color: red, style: dashed, exit: right, enter: top}
+  - {from: s7bc, to: rollback, label: "on error", color: red, style: dashed, exit: right, enter: top}
+  - {from: s7d, to: rollback, label: "error / SIGTERM", color: red, style: dashed, exit: right, enter: top}
+  - {from: rollback, to: s8, label: "keep prev SHA", color: red, style: dashed, exit: bottom, enter: right}
+
+groups:
+  - {id: preflight, label: "Pre-Flight Validation (Zero Host Mutations)"}
+  - {id: mutate, label: "Host Reconciliation"}
+  - {id: stage7, label: "Stage 7: Transactional Mutation Window", group: mutate}

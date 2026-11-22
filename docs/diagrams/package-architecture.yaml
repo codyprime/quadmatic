@@ -1,0 +1,118 @@
+title: "quadmatic — Go Package Architecture & Dependency Graph"
+direction: right
+style:
+  theme: gruvbox-dark
+  look: clean
+  font: sans
+  route: elbow
+  spacing: normal
+  compactness: 0.5
+
+nodes:
+  - id: cmd
+    label: "cmd/quadmatic\nCLI & composition root\ndaemon · apply · validate\nSIGHUP · SIGINT/SIGTERM"
+    color: orange
+    rank: 0
+
+  - id: apply
+    label: "internal/apply\nEngine · 8-stage pipeline\nflock · os.Root files\nSystemctl · rollback"
+    color: blue
+    rank: 1
+    order: 1
+    group: core
+  - id: metrics
+    label: "internal/metrics\nPrometheus Registry\n9 spec metrics\nbound HTTP /metrics"
+    color: pink
+    rank: 1
+    order: 2
+    group: core
+  - id: config
+    label: "internal/config\n/etc/quadmatic/config.toml\nstrict TOML · bind IP guard"
+    color: yellow
+    rank: 2
+    order: 5
+    group: core
+
+  - id: quadlet
+    label: "internal/quadlet\nquadlet --dryrun runner\nunit parser · SourceCandidates\nSecret= extractor"
+    color: cyan
+    rank: 2
+    order: 1
+    group: subs
+  - id: netmgr
+    label: "internal/netmgr\nnmcli VLAN/VRF/macvlan\nIPv4/6 unreachable routes\nl3mdev-before-local · rollback"
+    color: teal
+    rank: 2
+    order: 2
+    group: subs
+  - id: secrets
+    label: "internal/secrets\npure-Go age + agessh\nin-memory decrypt\nstdin podman secret"
+    color: red
+    rank: 2
+    order: 3
+    group: subs
+  - id: gitops
+    label: "internal/gitops\nSSH fetch · verify-commit\nFF guard · safe tar export\ndry-run alternates repo"
+    color: orange
+    rank: 2
+    order: 4
+    group: subs
+
+  - id: manifest
+    label: "internal/manifest\nloader · merger · validator\ntemplate render · PastaArgs\nMAC validation"
+    color: yellow
+    rank: 3
+    order: 1
+    group: subs
+  - id: state
+    label: "internal/state\natomic state.json (0600)\nFileRecord.Scope\nSecretSourcePaths"
+    color: indigo
+    rank: 3
+    order: 2
+    group: subs
+
+  - id: pkgusers
+    label: "pkg/users (Standalone)\nusers.toml · pinned UIDs\nadoption (no usermod)\nsubid + selective rollback\nlinger · LookupPrimaryGID"
+    color: green
+    rank: 4
+    order: 1
+    group: public
+  - id: hashutil
+    label: "internal/hashutil\nSHA256Hex"
+    color: gray
+    size: s
+    rank: 4
+    order: 2
+
+edges:
+  - {from: cmd, to: apply, label: "runs"}
+  - {from: cmd, to: metrics, label: "serves"}
+  - {from: cmd, to: config, label: "loads"}
+  - {from: cmd, to: quadlet, label: "validate", style: dashed}
+  - {from: cmd, to: manifest, label: "validate", style: dashed}
+  - {from: cmd, to: pkgusers, label: "validate", style: dashed}
+
+  - {from: metrics, to: apply, label: "Result"}
+  - {from: metrics, to: config, label: "ValidateListenAddr"}
+  - {from: apply, to: config}
+  - {from: apply, to: gitops}
+  - {from: apply, to: manifest}
+  - {from: apply, to: quadlet}
+  - {from: apply, to: secrets}
+  - {from: apply, to: netmgr}
+  - {from: apply, to: state}
+  - {from: apply, to: pkgusers}
+  - {from: apply, to: hashutil, style: dashed}
+
+  - {from: gitops, to: config}
+  - {from: quadlet, to: manifest}
+  - {from: quadlet, to: hashutil, style: dashed}
+  - {from: netmgr, to: manifest, label: "MAC / host"}
+  - {from: netmgr, to: state, label: "ManagedNetworkRecord"}
+  - {from: manifest, to: pkgusers, label: "Registry"}
+  - {from: manifest, to: hashutil, style: dashed}
+
+groups:
+  - {id: core, label: "Orchestration, Config & Metrics"}
+  - {id: subs, label: "Internal Reconciler Subsystems"}
+  - {id: public, label: "Public (Zero internal/)"}

@@ -1,0 +1,117 @@
+title: "quadmatic — High-Level System Architecture"
+direction: right
+style:
+  theme: gruvbox-dark
+  look: clean
+  font: sans
+  route: elbow
+  spacing: normal
+  compactness: 0.45
+
+nodes:
+  # External inputs & control plane
+  - id: gitrepo
+    label: "Signed Git Repo\nusers.toml · hosts/<h>.toml\ncomponents/ · secrets/*.age"
+    color: orange
+    rank: 0
+    group: external
+  - id: prom
+    label: "VictoriaMetrics /\nPrometheus"
+    shape: ellipse
+    color: pink
+    rank: 0
+    group: external
+  - id: butane
+    label: "Butane / Ignition\n(First Boot Only)\n/var saved · sysctls · VRF rules\nkeys · /etc/quadmatic/*"
+    color: yellow
+    fill: hachure
+    rank: 0
+    group: external
+
+  # Host config & persistent state
+  - id: hostcfg
+    label: "/etc/quadmatic/\nconfig.toml · deploy_key\nknown_hosts · allowed-signers\nage.key (0600)"
+    shape: rect
+    color: yellow
+    fill: hachure
+    rank: 1
+    group: host
+  - id: agent
+    label: "quadmatic (root)\nstatic Go binary\ndaemon · apply · validate\n/metrics (bound mgmt IP)"
+    color: blue
+    rank: 2
+    group: host
+  - id: state
+    label: "/var/lib/quadmatic/\nstate.json · state.json.lock\nrepo/ (bare Git cache)"
+    shape: rect
+    color: indigo
+    fill: hachure
+    rank: 2
+    group: host
+
+  # Reconciled host subsystems
+  - id: users
+    label: "Linux Accounts\n/etc/passwd · /etc/subuid\n/var/home/<user> (0700)\nloginctl enable-linger"
+    color: green
+    rank: 3
+    group: subsystems
+  - id: nm
+    label: "NetworkManager + ip\nqm-vlan<V> · qmv-<uid>\nqm-<uid> (MAC + DHCP)\nl3mdev before local"
+    color: cyan
+    rank: 3
+    group: subsystems
+  - id: quadletdirs
+    label: "Quadlet Units (root-owned)\n/etc/containers/systemd/\nusers/<uid>/ (rootless)\n+ rootful exceptions"
+    shape: rect
+    color: teal
+    rank: 3
+    group: subsystems
+  - id: secstore
+    label: "Podman Secrets\nin-memory age decrypt\nstdin -> podman secret"
+    color: red
+    rank: 3
+    group: subsystems
+
+  # Running workloads
+  - id: rootless
+    label: "Rootless Services\nper-UID userns + pasta\nsystemd --user units\n(default)"
+    color: green
+    rank: 4
+    group: workloads
+  - id: rootful
+    label: "Rootful Exceptions\nUSB / L2 mDNS\nsystem systemd units"
+    color: orange
+    rank: 4
+    group: workloads
+  - id: autoupdate
+    label: "podman-auto-update\n.timer\n(image updates only)"
+    color: gray
+    stroke: dashed
+    size: s
+    rank: 4
+    group: workloads
+
+edges:
+  - {from: butane, to: hostcfg, label: "provisions once", style: dashed}
+  - {from: butane, to: agent, label: "installs + enables", style: dashed}
+  - {from: gitrepo, to: agent, label: "SSH pull + sig/FF verify"}
+  - {from: hostcfg, to: agent, label: "config & keys"}
+  - {from: prom, to: agent, label: "GET /metrics"}
+  - {from: agent, to: state, arrow: both, label: "flock + atomic state"}
+  - {from: agent, to: users, label: "useradd / linger"}
+  - {from: agent, to: nm, label: "nmcli / ip rule"}
+  - {from: agent, to: quadletdirs, label: "os.Root atomic write"}
+  - {from: agent, to: secstore, label: "systemd-run --pipe"}
+  - {from: users, to: rootless, label: "UID + /var/home"}
+  - {from: nm, to: rootless, label: "pasta -i qm-<uid>"}
+  - {from: quadletdirs, to: rootless, label: "user daemon-reload"}
+  - {from: secstore, to: rootless, label: "Secret="}
+  - {from: quadletdirs, to: rootful, label: "system daemon-reload"}
+  - {from: nm, to: rootful, label: "parent VLAN", style: dashed}
+  - {from: autoupdate, to: rootless, label: "registry pull", style: dashed}
+
+groups:
+  - {id: external, label: "Control Plane & Bootstrap"}
+  - {id: host, label: "Fedora CoreOS Host"}
+  - {id: subsystems, label: "Host OS Subsystems (Reconciled)", group: host}
+  - {id: workloads, label: "Managed Workloads", group: host}

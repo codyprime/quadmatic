@@ -1,0 +1,3988 @@
+{
+  "type": "littleboxes",
+  "version": 1,
+  "source": "littleboxes",
+  "name": "quadmatic — Go Package Architecture & Dependency Graph",
+  "diagram": {
+    "spec": {
+      "title": "quadmatic — Go Package Architecture \u0026 Dependency Graph",
+      "direction": "right",
+      "style": {
+        "font": "sans",
+        "look": "clean",
+        "route": "elbow",
+        "spacing": "normal",
+        "compactness": 0.5,
+        "theme": "gruvbox-dark"
+      },
+      "nodes": [
+        {
+          "id": "cmd",
+          "label": "cmd/quadmatic\nCLI \u0026 composition root\ndaemon · apply · validate\nSIGHUP · SIGINT/SIGTERM",
+          "color": "orange",
+          "rank": 0
+        },
+        {
+          "id": "apply",
+          "label": "internal/apply\nEngine · 8-stage pipeline\nflock · os.Root files\nSystemctl · rollback",
+          "color": "blue",
+          "rank": 1,
+          "order": 1,
+          "group": "core"
+        },
+        {
+          "id": "metrics",
+          "label": "internal/metrics\nPrometheus Registry\n9 spec metrics\nbound HTTP /metrics",
+          "color": "pink",
+          "rank": 1,
+          "order": 2,
+          "group": "core"
+        },
+        {
+          "id": "config",
+          "label": "internal/config\n/etc/quadmatic/config.toml\nstrict TOML · bind IP guard",
+          "color": "yellow",
+          "rank": 2,
+          "order": 5,
+          "group": "core"
+        },
+        {
+          "id": "quadlet",
+          "label": "internal/quadlet\nquadlet --dryrun runner\nunit parser · SourceCandidates\nSecret= extractor",
+          "color": "cyan",
+          "rank": 2,
+          "order": 1,
+          "group": "subs"
+        },
+        {
+          "id": "netmgr",
+          "label": "internal/netmgr\nnmcli VLAN/VRF/macvlan\nIPv4/6 unreachable routes\nl3mdev-before-local · rollback",
+          "color": "teal",
+          "rank": 2,
+          "order": 2,
+          "group": "subs"
+        },
+        {
+          "id": "secrets",
+          "label": "internal/secrets\npure-Go age + agessh\nin-memory decrypt\nstdin podman secret",
+          "color": "red",
+          "rank": 2,
+          "order": 3,
+          "group": "subs"
+        },
+        {
+          "id": "gitops",
+          "label": "internal/gitops\nSSH fetch · verify-commit\nFF guard · safe tar export\ndry-run alternates repo",
+          "color": "orange",
+          "rank": 2,
+          "order": 4,
+          "group": "subs"
+        },
+        {
+          "id": "manifest",
+          "label": "internal/manifest\nloader · merger · validator\ntemplate render · PastaArgs\nMAC validation",
+          "color": "yellow",
+          "rank": 3,
+          "order": 1,
+          "group": "subs"
+        },
+        {
+          "id": "state",
+          "label": "internal/state\natomic state.json (0600)\nFileRecord.Scope\nSecretSourcePaths",
+          "color": "indigo",
+          "rank": 3,
+          "order": 2,
+          "group": "subs"
+        },
+        {
+          "id": "pkgusers",
+          "label": "pkg/users (Standalone)\nusers.toml · pinned UIDs\nadoption (no usermod)\nsubid + selective rollback\nlinger · LookupPrimaryGID",
+          "color": "green",
+          "rank": 4,
+          "order": 1,
+          "group": "public"
+        },
+        {
+          "id": "hashutil",
+          "label": "internal/hashutil\nSHA256Hex",
+          "color": "gray",
+          "size": "s",
+          "rank": 4,
+          "order": 2
+        }
+      ],
+      "edges": [
+        {
+          "from": "cmd",
+          "to": "apply",
+          "label": "runs"
+        },
+        {
+          "from": "cmd",
+          "to": "metrics",
+          "label": "serves"
+        },
+        {
+          "from": "cmd",
+          "to": "config",
+          "label": "loads"
+        },
+        {
+          "from": "cmd",
+          "to": "quadlet",
+          "label": "validate",
+          "style": "dashed"
+        },
+        {
+          "from": "cmd",
+          "to": "manifest",
+          "label": "validate",
+          "style": "dashed"
+        },
+        {
+          "from": "cmd",
+          "to": "pkgusers",
+          "label": "validate",
+          "style": "dashed"
+        },
+        {
+          "from": "metrics",
+          "to": "apply",
+          "label": "Result"
+        },
+        {
+          "from": "metrics",
+          "to": "config",
+          "label": "ValidateListenAddr"
+        },
+        {
+          "from": "apply",
+          "to": "config"
+        },
+        {
+          "from": "apply",
+          "to": "gitops"
+        },
+        {
+          "from": "apply",
+          "to": "manifest"
+        },
+        {
+          "from": "apply",
+          "to": "quadlet"
+        },
+        {
+          "from": "apply",
+          "to": "secrets"
+        },
+        {
+          "from": "apply",
+          "to": "netmgr"
+        },
+        {
+          "from": "apply",
+          "to": "state"
+        },
+        {
+          "from": "apply",
+          "to": "pkgusers"
+        },
+        {
+          "from": "apply",
+          "to": "hashutil",
+          "style": "dashed"
+        },
+        {
+          "from": "gitops",
+          "to": "config"
+        },
+        {
+          "from": "quadlet",
+          "to": "manifest"
+        },
+        {
+          "from": "quadlet",
+          "to": "hashutil",
+          "style": "dashed"
+        },
+        {
+          "from": "netmgr",
+          "to": "manifest",
+          "label": "MAC / host"
+        },
+        {
+          "from": "netmgr",
+          "to": "state",
+          "label": "ManagedNetworkRecord"
+        },
+        {
+          "from": "manifest",
+          "to": "pkgusers",
+          "label": "Registry"
+        },
+        {
+          "from": "manifest",
+          "to": "hashutil",
+          "style": "dashed"
+        }
+      ],
+      "groups": [
+        {
+          "id": "core",
+          "label": "Orchestration, Config \u0026 Metrics"
+        },
+        {
+          "id": "subs",
+          "label": "Internal Reconciler Subsystems"
+        },
+        {
+          "id": "public",
+          "label": "Public (Zero internal/)"
+        }
+      ]
+    },
+    "version": 1,
+    "source": "title: \"quadmatic — Go Package Architecture \u0026 Dependency Graph\"\ndirection: right\nstyle:\n  theme: gruvbox-dark\n  look: clean\n  font: sans\n  route: elbow\n  spacing: normal\n  compactness: 0.5\n\nnodes:\n  - id: cmd\n    label: \"cmd/quadmatic\\nCLI \u0026 composition root\\ndaemon · apply · validate\\nSIGHUP · SIGINT/SIGTERM\"\n    color: orange\n    rank: 0\n\n  - id: apply\n    label: \"internal/apply\\nEngine · 8-stage pipeline\\nflock · os.Root files\\nSystemctl · rollback\"\n    color: blue\n    rank: 1\n    order: 1\n    group: core\n  - id: metrics\n    label: \"internal/metrics\\nPrometheus Registry\\n9 spec metrics\\nbound HTTP /metrics\"\n    color: pink\n    rank: 1\n    order: 2\n    group: core\n  - id: config\n    label: \"internal/config\\n/etc/quadmatic/config.toml\\nstrict TOML · bind IP guard\"\n    color: yellow\n    rank: 2\n    order: 5\n    group: core\n\n  - id: quadlet\n    label: \"internal/quadlet\\nquadlet --dryrun runner\\nunit parser · SourceCandidates\\nSecret= extractor\"\n    color: cyan\n    rank: 2\n    order: 1\n    group: subs\n  - id: netmgr\n    label: \"internal/netmgr\\nnmcli VLAN/VRF/macvlan\\nIPv4/6 unreachable routes\\nl3mdev-before-local · rollback\"\n    color: teal\n    rank: 2\n    order: 2\n    group: subs\n  - id: secrets\n    label: \"internal/secrets\\npure-Go age + agessh\\nin-memory decrypt\\nstdin podman secret\"\n    color: red\n    rank: 2\n    order: 3\n    group: subs\n  - id: gitops\n    label: \"internal/gitops\\nSSH fetch · verify-commit\\nFF guard · safe tar export\\ndry-run alternates repo\"\n    color: orange\n    rank: 2\n    order: 4\n    group: subs\n\n  - id: manifest\n    label: \"internal/manifest\\nloader · merger · validator\\ntemplate render · PastaArgs\\nMAC validation\"\n    color: yellow\n    rank: 3\n    order: 1\n    group: subs\n  - id: state\n    label: \"internal/state\\natomic state.json (0600)\\nFileRecord.Scope\\nSecretSourcePaths\"\n    color: indigo\n    rank: 3\n    order: 2\n    group: subs\n\n  - id: pkgusers\n    label: \"pkg/users (Standalone)\\nusers.toml · pinned UIDs\\nadoption (no usermod)\\nsubid + selective rollback\\nlinger · LookupPrimaryGID\"\n    color: green\n    rank: 4\n    order: 1\n    group: public\n  - id: hashutil\n    label: \"internal/hashutil\\nSHA256Hex\"\n    color: gray\n    size: s\n    rank: 4\n    order: 2\n\nedges:\n  - {from: cmd, to: apply, label: \"runs\"}\n  - {from: cmd, to: metrics, label: \"serves\"}\n  - {from: cmd, to: config, label: \"loads\"}\n  - {from: cmd, to: quadlet, label: \"validate\", style: dashed}\n  - {from: cmd, to: manifest, label: \"validate\", style: dashed}\n  - {from: cmd, to: pkgusers, label: \"validate\", style: dashed}\n\n  - {from: metrics, to: apply, label: \"Result\"}\n  - {from: metrics, to: config, label: \"ValidateListenAddr\"}\n  - {from: apply, to: config}\n  - {from: apply, to: gitops}\n  - {from: apply, to: manifest}\n  - {from: apply, to: quadlet}\n  - {from: apply, to: secrets}\n  - {from: apply, to: netmgr}\n  - {from: apply, to: state}\n  - {from: apply, to: pkgusers}\n  - {from: apply, to: hashutil, style: dashed}\n\n  - {from: gitops, to: config}\n  - {from: quadlet, to: manifest}\n  - {from: quadlet, to: hashutil, style: dashed}\n  - {from: netmgr, to: manifest, label: \"MAC / host\"}\n  - {from: netmgr, to: state, label: \"ManagedNetworkRecord\"}\n  - {from: manifest, to: pkgusers, label: \"Registry\"}\n  - {from: manifest, to: hashutil, style: dashed}\n\ngroups:\n  - {id: core, label: \"Orchestration, Config \u0026 Metrics\"}\n  - {id: subs, label: \"Internal Reconciler Subsystems\"}\n  - {id: public, label: \"Public (Zero internal/)\"}\n"
+  },
+  "theme": {
+    "id": "gruvbox-dark"
+  },
+  "drawing": {
+    "elements": [
+      {
+        "id": "group:core",
+        "type": "frame",
+        "x": 309,
+        "y": 909,
+        "width": 1643,
+        "height": 361,
+        "angle": 0,
+        "strokeColor": "#bbb",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1915540373,
+        "version": 1,
+        "versionNonce": 690670749,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "name": "Orchestration, Config \u0026 Metrics"
+      },
+      {
+        "id": "group:subs",
+        "type": "frame",
+        "x": 1039,
+        "y": 0,
+        "width": 873.5,
+        "height": 855,
+        "angle": 0,
+        "strokeColor": "#bbb",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1297517897,
+        "version": 1,
+        "versionNonce": 280952209,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "name": "Internal Reconciler Subsystems"
+      },
+      {
+        "id": "group:public",
+        "type": "frame",
+        "x": 2098,
+        "y": 248.6059742743637,
+        "width": 276,
+        "height": 314,
+        "angle": 0,
+        "strokeColor": "#bbb",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 420267131,
+        "version": 1,
+        "versionNonce": 148653799,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "name": "Public (Zero internal/)"
+      },
+      {
+        "id": "node:cmd",
+        "type": "rectangle",
+        "x": 0,
+        "y": 432.909090909091,
+        "width": 197,
+        "height": 203,
+        "angle": 0,
+        "strokeColor": "#e8590c",
+        "backgroundColor": "#ffd8a8",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 549713627,
+        "version": 1,
+        "versionNonce": 1949380167,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": [
+          {
+            "id": "node:cmd:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:cmd-\u003eapply",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:cmd-\u003emetrics",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:cmd-\u003econfig",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:cmd-\u003equadlet",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:cmd-\u003emanifest",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:cmd-\u003epkgusers",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            0,
+            432.909090909091,
+            197,
+            203
+          ],
+          "littleboxes": "diagram",
+          "rank": 0
+        }
+      },
+      {
+        "id": "node:cmd:label",
+        "type": "text",
+        "x": 17,
+        "y": 446.909090909091,
+        "width": 163,
+        "height": 175,
+        "angle": 0,
+        "strokeColor": "#e8590c",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1123661499,
+        "version": 1,
+        "versionNonce": 1705501863,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "cmd/quadmatic\nCLI \u0026 composition\nroot\ndaemon · apply ·\nvalidate\nSIGHUP ·\nSIGINT/SIGTERM",
+        "originalText": "cmd/quadmatic\nCLI \u0026 composition root\ndaemon · apply · validate\nSIGHUP · SIGINT/SIGTERM",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:cmd",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:apply",
+        "type": "rectangle",
+        "x": 676,
+        "y": 927,
+        "width": 208,
+        "height": 260,
+        "angle": 0,
+        "strokeColor": "#1971c2",
+        "backgroundColor": "#a5d8ff",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 543480075,
+        "version": 1,
+        "versionNonce": 64202743,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:core",
+        "boundElements": [
+          {
+            "id": "node:apply:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:cmd-\u003eapply",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:metrics-\u003eapply",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:apply-\u003econfig",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:apply-\u003egitops",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:apply-\u003emanifest",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:apply-\u003equadlet",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:apply-\u003esecrets",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:apply-\u003enetmgr",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:apply-\u003estate",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:apply-\u003epkgusers",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:apply-\u003ehashutil",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            676,
+            927,
+            208,
+            260
+          ],
+          "littleboxes": "diagram",
+          "rank": 2
+        }
+      },
+      {
+        "id": "node:apply:label",
+        "type": "text",
+        "x": 693,
+        "y": 994.5,
+        "width": 174,
+        "height": 125,
+        "angle": 0,
+        "strokeColor": "#1971c2",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1100770187,
+        "version": 1,
+        "versionNonce": 364553847,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:core",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "internal/apply\nEngine · 8-stage\npipeline\nflock · os.Root files\nSystemctl · rollback",
+        "originalText": "internal/apply\nEngine · 8-stage pipeline\nflock · os.Root files\nSystemctl · rollback",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:apply",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:metrics",
+        "type": "rectangle",
+        "x": 345,
+        "y": 978,
+        "width": 226,
+        "height": 128,
+        "angle": 0,
+        "strokeColor": "#c2255c",
+        "backgroundColor": "#fcc2d7",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1048025478,
+        "version": 1,
+        "versionNonce": 1977533894,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:core",
+        "boundElements": [
+          {
+            "id": "node:metrics:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:cmd-\u003emetrics",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:metrics-\u003eapply",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:metrics-\u003econfig",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            345,
+            978,
+            226,
+            128
+          ],
+          "littleboxes": "diagram",
+          "rank": 1
+        }
+      },
+      {
+        "id": "node:metrics:label",
+        "type": "text",
+        "x": 362,
+        "y": 992,
+        "width": 192,
+        "height": 100,
+        "angle": 0,
+        "strokeColor": "#c2255c",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 269015282,
+        "version": 1,
+        "versionNonce": 1693971538,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:core",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "internal/metrics\nPrometheus Registry\n9 spec metrics\nbound HTTP /metrics",
+        "originalText": "internal/metrics\nPrometheus Registry\n9 spec metrics\nbound HTTP /metrics",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:metrics",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:config",
+        "type": "rectangle",
+        "x": 1633,
+        "y": 1036.7020408163266,
+        "width": 283,
+        "height": 140,
+        "angle": 0,
+        "strokeColor": "#f08c00",
+        "backgroundColor": "#ffec99",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1465450391,
+        "version": 1,
+        "versionNonce": 1376341843,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:core",
+        "boundElements": [
+          {
+            "id": "node:config:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:cmd-\u003econfig",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:metrics-\u003econfig",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:apply-\u003econfig",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:gitops-\u003econfig",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            1633,
+            1036.7020408163266,
+            283,
+            140
+          ],
+          "littleboxes": "diagram",
+          "rank": 4
+        }
+      },
+      {
+        "id": "node:config:label",
+        "type": "text",
+        "x": 1650,
+        "y": 1069.2020408163266,
+        "width": 249,
+        "height": 75,
+        "angle": 0,
+        "strokeColor": "#f08c00",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 664556207,
+        "version": 1,
+        "versionNonce": 1729370491,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:core",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "internal/config\n/etc/quadmatic/config.toml\nstrict TOML · bind IP guard",
+        "originalText": "internal/config\n/etc/quadmatic/config.toml\nstrict TOML · bind IP guard",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:config",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:quadlet",
+        "type": "rectangle",
+        "x": 1090.5,
+        "y": 35,
+        "width": 197,
+        "height": 178,
+        "angle": 0,
+        "strokeColor": "#0c8599",
+        "backgroundColor": "#99e9f2",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1563734439,
+        "version": 1,
+        "versionNonce": 521055395,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:subs",
+        "boundElements": [
+          {
+            "id": "node:quadlet:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:cmd-\u003equadlet",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:apply-\u003equadlet",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:quadlet-\u003emanifest",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:quadlet-\u003ehashutil",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            1090.5,
+            35,
+            197,
+            178
+          ],
+          "littleboxes": "diagram",
+          "rank": 3
+        }
+      },
+      {
+        "id": "node:quadlet:label",
+        "type": "text",
+        "x": 1107.5,
+        "y": 49,
+        "width": 163,
+        "height": 150,
+        "angle": 0,
+        "strokeColor": "#0c8599",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1072743071,
+        "version": 1,
+        "versionNonce": 839280235,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:subs",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "internal/quadlet\nquadlet --dryrun\nrunner\nunit parser ·\nSourceCandidates\nSecret= extractor",
+        "originalText": "internal/quadlet\nquadlet --dryrun runner\nunit parser · SourceCandidates\nSecret= extractor",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:quadlet",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:netmgr",
+        "type": "rectangle",
+        "x": 1078.5,
+        "y": 243,
+        "width": 221,
+        "height": 203,
+        "angle": 0,
+        "strokeColor": "#099268",
+        "backgroundColor": "#96f2d7",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 2132344494,
+        "version": 1,
+        "versionNonce": 151247646,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:subs",
+        "boundElements": [
+          {
+            "id": "node:netmgr:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:apply-\u003enetmgr",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:netmgr-\u003emanifest",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:netmgr-\u003estate",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            1078.5,
+            243,
+            221,
+            203
+          ],
+          "littleboxes": "diagram",
+          "rank": 3
+        }
+      },
+      {
+        "id": "node:netmgr:label",
+        "type": "text",
+        "x": 1095.5,
+        "y": 257,
+        "width": 187,
+        "height": 175,
+        "angle": 0,
+        "strokeColor": "#099268",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1916949130,
+        "version": 1,
+        "versionNonce": 1266941850,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:subs",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "internal/netmgr\nnmcli\nVLAN/VRF/macvlan\nIPv4/6 unreachable\nroutes\nl3mdev-before-local ·\nrollback",
+        "originalText": "internal/netmgr\nnmcli VLAN/VRF/macvlan\nIPv4/6 unreachable routes\nl3mdev-before-local · rollback",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:netmgr",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:secrets",
+        "type": "rectangle",
+        "x": 1075,
+        "y": 476,
+        "width": 228,
+        "height": 128,
+        "angle": 0,
+        "strokeColor": "#e03131",
+        "backgroundColor": "#ffc9c9",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 458409462,
+        "version": 1,
+        "versionNonce": 1624967030,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:subs",
+        "boundElements": [
+          {
+            "id": "node:secrets:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:apply-\u003esecrets",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            1075,
+            476,
+            228,
+            128
+          ],
+          "littleboxes": "diagram",
+          "rank": 3
+        }
+      },
+      {
+        "id": "node:secrets:label",
+        "type": "text",
+        "x": 1092,
+        "y": 490,
+        "width": 194,
+        "height": 100,
+        "angle": 0,
+        "strokeColor": "#e03131",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 356437122,
+        "version": 1,
+        "versionNonce": 734214498,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:subs",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "internal/secrets\npure-Go age + agessh\nin-memory decrypt\nstdin podman secret",
+        "originalText": "internal/secrets\npure-Go age + agessh\nin-memory decrypt\nstdin podman secret",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:secrets",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:gitops",
+        "type": "rectangle",
+        "x": 1091.5,
+        "y": 634,
+        "width": 195,
+        "height": 203,
+        "angle": 0,
+        "strokeColor": "#e8590c",
+        "backgroundColor": "#ffd8a8",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 25342453,
+        "version": 1,
+        "versionNonce": 155675773,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:subs",
+        "boundElements": [
+          {
+            "id": "node:gitops:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:apply-\u003egitops",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:gitops-\u003econfig",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            1091.5,
+            634,
+            195,
+            203
+          ],
+          "littleboxes": "diagram",
+          "rank": 3
+        }
+      },
+      {
+        "id": "node:gitops:label",
+        "type": "text",
+        "x": 1108.5,
+        "y": 648,
+        "width": 161,
+        "height": 175,
+        "angle": 0,
+        "strokeColor": "#e8590c",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 89991845,
+        "version": 1,
+        "versionNonce": 1072098925,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:subs",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "internal/gitops\nSSH fetch ·\nverify-commit\nFF guard · safe tar\nexport\ndry-run alternates\nrepo",
+        "originalText": "internal/gitops\nSSH fetch · verify-commit\nFF guard · safe tar export\ndry-run alternates repo",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:gitops",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:manifest",
+        "type": "rectangle",
+        "x": 1680.5,
+        "y": 265.8209903528864,
+        "width": 188,
+        "height": 178,
+        "angle": 0,
+        "strokeColor": "#f08c00",
+        "backgroundColor": "#ffec99",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 2085782004,
+        "version": 1,
+        "versionNonce": 1163202952,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:subs",
+        "boundElements": [
+          {
+            "id": "node:manifest:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:cmd-\u003emanifest",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:apply-\u003emanifest",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:quadlet-\u003emanifest",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:netmgr-\u003emanifest",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:manifest-\u003epkgusers",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:manifest-\u003ehashutil",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            1680.5,
+            265.8209903528864,
+            188,
+            178
+          ],
+          "littleboxes": "diagram",
+          "rank": 4
+        }
+      },
+      {
+        "id": "node:manifest:label",
+        "type": "text",
+        "x": 1697.5,
+        "y": 279.8209903528864,
+        "width": 154,
+        "height": 150,
+        "angle": 0,
+        "strokeColor": "#f08c00",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 726671856,
+        "version": 1,
+        "versionNonce": 1848614852,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:subs",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "internal/manifest\nloader · merger ·\nvalidator\ntemplate render ·\nPastaArgs\nMAC validation",
+        "originalText": "internal/manifest\nloader · merger · validator\ntemplate render · PastaArgs\nMAC validation",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:manifest",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:state",
+        "type": "rectangle",
+        "x": 1672.5,
+        "y": 666.3333333333333,
+        "width": 204,
+        "height": 153,
+        "angle": 0,
+        "strokeColor": "#3b5bdb",
+        "backgroundColor": "#bac8ff",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 381335430,
+        "version": 1,
+        "versionNonce": 119075782,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:subs",
+        "boundElements": [
+          {
+            "id": "node:state:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:apply-\u003estate",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:netmgr-\u003estate",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            1672.5,
+            666.3333333333333,
+            204,
+            153
+          ],
+          "littleboxes": "diagram",
+          "rank": 4
+        }
+      },
+      {
+        "id": "node:state:label",
+        "type": "text",
+        "x": 1689.5,
+        "y": 680.3333333333333,
+        "width": 170,
+        "height": 125,
+        "angle": 0,
+        "strokeColor": "#3b5bdb",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 558040818,
+        "version": 1,
+        "versionNonce": 250655314,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:subs",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "internal/state\natomic state.json\n(0600)\nFileRecord.Scope\nSecretSourcePaths",
+        "originalText": "internal/state\natomic state.json (0600)\nFileRecord.Scope\nSecretSourcePaths",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:state",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:pkgusers",
+        "type": "rectangle",
+        "x": 2134,
+        "y": 266.6059742743637,
+        "width": 204,
+        "height": 278,
+        "angle": 0,
+        "strokeColor": "#2f9e44",
+        "backgroundColor": "#b2f2bb",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 934883271,
+        "version": 1,
+        "versionNonce": 1183756611,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:public",
+        "boundElements": [
+          {
+            "id": "node:pkgusers:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:cmd-\u003epkgusers",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:apply-\u003epkgusers",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:manifest-\u003epkgusers",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            2134,
+            266.6059742743637,
+            204,
+            278
+          ],
+          "littleboxes": "diagram",
+          "rank": 5
+        }
+      },
+      {
+        "id": "node:pkgusers:label",
+        "type": "text",
+        "x": 2151,
+        "y": 280.6059742743637,
+        "width": 170,
+        "height": 250,
+        "angle": 0,
+        "strokeColor": "#2f9e44",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1735444287,
+        "version": 1,
+        "versionNonce": 972854539,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:public",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "pkg/users\n(Standalone)\nusers.toml · pinned\nUIDs\nadoption (no\nusermod)\nsubid + selective\nrollback\nlinger ·\nLookupPrimaryGID",
+        "originalText": "pkg/users (Standalone)\nusers.toml · pinned UIDs\nadoption (no usermod)\nsubid + selective rollback\nlinger · LookupPrimaryGID",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:pkgusers",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:hashutil",
+        "type": "rectangle",
+        "x": 2160.5,
+        "y": 592.6059742743637,
+        "width": 151,
+        "height": 116,
+        "angle": 0,
+        "strokeColor": "#343a40",
+        "backgroundColor": "#e9ecef",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 953365181,
+        "version": 1,
+        "versionNonce": 1818994581,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": [
+          {
+            "id": "node:hashutil:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:apply-\u003ehashutil",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:quadlet-\u003ehashutil",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:manifest-\u003ehashutil",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            2160.5,
+            592.6059742743637,
+            151,
+            116
+          ],
+          "littleboxes": "diagram",
+          "rank": 5
+        }
+      },
+      {
+        "id": "node:hashutil:label",
+        "type": "text",
+        "x": 2177.5,
+        "y": 630.6059742743637,
+        "width": 117,
+        "height": 40,
+        "angle": 0,
+        "strokeColor": "#343a40",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1285663421,
+        "version": 1,
+        "versionNonce": 1040605077,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "internal/hashutil\nSHA256Hex",
+        "originalText": "internal/hashutil\nSHA256Hex",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:hashutil",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:cmd-\u003eapply:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "38811a01",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:apply",
+          "fixedPoint": [
+            -0.02403846153846154,
+            0.038461538461538464
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 359.090909090909,
+        "id": "edge:cmd-\u003eapply",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            84,
+            0
+          ],
+          [
+            84,
+            48
+          ],
+          [
+            256,
+            48
+          ],
+          [
+            421.5,
+            48
+          ],
+          [
+            421.5,
+            359.090909090909
+          ],
+          [
+            469,
+            359.090909090909
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1663056135,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:cmd",
+          "fixedPoint": [
+            1.0253807106598984,
+            0.7142857142857143
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 739208451,
+        "width": 469,
+        "x": 202,
+        "y": 577.909090909091
+      },
+      {
+        "id": "edge:cmd-\u003eapply:label",
+        "type": "text",
+        "x": 442,
+        "y": 615.909090909091,
+        "width": 32,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1290896127,
+        "version": 1,
+        "versionNonce": 607805771,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "runs",
+        "originalText": "runs",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:cmd-\u003eapply",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:cmd-\u003emetrics:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "d4d238c0",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:metrics",
+          "fixedPoint": [
+            -0.022123893805309734,
+            0.078125
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 386.090909090909,
+        "id": "edge:cmd-\u003emetrics",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            45.5,
+            0
+          ],
+          [
+            45.5,
+            386.090909090909
+          ],
+          [
+            76.875,
+            386.090909090909
+          ],
+          [
+            92.15625,
+            386.090909090909
+          ],
+          [
+            107.4375,
+            386.090909090909
+          ],
+          [
+            138,
+            386.090909090909
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1653797938,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:cmd",
+          "fixedPoint": [
+            1.0253807106598984,
+            0.8325123152709359
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 78343954,
+        "width": 138,
+        "x": 202,
+        "y": 601.909090909091
+      },
+      {
+        "id": "edge:cmd-\u003emetrics:label",
+        "type": "text",
+        "x": 255.375,
+        "y": 978,
+        "width": 47,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 294386662,
+        "version": 1,
+        "versionNonce": 540585638,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "serves",
+        "originalText": "serves",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:cmd-\u003emetrics",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:cmd-\u003econfig:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "9353ea96",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:config",
+          "fixedPoint": [
+            -0.0176678445229682,
+            0.9285714285714286
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 608.090909090909,
+        "id": "edge:cmd-\u003econfig",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            7,
+            0
+          ],
+          [
+            7,
+            608.090909090909
+          ],
+          [
+            578,
+            608.090909090909
+          ],
+          [
+            1298,
+            608.090909090909
+          ],
+          [
+            1298,
+            540.7929499072357
+          ],
+          [
+            1426,
+            540.7929499072357
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1717838019,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:cmd",
+          "fixedPoint": [
+            1.0253807106598984,
+            0.9507389162561576
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 423964447,
+        "width": 1426,
+        "x": 202,
+        "y": 625.909090909091
+      },
+      {
+        "id": "edge:cmd-\u003econfig:label",
+        "type": "text",
+        "x": 760.5,
+        "y": 1224,
+        "width": 39,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 161936243,
+        "version": 1,
+        "versionNonce": 2036412239,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "loads",
+        "originalText": "loads",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:cmd-\u003econfig",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:cmd-\u003equadlet:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "a64d1080",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:quadlet",
+          "fixedPoint": [
+            -0.025380710659898477,
+            0.8089887640449438
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 311.909090909091,
+        "id": "edge:cmd-\u003equadlet",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            84,
+            0
+          ],
+          [
+            84,
+            -48
+          ],
+          [
+            578,
+            -48
+          ],
+          [
+            690.1818181818181,
+            -48
+          ],
+          [
+            690.1818181818181,
+            -311.909090909091
+          ],
+          [
+            883.5,
+            -311.909090909091
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1385491235,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:cmd",
+          "fixedPoint": [
+            1.0253807106598984,
+            0.2857142857142857
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "dashed",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 823248383,
+        "width": 883.5,
+        "x": 202,
+        "y": 490.909090909091
+      },
+      {
+        "id": "edge:cmd-\u003equadlet:label",
+        "type": "text",
+        "x": 752,
+        "y": 432.909090909091,
+        "width": 56,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 602796883,
+        "version": 1,
+        "versionNonce": 1130149167,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "validate",
+        "originalText": "validate",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:cmd-\u003equadlet",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:cmd-\u003emanifest:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "85733a71",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:manifest",
+          "fixedPoint": [
+            -0.026595744680851064,
+            0.056179775280898875
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 447.909090909091,
+        "id": "edge:cmd-\u003emanifest",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            45.5,
+            0
+          ],
+          [
+            45.5,
+            -344.8272727272729
+          ],
+          [
+            421.5,
+            -344.8272727272729
+          ],
+          [
+            421.5,
+            -396.36818181818194
+          ],
+          [
+            578,
+            -396.36818181818194
+          ],
+          [
+            690.1818181818181,
+            -396.36818181818194
+          ],
+          [
+            690.1818181818181,
+            -447.909090909091
+          ],
+          [
+            1405,
+            -447.909090909091
+          ],
+          [
+            1405,
+            -191.0881005562046
+          ],
+          [
+            1473.5,
+            -191.0881005562046
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 212495976,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:cmd",
+          "fixedPoint": [
+            1.0253807106598984,
+            0.16748768472906403
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "dashed",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 1037335884,
+        "width": 1473.5,
+        "x": 202,
+        "y": 466.909090909091
+      },
+      {
+        "id": "edge:cmd-\u003emanifest:label",
+        "type": "text",
+        "x": 752,
+        "y": 60.540909090909054,
+        "width": 56,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 252827836,
+        "version": 1,
+        "versionNonce": 1051548032,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "validate",
+        "originalText": "validate",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:cmd-\u003emanifest",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:cmd-\u003epkgusers:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "1d8e7493",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:pkgusers",
+          "fixedPoint": [
+            -0.024509803921568627,
+            0.03597122302158273
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 454.909090909091,
+        "id": "edge:cmd-\u003epkgusers",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            7,
+            0
+          ],
+          [
+            7,
+            -454.909090909091
+          ],
+          [
+            470.70000000000005,
+            -454.909090909091
+          ],
+          [
+            1797.8,
+            -454.909090909091
+          ],
+          [
+            1797.8,
+            -166.3031166347273
+          ],
+          [
+            1927,
+            -166.3031166347273
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 590750475,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:cmd",
+          "fixedPoint": [
+            1.0253807106598984,
+            0.04926108374384237
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "dashed",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 1103798775,
+        "width": 1927,
+        "x": 202,
+        "y": 442.909090909091
+      },
+      {
+        "id": "edge:cmd-\u003epkgusers:label",
+        "type": "text",
+        "x": 644.7,
+        "y": -22,
+        "width": 56,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 2140366219,
+        "version": 1,
+        "versionNonce": 673828983,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "validate",
+        "originalText": "validate",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:cmd-\u003epkgusers",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:metrics-\u003eapply:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "025bdad4",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:apply",
+          "fixedPoint": [
+            -0.02403846153846154,
+            0.4423076923076923
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:core",
+        "groupIds": [],
+        "height": 0,
+        "id": "edge:metrics-\u003eapply",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            47.5,
+            0
+          ],
+          [
+            95,
+            0
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 939085724,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:metrics",
+          "fixedPoint": [
+            1.0221238938053097,
+            0.5
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 1817087328,
+        "width": 95,
+        "x": 576,
+        "y": 1042
+      },
+      {
+        "id": "edge:metrics-\u003eapply:label",
+        "type": "text",
+        "x": 601,
+        "y": 1032,
+        "width": 45,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 585490920,
+        "version": 1,
+        "versionNonce": 328750284,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:core",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "Result",
+        "originalText": "Result",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:metrics-\u003eapply",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:metrics-\u003econfig:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "64255ea5",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:config",
+          "fixedPoint": [
+            -0.0176678445229682,
+            0.7571428571428571
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:core",
+        "groupIds": [],
+        "height": 107,
+        "id": "edge:metrics-\u003econfig",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            47.5,
+            0
+          ],
+          [
+            47.5,
+            107
+          ],
+          [
+            613,
+            107
+          ],
+          [
+            822.5,
+            107
+          ],
+          [
+            822.5,
+            46.702040816326644
+          ],
+          [
+            1052,
+            46.702040816326644
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 628399446,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:metrics",
+          "fixedPoint": [
+            1.0221238938053097,
+            0.921875
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 1089429974,
+        "width": 1052,
+        "x": 576,
+        "y": 1096
+      },
+      {
+        "id": "edge:metrics-\u003econfig:label",
+        "type": "text",
+        "x": 1121.5,
+        "y": 1193,
+        "width": 135,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1544029410,
+        "version": 1,
+        "versionNonce": 2046086722,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:core",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "ValidateListenAddr",
+        "originalText": "ValidateListenAddr",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:metrics-\u003econfig",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": null,
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "f814cddb",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:config",
+          "fixedPoint": [
+            -0.0176678445229682,
+            0.4142857142857143
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:core",
+        "groupIds": [],
+        "height": 34.297959183673356,
+        "id": "edge:apply-\u003econfig",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            130.8181818181813,
+            0
+          ],
+          [
+            130.8181818181813,
+            -34.297959183673356
+          ],
+          [
+            739,
+            -34.297959183673356
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 2132489299,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:apply",
+          "fixedPoint": [
+            1.0240384615384615,
+            0.7769230769230769
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 823651887,
+        "width": 739,
+        "x": 889,
+        "y": 1129
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": null,
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "d215d9ac",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:gitops",
+          "fixedPoint": [
+            -0.02564102564102564,
+            0.9507389162561576
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 182,
+        "id": "edge:apply-\u003egitops",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            59.90909090909065,
+            0
+          ],
+          [
+            59.90909090909065,
+            -182
+          ],
+          [
+            197.5,
+            -182
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1610180521,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:apply",
+          "fixedPoint": [
+            1.0240384615384615,
+            0.3153846153846154
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 1093172337,
+        "width": 197.5,
+        "x": 889,
+        "y": 1009
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": null,
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "f3bfdad3",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:manifest",
+          "fixedPoint": [
+            -0.026595744680851064,
+            0.8886461216129978
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 609,
+        "id": "edge:apply-\u003emanifest",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            74.09090909090878,
+            0
+          ],
+          [
+            74.09090909090878,
+            -105
+          ],
+          [
+            664.5,
+            -105
+          ],
+          [
+            664.5,
+            -609
+          ],
+          [
+            786.5,
+            -609
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1460302648,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:apply",
+          "fixedPoint": [
+            1.0240384615384615,
+            0.4076923076923077
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 572260700,
+        "width": 786.5,
+        "x": 889,
+        "y": 1033
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": null,
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "16c27cb4",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:quadlet",
+          "fixedPoint": [
+            -0.025380710659898477,
+            0.9438202247191011
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 734,
+        "id": "edge:apply-\u003equadlet",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            17.36363636363626,
+            0
+          ],
+          [
+            17.36363636363626,
+            -734
+          ],
+          [
+            196.5,
+            -734
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 243932723,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:apply",
+          "fixedPoint": [
+            1.0240384615384615,
+            0.038461538461538464
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 1282370959,
+        "width": 196.5,
+        "x": 889,
+        "y": 937
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": null,
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "9ab51ea0",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:secrets",
+          "fixedPoint": [
+            -0.021929824561403508,
+            0.921875
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 391,
+        "id": "edge:apply-\u003esecrets",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            45.72727272727252,
+            0
+          ],
+          [
+            45.72727272727252,
+            -391
+          ],
+          [
+            181,
+            -391
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 609486994,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:apply",
+          "fixedPoint": [
+            1.0240384615384615,
+            0.2230769230769231
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 1286263410,
+        "width": 181,
+        "x": 889,
+        "y": 985
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": null,
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "2393d911",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:netmgr",
+          "fixedPoint": [
+            -0.02262443438914027,
+            0.9256605463502008
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 530.0909090909092,
+        "id": "edge:apply-\u003enetmgr",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            31.54545454545439,
+            0
+          ],
+          [
+            31.54545454545439,
+            -530.0909090909092
+          ],
+          [
+            184.5,
+            -530.0909090909092
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1917291586,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:apply",
+          "fixedPoint": [
+            1.0240384615384615,
+            0.13076923076923078
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 1957165986,
+        "width": 184.5,
+        "x": 889,
+        "y": 961
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": null,
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "2e36c009",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:state",
+          "fixedPoint": [
+            -0.024509803921568627,
+            0.934640522875817
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 247.66666666666674,
+        "id": "edge:apply-\u003estate",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            88.27272727272691,
+            0
+          ],
+          [
+            88.27272727272691,
+            -115
+          ],
+          [
+            718,
+            -115
+          ],
+          [
+            718,
+            -247.66666666666674
+          ],
+          [
+            778.5,
+            -247.66666666666674
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1984065154,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:apply",
+          "fixedPoint": [
+            1.0240384615384615,
+            0.5
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 1402588002,
+        "width": 778.5,
+        "x": 889,
+        "y": 1057
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": null,
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "56ce3367",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:pkgusers",
+          "fixedPoint": [
+            -0.024509803921568627,
+            0.9640287769784173
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 546.3940257256363,
+        "id": "edge:apply-\u003epkgusers",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            102.45454545454504,
+            0
+          ],
+          [
+            102.45454545454504,
+            -125
+          ],
+          [
+            734,
+            -125
+          ],
+          [
+            734,
+            -165
+          ],
+          [
+            1170.4,
+            -165
+          ],
+          [
+            1170.4,
+            -546.3940257256363
+          ],
+          [
+            1240,
+            -546.3940257256363
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 176017275,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:apply",
+          "fixedPoint": [
+            1.0240384615384615,
+            0.5923076923076923
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 409795047,
+        "width": 1240,
+        "x": 889,
+        "y": 1081
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": null,
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "6c19f958",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:hashutil",
+          "fixedPoint": [
+            -0.033112582781456956,
+            0.9137931034482759
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 406.3940257256363,
+        "id": "edge:apply-\u003ehashutil",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            116.63636363636317,
+            0
+          ],
+          [
+            116.63636363636317,
+            -135
+          ],
+          [
+            1187.2000000000003,
+            -135
+          ],
+          [
+            1187.2000000000003,
+            -406.3940257256363
+          ],
+          [
+            1266.5,
+            -406.3940257256363
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 408343233,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:apply",
+          "fixedPoint": [
+            1.0240384615384615,
+            0.6846153846153846
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "dashed",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 1602828889,
+        "width": 1266.5,
+        "x": 889,
+        "y": 1105
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": null,
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "e5ba1281",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:config",
+          "fixedPoint": [
+            -0.0176678445229682,
+            0.07142857142857142
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 219.70204081632664,
+        "id": "edge:gitops-\u003econfig",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            107,
+            0
+          ],
+          [
+            107,
+            219.70204081632664
+          ],
+          [
+            336.5,
+            219.70204081632664
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 242685339,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:gitops",
+          "fixedPoint": [
+            1.0256410256410255,
+            0.9507389162561576
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 662406791,
+        "width": 336.5,
+        "x": 1291.5,
+        "y": 827
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": null,
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "b02bf726",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:manifest",
+          "fixedPoint": [
+            -0.026595744680851064,
+            0.19101123595505617
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:subs",
+        "groupIds": [],
+        "height": 120.82099035288638,
+        "id": "edge:quadlet-\u003emanifest",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            261,
+            0
+          ],
+          [
+            261,
+            120.82099035288638
+          ],
+          [
+            383,
+            120.82099035288638
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 283961676,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:quadlet",
+          "fixedPoint": [
+            1.0253807106598984,
+            0.8089887640449438
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 1467584848,
+        "width": 383,
+        "x": 1292.5,
+        "y": 179
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": null,
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "68314081",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:hashutil",
+          "fixedPoint": [
+            -0.033112582781456956,
+            0.29310344827586204
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 423.6059742743637,
+        "id": "edge:quadlet-\u003ehashutil",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            207.5,
+            0
+          ],
+          [
+            207.5,
+            399.6059742743637
+          ],
+          [
+            707.3,
+            399.6059742743637
+          ],
+          [
+            707.3,
+            423.6059742743637
+          ],
+          [
+            863,
+            423.6059742743637
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 944534789,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:quadlet",
+          "fixedPoint": [
+            1.0253807106598984,
+            0.9438202247191011
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "dashed",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 1974716109,
+        "width": 863,
+        "x": 1292.5,
+        "y": 203
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:netmgr-\u003emanifest:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "27437508",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:manifest",
+          "fixedPoint": [
+            -0.026595744680851064,
+            0.5
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:subs",
+        "groupIds": [],
+        "height": 0,
+        "id": "edge:netmgr-\u003emanifest",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            112.5,
+            0
+          ],
+          [
+            371,
+            0
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1634203611,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:netmgr",
+          "fixedPoint": [
+            1.0226244343891402,
+            0.5508423170092925
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 1705846599,
+        "width": 371,
+        "x": 1304.5,
+        "y": 354.8209903528864
+      },
+      {
+        "id": "edge:netmgr-\u003emanifest:label",
+        "type": "text",
+        "x": 1376.5,
+        "y": 344.8209903528864,
+        "width": 81,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 880127931,
+        "version": 1,
+        "versionNonce": 293344679,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:subs",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "MAC / host",
+        "originalText": "MAC / host",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:netmgr-\u003emanifest",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:netmgr-\u003estate:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "868f6e40",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:state",
+          "fixedPoint": [
+            -0.024509803921568627,
+            0.06535947712418301
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:subs",
+        "groupIds": [],
+        "height": 240.33333333333326,
+        "id": "edge:netmgr-\u003estate",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            94,
+            0
+          ],
+          [
+            94,
+            120.16666666666652
+          ],
+          [
+            94,
+            240.33333333333326
+          ],
+          [
+            363,
+            240.33333333333326
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1852768863,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:netmgr",
+          "fixedPoint": [
+            1.0226244343891402,
+            0.9507389162561576
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 1555748779,
+        "width": 363,
+        "x": 1304.5,
+        "y": 436
+      },
+      {
+        "id": "edge:netmgr-\u003estate:label",
+        "type": "text",
+        "x": 1310,
+        "y": 546.1666666666665,
+        "width": 177,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 481440295,
+        "version": 1,
+        "versionNonce": 563882275,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:subs",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "ManagedNetworkRecord",
+        "originalText": "ManagedNetworkRecord",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:netmgr-\u003estate",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:manifest-\u003epkgusers:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "63bbd715",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:pkgusers",
+          "fixedPoint": [
+            -0.024509803921568627,
+            0.31873204330669547
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 0,
+        "id": "edge:manifest-\u003epkgusers",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            126.29999999999995,
+            0
+          ],
+          [
+            255.5,
+            0
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 53660550,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:manifest",
+          "fixedPoint": [
+            1.0265957446808511,
+            0.5022050110153857
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 120612806,
+        "width": 255.5,
+        "x": 1873.5,
+        "y": 355.21348231362504
+      },
+      {
+        "id": "edge:manifest-\u003epkgusers:label",
+        "type": "text",
+        "x": 1970.8,
+        "y": 345.21348231362504,
+        "width": 58,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 559577842,
+        "version": 1,
+        "versionNonce": 1252820562,
+        "updated": 1795388611495,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "Registry",
+        "originalText": "Registry",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:manifest-\u003epkgusers",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": null,
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "07fa44c2",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:hashutil",
+          "fixedPoint": [
+            -0.033112582781456956,
+            0.08620689655172414
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 168.7849839214773,
+        "id": "edge:manifest-\u003ehashutil",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            169.0999999999999,
+            0
+          ],
+          [
+            169.0999999999999,
+            168.7849839214773
+          ],
+          [
+            282,
+            168.7849839214773
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 282270128,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:manifest",
+          "fixedPoint": [
+            1.0265957446808511,
+            0.9438202247191011
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "dashed",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388611495,
+        "version": 1,
+        "versionNonce": 448583940,
+        "width": 282,
+        "x": 1873.5,
+        "y": 433.8209903528864
+      }
+    ],
+    "appState": {
+      "gridModeEnabled": false,
+      "gridSize": 20,
+      "viewBackgroundColor": "#ffffff"
+    }
+  }
+}

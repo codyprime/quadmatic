@@ -1,0 +1,2591 @@
+{
+  "type": "littleboxes",
+  "version": 1,
+  "source": "littleboxes",
+  "name": "quadmatic — Rootless Per-Quadlet VLAN + VRF + pasta Isolation (Option 2B)",
+  "diagram": {
+    "spec": {
+      "title": "quadmatic — Rootless Per-Quadlet VLAN + VRF + pasta Isolation (Option 2B)",
+      "direction": "right",
+      "style": {
+        "font": "sans",
+        "look": "clean",
+        "route": "elbow",
+        "spacing": "normal",
+        "compactness": 0.45,
+        "theme": "gruvbox-dark"
+      },
+      "nodes": [
+        {
+          "id": "trunk",
+          "label": "Switch Trunk Port\n802.1Q Tagged VLANs\n+ Router / DHCP Server",
+          "shape": "ellipse",
+          "color": "orange",
+          "rank": 0
+        },
+        {
+          "id": "nic",
+          "label": "Host Trunk NIC\ne.g. enp3s0\n(VLAN-agnostic host)",
+          "color": "yellow",
+          "rank": 1,
+          "group": "host"
+        },
+        {
+          "id": "mgmtvlan",
+          "label": "Management VLAN\ne.g. enp3s0.3 (Butane)\nDefault VRF (table main)",
+          "color": "blue",
+          "rank": 2,
+          "group": "defaultvrf"
+        },
+        {
+          "id": "hostdaemons",
+          "label": "Host Daemons\nsshd · quadmatic /metrics\npodman pull / auto-update",
+          "color": "blue",
+          "rank": 3,
+          "group": "defaultvrf"
+        },
+        {
+          "id": "svcvlan",
+          "label": "Service VLAN\nqm-vlan\u003cV\u003e (IP-less)\nor reused unmanaged parent",
+          "color": "cyan",
+          "rank": 2,
+          "group": "vrf"
+        },
+        {
+          "id": "macvlan",
+          "label": "macvlan qm-\u003cuid\u003e\nmode: private · pinned MAC\nDHCP static IP · ignore-auto-dns",
+          "color": "teal",
+          "rank": 3,
+          "group": "vrf"
+        },
+        {
+          "id": "vrfdev",
+          "label": "VRF qmv-\u003cuid\u003e\ntable 10000+\u003cuid\u003e\nunreachable default metric 8192\n(IPv4 + optional IPv6)",
+          "color": "violet",
+          "rank": 3,
+          "group": "vrf"
+        },
+        {
+          "id": "iprule",
+          "label": "Kernel Policy Routing\n1000: lookup [l3mdev-table]\n32765: lookup local\n32766: lookup main\ntcp/udp_l3mdev_accept = 0",
+          "shape": "rect",
+          "color": "red",
+          "fill": "hachure",
+          "width": 280,
+          "rank": 4,
+          "group": "host"
+        },
+        {
+          "id": "pasta",
+          "label": "pasta (unprivileged UID)\n--no-map-gw · --map-host-loopback,none\n-i qm-\u003cuid\u003e · --outbound-if4 qm-\u003cuid\u003e\n-t %qm-\u003cuid\u003e/\u003cports\u003e",
+          "color": "green",
+          "rank": 4,
+          "group": "container"
+        },
+        {
+          "id": "workload",
+          "label": "Rootless Container\nisolated userns + netns\nexplicit VLAN DNS=\nno host netns access",
+          "color": "green",
+          "rank": 5,
+          "group": "container"
+        },
+        {
+          "id": "rootfulnet",
+          "label": "Rootful Escape Hatch\nDriver=macvlan .network\n(L2 mDNS / Home Assistant)",
+          "color": "orange",
+          "stroke": "dashed",
+          "size": "s",
+          "rank": 3,
+          "group": "host"
+        }
+      ],
+      "edges": [
+        {
+          "from": "trunk",
+          "to": "nic",
+          "label": "802.1Q trunk",
+          "arrow": "both"
+        },
+        {
+          "from": "nic",
+          "to": "mgmtvlan",
+          "label": "VLAN 3"
+        },
+        {
+          "from": "mgmtvlan",
+          "to": "hostdaemons",
+          "arrow": "both"
+        },
+        {
+          "from": "nic",
+          "to": "svcvlan",
+          "label": "VLAN \u003cV\u003e"
+        },
+        {
+          "from": "svcvlan",
+          "to": "macvlan",
+          "label": "parent"
+        },
+        {
+          "from": "macvlan",
+          "to": "vrfdev",
+          "label": "enslaved to"
+        },
+        {
+          "from": "vrfdev",
+          "to": "iprule",
+          "label": "hits rule 1000 first",
+          "style": "dashed"
+        },
+        {
+          "from": "hostdaemons",
+          "to": "iprule",
+          "label": "skips 1000 -\u003e local/main",
+          "style": "dashed"
+        },
+        {
+          "from": "macvlan",
+          "to": "pasta",
+          "label": "SO_BINDTODEVICE",
+          "arrow": "both"
+        },
+        {
+          "from": "pasta",
+          "to": "workload",
+          "label": "L4 tap (TCP/UDP/ICMP)",
+          "arrow": "both"
+        },
+        {
+          "from": "svcvlan",
+          "to": "rootfulnet",
+          "label": "ParentInterface",
+          "style": "dashed"
+        }
+      ],
+      "groups": [
+        {
+          "id": "host",
+          "label": "Fedora CoreOS Host"
+        },
+        {
+          "id": "defaultvrf",
+          "label": "Default VRF (Management)",
+          "group": "host"
+        },
+        {
+          "id": "vrf",
+          "label": "Per-Component VRF Isolation (Managed by netmgr)",
+          "group": "host"
+        },
+        {
+          "id": "container",
+          "label": "Rootless Service Namespace (UID \u003cuid\u003e)",
+          "group": "host"
+        }
+      ]
+    },
+    "version": 1,
+    "source": "title: \"quadmatic — Rootless Per-Quadlet VLAN + VRF + pasta Isolation (Option 2B)\"\ndirection: right\nstyle:\n  theme: gruvbox-dark\n  look: clean\n  font: sans\n  route: elbow\n  spacing: normal\n  compactness: 0.45\n\nnodes:\n  # Physical network\n  - id: trunk\n    label: \"Switch Trunk Port\\n802.1Q Tagged VLANs\\n+ Router / DHCP Server\"\n    shape: ellipse\n    color: orange\n    rank: 0\n  - id: nic\n    label: \"Host Trunk NIC\\ne.g. enp3s0\\n(VLAN-agnostic host)\"\n    color: yellow\n    rank: 1\n    group: host\n\n  # Management plane (Default VRF)\n  - id: mgmtvlan\n    label: \"Management VLAN\\ne.g. enp3s0.3 (Butane)\\nDefault VRF (table main)\"\n    color: blue\n    rank: 2\n    group: defaultvrf\n  - id: hostdaemons\n    label: \"Host Daemons\\nsshd · quadmatic /metrics\\npodman pull / auto-update\"\n    color: blue\n    rank: 3\n    group: defaultvrf\n\n  # Isolated Service VLAN + VRF\n  - id: svcvlan\n    label: \"Service VLAN\\nqm-vlan\u003cV\u003e (IP-less)\\nor reused unmanaged parent\"\n    color: cyan\n    rank: 2\n    group: vrf\n  - id: macvlan\n    label: \"macvlan qm-\u003cuid\u003e\\nmode: private · pinned MAC\\nDHCP static IP · ignore-auto-dns\"\n    color: teal\n    rank: 3\n    group: vrf\n  - id: vrfdev\n    label: \"VRF qmv-\u003cuid\u003e\\ntable 10000+\u003cuid\u003e\\nunreachable default metric 8192\\n(IPv4 + optional IPv6)\"\n    color: violet\n    rank: 3\n    group: vrf\n\n  # Kernel policy routing invariant\n  - id: iprule\n    label: \"Kernel Policy Routing\\n1000: lookup [l3mdev-table]\\n32765: lookup local\\n32766: lookup main\\ntcp/udp_l3mdev_accept = 0\"\n    shape: rect\n    color: red\n    fill: hachure\n    width: 280\n    rank: 4\n    group: host\n\n  # Rootless container\n  - id: pasta\n    label: \"pasta (unprivileged UID)\\n--no-map-gw · --map-host-loopback,none\\n-i qm-\u003cuid\u003e · --outbound-if4 qm-\u003cuid\u003e\\n-t %qm-\u003cuid\u003e/\u003cports\u003e\"\n    color: green\n    rank: 4\n    group: container\n  - id: workload\n    label: \"Rootless Container\\nisolated userns + netns\\nexplicit VLAN DNS=\\nno host netns access\"\n    color: green\n    rank: 5\n    group: container\n\n  # Rootful escape hatch\n  - id: rootfulnet\n    label: \"Rootful Escape Hatch\\nDriver=macvlan .network\\n(L2 mDNS / Home Assistant)\"\n    color: orange\n    stroke: dashed\n    size: s\n    rank: 3\n    group: host\n\nedges:\n  - {from: trunk, to: nic, label: \"802.1Q trunk\", arrow: both}\n  - {from: nic, to: mgmtvlan, label: \"VLAN 3\"}\n  - {from: mgmtvlan, to: hostdaemons, arrow: both}\n  - {from: nic, to: svcvlan, label: \"VLAN \u003cV\u003e\"}\n  - {from: svcvlan, to: macvlan, label: \"parent\"}\n  - {from: macvlan, to: vrfdev, label: \"enslaved to\"}\n  - {from: vrfdev, to: iprule, label: \"hits rule 1000 first\", style: dashed}\n  - {from: hostdaemons, to: iprule, label: \"skips 1000 -\u003e local/main\", style: dashed}\n  - {from: macvlan, to: pasta, label: \"SO_BINDTODEVICE\", arrow: both}\n  - {from: pasta, to: workload, label: \"L4 tap (TCP/UDP/ICMP)\", arrow: both}\n  - {from: svcvlan, to: rootfulnet, label: \"ParentInterface\", style: dashed}\n\ngroups:\n  - {id: host, label: \"Fedora CoreOS Host\"}\n  - {id: defaultvrf, label: \"Default VRF (Management)\", group: host}\n  - {id: vrf, label: \"Per-Component VRF Isolation (Managed by netmgr)\", group: host}\n  - {id: container, label: \"Rootless Service Namespace (UID \u003cuid\u003e)\", group: host}\n"
+  },
+  "theme": {
+    "id": "gruvbox-dark"
+  },
+  "drawing": {
+    "elements": [
+      {
+        "id": "group:host",
+        "type": "frame",
+        "x": 423.6603748255328,
+        "y": 0,
+        "width": 2187.2,
+        "height": 854.3610085227274,
+        "angle": 0,
+        "strokeColor": "#bbb",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1411109836,
+        "version": 1,
+        "versionNonce": 1356670928,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "name": "Fedora CoreOS Host"
+      },
+      {
+        "id": "group:defaultvrf",
+        "type": "frame",
+        "x": 828.3603748255327,
+        "y": 128.3610085227274,
+        "width": 674.1000000000004,
+        "height": 190.8,
+        "angle": 0,
+        "strokeColor": "#bbb",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 689337303,
+        "version": 1,
+        "versionNonce": 10868499,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:host",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "name": "Default VRF (Management)"
+      },
+      {
+        "id": "group:vrf",
+        "type": "frame",
+        "x": 817.8603748255327,
+        "y": 374.1610085227274,
+        "width": 1215.8000000000002,
+        "height": 190.8,
+        "angle": 0,
+        "strokeColor": "#bbb",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1655248548,
+        "version": 1,
+        "versionNonce": 320458936,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:host",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "name": "Per-Component VRF Isolation (Managed by netmgr)"
+      },
+      {
+        "id": "group:container",
+        "type": "frame",
+        "x": 1715.0603748255326,
+        "y": 619.9610085227274,
+        "width": 859.4000000000001,
+        "height": 215.8,
+        "angle": 0,
+        "strokeColor": "#bbb",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1808198369,
+        "version": 1,
+        "versionNonce": 420158841,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:host",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "name": "Rootless Service Namespace (UID \u003cuid\u003e)"
+      },
+      {
+        "id": "node:trunk",
+        "type": "ellipse",
+        "x": 0,
+        "y": 244.29940693247374,
+        "width": 272.66037482553276,
+        "height": 217.22320318050737,
+        "angle": 0,
+        "strokeColor": "#e8590c",
+        "backgroundColor": "#ffd8a8",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 940529229,
+        "version": 1,
+        "versionNonce": 724062949,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": [
+          {
+            "id": "node:trunk:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:trunk-\u003enic",
+            "type": "arrow"
+          }
+        ],
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            0,
+            244.29940693247374,
+            272.66037482553276,
+            217.22320318050737
+          ],
+          "littleboxes": "diagram",
+          "rank": 0
+        }
+      },
+      {
+        "id": "node:trunk:label",
+        "type": "text",
+        "x": 57.33018741276638,
+        "y": 290.41100852272746,
+        "width": 158,
+        "height": 125,
+        "angle": 0,
+        "strokeColor": "#e8590c",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1094415789,
+        "version": 1,
+        "versionNonce": 2133755333,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "Switch Trunk Port\n802.1Q Tagged\nVLANs\n+ Router / DHCP\nServer",
+        "originalText": "Switch Trunk Port\n802.1Q Tagged VLANs\n+ Router / DHCP Server",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:trunk",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:nic",
+        "type": "rectangle",
+        "x": 460.0603748255328,
+        "y": 301.11100852272745,
+        "width": 226.79999999999995,
+        "height": 103.60000000000002,
+        "angle": 0,
+        "strokeColor": "#f08c00",
+        "backgroundColor": "#ffec99",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1054188257,
+        "version": 1,
+        "versionNonce": 769922425,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:host",
+        "boundElements": [
+          {
+            "id": "node:nic:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:trunk-\u003enic",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:nic-\u003emgmtvlan",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:nic-\u003esvcvlan",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            460.0603748255328,
+            301.11100852272745,
+            226.79999999999995,
+            103.60000000000002
+          ],
+          "littleboxes": "diagram",
+          "rank": 1
+        }
+      },
+      {
+        "id": "node:nic:label",
+        "type": "text",
+        "x": 477.46037482553277,
+        "y": 315.41100852272746,
+        "width": 192,
+        "height": 75,
+        "angle": 0,
+        "strokeColor": "#f08c00",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1961886345,
+        "version": 1,
+        "versionNonce": 1124256081,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:host",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "Host Trunk NIC\ne.g. enp3s0\n(VLAN-agnostic host)",
+        "originalText": "Host Trunk NIC\ne.g. enp3s0\n(VLAN-agnostic host)",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:nic",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:mgmtvlan",
+        "type": "rectangle",
+        "x": 864.7603748255327,
+        "y": 146.9610085227274,
+        "width": 208.80000000000007,
+        "height": 153.59999999999997,
+        "angle": 0,
+        "strokeColor": "#1971c2",
+        "backgroundColor": "#a5d8ff",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 2126942065,
+        "version": 1,
+        "versionNonce": 787014601,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:defaultvrf",
+        "boundElements": [
+          {
+            "id": "node:mgmtvlan:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:nic-\u003emgmtvlan",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:mgmtvlan-\u003ehostdaemons",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            864.7603748255327,
+            146.9610085227274,
+            208.80000000000007,
+            153.59999999999997
+          ],
+          "littleboxes": "diagram",
+          "rank": 2
+        }
+      },
+      {
+        "id": "node:mgmtvlan:label",
+        "type": "text",
+        "x": 882.1603748255327,
+        "y": 161.2610085227274,
+        "width": 174,
+        "height": 125,
+        "angle": 0,
+        "strokeColor": "#1971c2",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 2088664313,
+        "version": 1,
+        "versionNonce": 1229006145,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:defaultvrf",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "Management VLAN\ne.g. enp3s0.3\n(Butane)\nDefault VRF (table\nmain)",
+        "originalText": "Management VLAN\ne.g. enp3s0.3 (Butane)\nDefault VRF (table main)",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:mgmtvlan",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:hostdaemons",
+        "type": "rectangle",
+        "x": 1278.2603748255328,
+        "y": 146.9610085227274,
+        "width": 187.80000000000018,
+        "height": 153.59999999999997,
+        "angle": 0,
+        "strokeColor": "#1971c2",
+        "backgroundColor": "#a5d8ff",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 443879764,
+        "version": 1,
+        "versionNonce": 505032936,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:defaultvrf",
+        "boundElements": [
+          {
+            "id": "node:hostdaemons:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:mgmtvlan-\u003ehostdaemons",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:hostdaemons-\u003eiprule",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            1278.2603748255328,
+            146.9610085227274,
+            187.80000000000018,
+            153.59999999999997
+          ],
+          "littleboxes": "diagram",
+          "rank": 3
+        }
+      },
+      {
+        "id": "node:hostdaemons:label",
+        "type": "text",
+        "x": 1295.660374825533,
+        "y": 161.2610085227274,
+        "width": 153,
+        "height": 125,
+        "angle": 0,
+        "strokeColor": "#1971c2",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 852409168,
+        "version": 1,
+        "versionNonce": 690399268,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:defaultvrf",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "Host Daemons\nsshd · quadmatic\n/metrics\npodman pull /\nauto-update",
+        "originalText": "Host Daemons\nsshd · quadmatic /metrics\npodman pull / auto-update",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:hostdaemons",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:svcvlan",
+        "type": "rectangle",
+        "x": 854.2603748255327,
+        "y": 417.7610085227274,
+        "width": 229.80000000000007,
+        "height": 128.60000000000002,
+        "angle": 0,
+        "strokeColor": "#0c8599",
+        "backgroundColor": "#99e9f2",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 161791188,
+        "version": 1,
+        "versionNonce": 863010920,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:vrf",
+        "boundElements": [
+          {
+            "id": "node:svcvlan:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:nic-\u003esvcvlan",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:svcvlan-\u003emacvlan",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:svcvlan-\u003erootfulnet",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            854.2603748255327,
+            417.7610085227274,
+            229.80000000000007,
+            128.60000000000002
+          ],
+          "littleboxes": "diagram",
+          "rank": 2
+        }
+      },
+      {
+        "id": "node:svcvlan:label",
+        "type": "text",
+        "x": 871.6603748255327,
+        "y": 432.06100852272743,
+        "width": 195,
+        "height": 100,
+        "angle": 0,
+        "strokeColor": "#0c8599",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1210387152,
+        "version": 1,
+        "versionNonce": 374242212,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:vrf",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "Service VLAN\nqm-vlan\u003cV\u003e (IP-less)\nor reused unmanaged\nparent",
+        "originalText": "Service VLAN\nqm-vlan\u003cV\u003e (IP-less)\nor reused unmanaged parent",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:svcvlan",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:macvlan",
+        "type": "rectangle",
+        "x": 1256.2603748255328,
+        "y": 392.7610085227274,
+        "width": 231.80000000000018,
+        "height": 153.60000000000002,
+        "angle": 0,
+        "strokeColor": "#099268",
+        "backgroundColor": "#96f2d7",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 663430533,
+        "version": 1,
+        "versionNonce": 1081668429,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:vrf",
+        "boundElements": [
+          {
+            "id": "node:macvlan:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:svcvlan-\u003emacvlan",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:macvlan-\u003evrfdev",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:macvlan-\u003epasta",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            1256.2603748255328,
+            392.7610085227274,
+            231.80000000000018,
+            153.60000000000002
+          ],
+          "littleboxes": "diagram",
+          "rank": 3
+        }
+      },
+      {
+        "id": "node:macvlan:label",
+        "type": "text",
+        "x": 1273.660374825533,
+        "y": 407.06100852272743,
+        "width": 197,
+        "height": 125,
+        "angle": 0,
+        "strokeColor": "#099268",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 2094852949,
+        "version": 1,
+        "versionNonce": 1659920349,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:vrf",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "macvlan qm-\u003cuid\u003e\nmode: private · pinned\nMAC\nDHCP static IP ·\nignore-auto-dns",
+        "originalText": "macvlan qm-\u003cuid\u003e\nmode: private · pinned MAC\nDHCP static IP · ignore-auto-dns",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:macvlan",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:vrfdev",
+        "type": "rectangle",
+        "x": 1771.4603748255327,
+        "y": 392.7610085227274,
+        "width": 225.80000000000018,
+        "height": 153.60000000000002,
+        "angle": 0,
+        "strokeColor": "#6741d9",
+        "backgroundColor": "#d0bfff",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1832143276,
+        "version": 1,
+        "versionNonce": 275833904,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:vrf",
+        "boundElements": [
+          {
+            "id": "node:vrfdev:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:macvlan-\u003evrfdev",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:vrfdev-\u003eiprule",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            1771.4603748255327,
+            392.7610085227274,
+            225.80000000000018,
+            153.60000000000002
+          ],
+          "littleboxes": "diagram",
+          "rank": 4
+        }
+      },
+      {
+        "id": "node:vrfdev:label",
+        "type": "text",
+        "x": 1788.8603748255327,
+        "y": 407.06100852272743,
+        "width": 191,
+        "height": 125,
+        "angle": 0,
+        "strokeColor": "#6741d9",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1644741720,
+        "version": 1,
+        "versionNonce": 204057084,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:vrf",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "VRF qmv-\u003cuid\u003e\ntable 10000+\u003cuid\u003e\nunreachable default\nmetric 8192\n(IPv4 + optional IPv6)",
+        "originalText": "VRF qmv-\u003cuid\u003e\ntable 10000+\u003cuid\u003e\nunreachable default metric 8192\n(IPv4 + optional IPv6)",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:vrfdev",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:iprule",
+        "type": "rectangle",
+        "x": 2285.6603748255325,
+        "y": 243.70545296717194,
+        "width": 280,
+        "height": 178.59999999999997,
+        "angle": 0,
+        "strokeColor": "#e03131",
+        "backgroundColor": "#ffc9c9",
+        "fillStyle": "hachure",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1390009170,
+        "version": 1,
+        "versionNonce": 1184011442,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:host",
+        "boundElements": [
+          {
+            "id": "node:iprule:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:vrfdev-\u003eiprule",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:hostdaemons-\u003eiprule",
+            "type": "arrow"
+          }
+        ],
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            2285.6603748255325,
+            243.70545296717194,
+            280,
+            178.59999999999997
+          ],
+          "littleboxes": "diagram",
+          "rank": 5
+        }
+      },
+      {
+        "id": "node:iprule:label",
+        "type": "text",
+        "x": 2302.6603748255325,
+        "y": 258.0054529671719,
+        "width": 246,
+        "height": 150,
+        "angle": 0,
+        "strokeColor": "#e03131",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1400054150,
+        "version": 1,
+        "versionNonce": 918425030,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:host",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "Kernel Policy Routing\n1000: lookup [l3mdev-table]\n32765: lookup local\n32766: lookup main\ntcp/udp_l3mdev_accept =\n0",
+        "originalText": "Kernel Policy Routing\n1000: lookup [l3mdev-table]\n32765: lookup local\n32766: lookup main\ntcp/udp_l3mdev_accept = 0",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:iprule",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:pasta",
+        "type": "rectangle",
+        "x": 1751.4603748255327,
+        "y": 638.5610085227274,
+        "width": 265.8000000000002,
+        "height": 178.6,
+        "angle": 0,
+        "strokeColor": "#2f9e44",
+        "backgroundColor": "#b2f2bb",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 2097783364,
+        "version": 1,
+        "versionNonce": 1349027800,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:container",
+        "boundElements": [
+          {
+            "id": "node:pasta:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:macvlan-\u003epasta",
+            "type": "arrow"
+          },
+          {
+            "id": "edge:pasta-\u003eworkload",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            1751.4603748255327,
+            638.5610085227274,
+            265.8000000000002,
+            178.6
+          ],
+          "littleboxes": "diagram",
+          "rank": 4
+        }
+      },
+      {
+        "id": "node:pasta:label",
+        "type": "text",
+        "x": 1768.8603748255327,
+        "y": 652.8610085227274,
+        "width": 231,
+        "height": 150,
+        "angle": 0,
+        "strokeColor": "#2f9e44",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 2102045792,
+        "version": 1,
+        "versionNonce": 459419700,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:container",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "pasta (unprivileged UID)\n--no-map-gw ·\n--map-host-loopback,none\n-i qm-\u003cuid\u003e ·\n--outbound-if4 qm-\u003cuid\u003e\n-t %qm-\u003cuid\u003e/\u003cports\u003e",
+        "originalText": "pasta (unprivileged UID)\n--no-map-gw · --map-host-loopback,none\n-i qm-\u003cuid\u003e · --outbound-if4 qm-\u003cuid\u003e\n-t %qm-\u003cuid\u003e/\u003cports\u003e",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:pasta",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:workload",
+        "type": "rectangle",
+        "x": 2313.2603748255324,
+        "y": 651.0610085227274,
+        "width": 224.80000000000018,
+        "height": 153.6,
+        "angle": 0,
+        "strokeColor": "#2f9e44",
+        "backgroundColor": "#b2f2bb",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 2036707692,
+        "version": 1,
+        "versionNonce": 738169712,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:container",
+        "boundElements": [
+          {
+            "id": "node:workload:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:pasta-\u003eworkload",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            2313.2603748255324,
+            651.0610085227274,
+            224.80000000000018,
+            153.6
+          ],
+          "littleboxes": "diagram",
+          "rank": 5
+        }
+      },
+      {
+        "id": "node:workload:label",
+        "type": "text",
+        "x": 2330.6603748255325,
+        "y": 665.3610085227274,
+        "width": 190,
+        "height": 125,
+        "angle": 0,
+        "strokeColor": "#2f9e44",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 701821336,
+        "version": 1,
+        "versionNonce": 898630588,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:container",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "Rootless Container\nisolated userns +\nnetns\nexplicit VLAN DNS=\nno host netns access",
+        "originalText": "Rootless Container\nisolated userns + netns\nexplicit VLAN DNS=\nno host netns access",
+        "fontSize": 20,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:workload",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "id": "node:rootfulnet",
+        "type": "rectangle",
+        "x": 1277.7603748255328,
+        "y": 595.9610085227274,
+        "width": 188.80000000000018,
+        "height": 128.6,
+        "angle": 0,
+        "strokeColor": "#e8590c",
+        "backgroundColor": "#ffd8a8",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "dashed",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1773734771,
+        "version": 1,
+        "versionNonce": 1478657871,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:host",
+        "boundElements": [
+          {
+            "id": "node:rootfulnet:label",
+            "type": "text"
+          },
+          {
+            "id": "edge:svcvlan-\u003erootfulnet",
+            "type": "arrow"
+          }
+        ],
+        "roundness": {
+          "type": 3
+        },
+        "link": null,
+        "locked": false,
+        "customData": {
+          "at": [
+            1277.7603748255328,
+            595.9610085227274,
+            188.80000000000018,
+            128.6
+          ],
+          "littleboxes": "diagram",
+          "rank": 3
+        }
+      },
+      {
+        "id": "node:rootfulnet:label",
+        "type": "text",
+        "x": 1295.160374825533,
+        "y": 610.2610085227274,
+        "width": 154,
+        "height": 100,
+        "angle": 0,
+        "strokeColor": "#e8590c",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 460610947,
+        "version": 1,
+        "versionNonce": 1515293023,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:host",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "Rootful Escape Hatch\nDriver=macvlan\n.network\n(L2 mDNS / Home\nAssistant)",
+        "originalText": "Rootful Escape Hatch\nDriver=macvlan .network\n(L2 mDNS / Home Assistant)",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "node:rootfulnet",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:trunk-\u003enic:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "5b9cb915",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:nic",
+          "fixedPoint": [
+            -0.022045855379188718,
+            0.5
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": null,
+        "groupIds": [],
+        "height": 0,
+        "id": "edge:trunk-\u003enic",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            64.84999999999997,
+            0
+          ],
+          [
+            177.40000000000003,
+            0
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1687986251,
+        "startArrowhead": "triangle",
+        "startBinding": {
+          "elementId": "node:trunk",
+          "fixedPoint": [
+            1.0183378314623068,
+            0.5000000000000001
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388719313,
+        "version": 1,
+        "versionNonce": 545357239,
+        "width": 177.40000000000003,
+        "x": 277.66037482553276,
+        "y": 352.91100852272746
+      },
+      {
+        "id": "edge:trunk-\u003enic:label",
+        "type": "text",
+        "x": 296.5103748255327,
+        "y": 342.91100852272746,
+        "width": 92,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1240783435,
+        "version": 1,
+        "versionNonce": 357033911,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": null,
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "802.1Q trunk",
+        "originalText": "802.1Q trunk",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:trunk-\u003enic",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:nic-\u003emgmtvlan:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "205ec37f",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:mgmtvlan",
+          "fixedPoint": [
+            -0.0239463601532567,
+            0.9348958333333334
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:host",
+        "groupIds": [],
+        "height": 20.550000000000068,
+        "id": "edge:nic-\u003emgmtvlan",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            54.85000000000002,
+            0
+          ],
+          [
+            54.85000000000002,
+            -20.550000000000068
+          ],
+          [
+            93.11249999999995,
+            -20.550000000000068
+          ],
+          [
+            130.5062499999999,
+            -20.550000000000068
+          ],
+          [
+            149.203125,
+            -20.550000000000068
+          ],
+          [
+            167.89999999999998,
+            -20.550000000000068
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1796194919,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:nic",
+          "fixedPoint": [
+            1.0220458553791887,
+            0.0965250965250965
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388719313,
+        "version": 1,
+        "versionNonce": 900516579,
+        "width": 167.89999999999998,
+        "x": 691.8603748255327,
+        "y": 311.11100852272745
+      },
+      {
+        "id": "edge:nic-\u003emgmtvlan:label",
+        "type": "text",
+        "x": 757.9728748255327,
+        "y": 280.5610085227274,
+        "width": 54,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 793086687,
+        "version": 1,
+        "versionNonce": 1033444395,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:host",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "VLAN 3",
+        "originalText": "VLAN 3",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:nic-\u003emgmtvlan",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": null,
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "1ecfbe6b",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:hostdaemons",
+          "fixedPoint": [
+            -0.026624068157614457,
+            0.49999999999999983
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:defaultvrf",
+        "groupIds": [],
+        "height": 0,
+        "id": "edge:mgmtvlan-\u003ehostdaemons",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            194.70000000000005,
+            0
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1072324100,
+        "startArrowhead": "triangle",
+        "startBinding": {
+          "elementId": "node:mgmtvlan",
+          "fixedPoint": [
+            1.0239463601532568,
+            0.49999999999999983
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388719313,
+        "version": 1,
+        "versionNonce": 330828824,
+        "width": 194.70000000000005,
+        "x": 1078.5603748255328,
+        "y": 223.76100852272737
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:nic-\u003esvcvlan:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "e8264f23",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:svcvlan",
+          "fixedPoint": [
+            -0.021758050478677102,
+            0.07776049766718506
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:host",
+        "groupIds": [],
+        "height": 33.049999999999955,
+        "id": "edge:nic-\u003esvcvlan",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            54.85000000000002,
+            0
+          ],
+          [
+            54.85000000000002,
+            16.524999999999977
+          ],
+          [
+            54.85000000000002,
+            33.049999999999955
+          ],
+          [
+            157.39999999999998,
+            33.049999999999955
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 954799614,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:nic",
+          "fixedPoint": [
+            1.0220458553791887,
+            0.9034749034749034
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388719313,
+        "version": 1,
+        "versionNonce": 1178856494,
+        "width": 157.39999999999998,
+        "x": 691.8603748255327,
+        "y": 394.71100852272747
+      },
+      {
+        "id": "edge:nic-\u003esvcvlan:label",
+        "type": "text",
+        "x": 710.7103748255328,
+        "y": 401.23600852272745,
+        "width": 72,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1897211514,
+        "version": 1,
+        "versionNonce": 917885002,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:host",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "VLAN \u003cV\u003e",
+        "originalText": "VLAN \u003cV\u003e",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:nic-\u003esvcvlan",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:svcvlan-\u003emacvlan:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "a25bc918",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:macvlan",
+          "fixedPoint": [
+            -0.021570319240724747,
+            0.5813802083333334
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:vrf",
+        "groupIds": [],
+        "height": 0,
+        "id": "edge:svcvlan-\u003emacvlan",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            81.09999999999991,
+            0
+          ],
+          [
+            162.20000000000005,
+            0
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1463679432,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:svcvlan",
+          "fixedPoint": [
+            1.0217580504786772,
+            0.5
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388719313,
+        "version": 1,
+        "versionNonce": 118779820,
+        "width": 162.20000000000005,
+        "x": 1089.0603748255328,
+        "y": 482.06100852272743
+      },
+      {
+        "id": "edge:svcvlan-\u003emacvlan:label",
+        "type": "text",
+        "x": 1147.1603748255327,
+        "y": 472.06100852272743,
+        "width": 46,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 697848092,
+        "version": 1,
+        "versionNonce": 1508475616,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:vrf",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "parent",
+        "originalText": "parent",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:svcvlan-\u003emacvlan",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:macvlan-\u003evrfdev:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "c1d62988",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:vrfdev",
+          "fixedPoint": [
+            -0.02214348981399467,
+            0.5
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:vrf",
+        "groupIds": [],
+        "height": 0,
+        "id": "edge:macvlan-\u003evrfdev",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            126.69999999999982,
+            0
+          ],
+          [
+            273.39999999999964,
+            0
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 683034446,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:macvlan",
+          "fixedPoint": [
+            1.0215703192407248,
+            0.5
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388719313,
+        "version": 1,
+        "versionNonce": 1858738494,
+        "width": 273.39999999999964,
+        "x": 1493.060374825533,
+        "y": 469.56100852272743
+      },
+      {
+        "id": "edge:macvlan-\u003evrfdev:label",
+        "type": "text",
+        "x": 1578.7603748255328,
+        "y": 459.56100852272743,
+        "width": 82,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1477059498,
+        "version": 1,
+        "versionNonce": 1867660474,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:vrf",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "enslaved to",
+        "originalText": "enslaved to",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:macvlan-\u003evrfdev",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:vrfdev-\u003eiprule:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "2f71d540",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:iprule",
+          "fixedPoint": [
+            -0.017857142857142856,
+            0.9172887893492596
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:host",
+        "groupIds": [],
+        "height": 0,
+        "id": "edge:vrfdev-\u003eiprule",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            173.04999999999973,
+            0
+          ],
+          [
+            278.39999999999964,
+            0
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1557281571,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:vrfdev",
+          "fixedPoint": [
+            1.0221434898139947,
+            0.09617332175925936
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "dashed",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388719313,
+        "version": 1,
+        "versionNonce": 1592038911,
+        "width": 278.39999999999964,
+        "x": 2002.2603748255328,
+        "y": 407.53323074494966
+      },
+      {
+        "id": "edge:vrfdev-\u003eiprule:label",
+        "type": "text",
+        "x": 2110.3103748255326,
+        "y": 397.53323074494966,
+        "width": 130,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1371587411,
+        "version": 1,
+        "versionNonce": 1276708143,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:host",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "hits rule 1000 first",
+        "originalText": "hits rule 1000 first",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:vrfdev-\u003eiprule",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:hostdaemons-\u003eiprule:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "ceb57fa6",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:iprule",
+          "fixedPoint": [
+            -0.017857142857142856,
+            0.11770561154659648
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:host",
+        "groupIds": [],
+        "height": 0,
+        "id": "edge:hostdaemons-\u003eiprule",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            413.2999999999997,
+            0
+          ],
+          [
+            809.5999999999995,
+            0
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1565414825,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:hostdaemons",
+          "fixedPoint": [
+            1.0266240681576144,
+            0.7667100694444445
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "dashed",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388719313,
+        "version": 1,
+        "versionNonce": 543554161,
+        "width": 809.5999999999995,
+        "x": 1471.060374825533,
+        "y": 264.72767518939406
+      },
+      {
+        "id": "edge:hostdaemons-\u003eiprule:label",
+        "type": "text",
+        "x": 1796.8603748255327,
+        "y": 254.72767518939406,
+        "width": 175,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1045997825,
+        "version": 1,
+        "versionNonce": 938511897,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:host",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "skips 1000 -\u003e local/main",
+        "originalText": "skips 1000 -\u003e local/main",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:hostdaemons-\u003eiprule",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:macvlan-\u003epasta:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "e687d934",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:pasta",
+          "fixedPoint": [
+            -0.018811136192626022,
+            0.055991041433370664
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:host",
+        "groupIds": [],
+        "height": 112.20000000000005,
+        "id": "edge:macvlan-\u003epasta",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            126.69999999999982,
+            0
+          ],
+          [
+            126.69999999999982,
+            56.10000000000002
+          ],
+          [
+            126.69999999999982,
+            112.20000000000005
+          ],
+          [
+            253.39999999999964,
+            112.20000000000005
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 747372318,
+        "startArrowhead": "triangle",
+        "startBinding": {
+          "elementId": "node:macvlan",
+          "fixedPoint": [
+            1.0215703192407248,
+            0.9348958333333329
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388719313,
+        "version": 1,
+        "versionNonce": 1675544270,
+        "width": 253.39999999999964,
+        "x": 1493.060374825533,
+        "y": 536.3610085227274
+      },
+      {
+        "id": "edge:macvlan-\u003epasta:label",
+        "type": "text",
+        "x": 1550.7603748255328,
+        "y": 582.4610085227274,
+        "width": 138,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 1734884890,
+        "version": 1,
+        "versionNonce": 977144682,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:host",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "SO_BINDTODEVICE",
+        "originalText": "SO_BINDTODEVICE",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:macvlan-\u003epasta",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:pasta-\u003eworkload:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "deadf6f3",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:workload",
+          "fixedPoint": [
+            -0.022241992882562258,
+            0.4999999999999997
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:container",
+        "groupIds": [],
+        "height": 0,
+        "id": "edge:pasta-\u003eworkload",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            153.04999999999973,
+            0
+          ],
+          [
+            285.99999999999955,
+            0
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 1500233259,
+        "startArrowhead": "triangle",
+        "startBinding": {
+          "elementId": "node:pasta",
+          "fixedPoint": [
+            1.018811136192626,
+            0.4999999999999998
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "solid",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388719313,
+        "version": 1,
+        "versionNonce": 416822551,
+        "width": 285.99999999999955,
+        "x": 2022.2603748255328,
+        "y": 727.8610085227274
+      },
+      {
+        "id": "edge:pasta-\u003eworkload:label",
+        "type": "text",
+        "x": 2088.8103748255326,
+        "y": 717.8610085227274,
+        "width": 173,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 369814955,
+        "version": 1,
+        "versionNonce": 1812064407,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:container",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "L4 tap (TCP/UDP/ICMP)",
+        "originalText": "L4 tap (TCP/UDP/ICMP)",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:pasta-\u003eworkload",
+        "lineHeight": 1.25,
+        "autoResize": true
+      },
+      {
+        "angle": 0,
+        "backgroundColor": "transparent",
+        "boundElements": [
+          {
+            "id": "edge:svcvlan-\u003erootfulnet:label",
+            "type": "text"
+          }
+        ],
+        "customData": {
+          "littleboxes": "diagram",
+          "path": "8031feba",
+          "sides": [
+            "right",
+            "left"
+          ]
+        },
+        "elbowed": true,
+        "endArrowhead": "triangle",
+        "endBinding": {
+          "elementId": "node:rootfulnet",
+          "fixedPoint": [
+            -0.0264830508474576,
+            0.07776049766718507
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "fillStyle": "solid",
+        "frameId": "group:host",
+        "groupIds": [],
+        "height": 69.60000000000002,
+        "id": "edge:svcvlan-\u003erootfulnet",
+        "isDeleted": false,
+        "link": null,
+        "locked": false,
+        "opacity": 100,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            81.09999999999991,
+            0
+          ],
+          [
+            81.09999999999991,
+            45.200000000000045
+          ],
+          [
+            81.09999999999991,
+            69.60000000000002
+          ],
+          [
+            183.70000000000005,
+            69.60000000000002
+          ]
+        ],
+        "roughness": 0,
+        "roundness": null,
+        "seed": 2040276056,
+        "startArrowhead": null,
+        "startBinding": {
+          "elementId": "node:svcvlan",
+          "fixedPoint": [
+            1.0217580504786772,
+            0.9222395023328145
+          ],
+          "focus": 0,
+          "gap": 5,
+          "mode": "orbit"
+        },
+        "strokeColor": "#1e1e1e",
+        "strokeStyle": "dashed",
+        "strokeWidth": 2,
+        "type": "arrow",
+        "updated": 1795388719313,
+        "version": 1,
+        "versionNonce": 203557372,
+        "width": 183.70000000000005,
+        "x": 1089.0603748255328,
+        "y": 536.3610085227274
+      },
+      {
+        "id": "edge:svcvlan-\u003erootfulnet:label",
+        "type": "text",
+        "x": 1114.6603748255327,
+        "y": 571.5610085227274,
+        "width": 111,
+        "height": 20,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 0,
+        "opacity": 100,
+        "seed": 690425292,
+        "version": 1,
+        "versionNonce": 532582864,
+        "updated": 1795388719313,
+        "isDeleted": false,
+        "groupIds": [],
+        "frameId": "group:host",
+        "boundElements": null,
+        "roundness": null,
+        "link": null,
+        "locked": false,
+        "customData": {
+          "littleboxes": "diagram"
+        },
+        "text": "ParentInterface",
+        "originalText": "ParentInterface",
+        "fontSize": 16,
+        "fontFamily": 2,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": "edge:svcvlan-\u003erootfulnet",
+        "lineHeight": 1.25,
+        "autoResize": true
+      }
+    ],
+    "appState": {
+      "gridModeEnabled": false,
+      "gridSize": 20,
+      "viewBackgroundColor": "#ffffff"
+    }
+  }
+}

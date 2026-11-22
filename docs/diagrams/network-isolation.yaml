@@ -1,0 +1,101 @@
+title: "quadmatic — Rootless Per-Quadlet VLAN + VRF + pasta Isolation (Option 2B)"
+direction: right
+style:
+  theme: gruvbox-dark
+  look: clean
+  font: sans
+  route: elbow
+  spacing: normal
+  compactness: 0.45
+
+nodes:
+  # Physical network
+  - id: trunk
+    label: "Switch Trunk Port\n802.1Q Tagged VLANs\n+ Router / DHCP Server"
+    shape: ellipse
+    color: orange
+    rank: 0
+  - id: nic
+    label: "Host Trunk NIC\ne.g. enp3s0\n(VLAN-agnostic host)"
+    color: yellow
+    rank: 1
+    group: host
+
+  # Management plane (Default VRF)
+  - id: mgmtvlan
+    label: "Management VLAN\ne.g. enp3s0.3 (Butane)\nDefault VRF (table main)"
+    color: blue
+    rank: 2
+    group: defaultvrf
+  - id: hostdaemons
+    label: "Host Daemons\nsshd · quadmatic /metrics\npodman pull / auto-update"
+    color: blue
+    rank: 3
+    group: defaultvrf
+
+  # Isolated Service VLAN + VRF
+  - id: svcvlan
+    label: "Service VLAN\nqm-vlan<V> (IP-less)\nor reused unmanaged parent"
+    color: cyan
+    rank: 2
+    group: vrf
+  - id: macvlan
+    label: "macvlan qm-<uid>\nmode: private · pinned MAC\nDHCP static IP · ignore-auto-dns"
+    color: teal
+    rank: 3
+    group: vrf
+  - id: vrfdev
+    label: "VRF qmv-<uid>\ntable 10000+<uid>\nunreachable default metric 8192\n(IPv4 + optional IPv6)"
+    color: violet
+    rank: 3
+    group: vrf
+
+  # Kernel policy routing invariant
+  - id: iprule
+    label: "Kernel Policy Routing\n1000: lookup [l3mdev-table]\n32765: lookup local\n32766: lookup main\ntcp/udp_l3mdev_accept = 0"
+    shape: rect
+    color: red
+    fill: hachure
+    width: 280
+    rank: 4
+    group: host
+
+  # Rootless container
+  - id: pasta
+    label: "pasta (unprivileged UID)\n--no-map-gw · --map-host-loopback,none\n-i qm-<uid> · --outbound-if4 qm-<uid>\n-t %qm-<uid>/<ports>"
+    color: green
+    rank: 4
+    group: container
+  - id: workload
+    label: "Rootless Container\nisolated userns + netns\nexplicit VLAN DNS=\nno host netns access"
+    color: green
+    rank: 5
+    group: container
+
+  # Rootful escape hatch
+  - id: rootfulnet
+    label: "Rootful Escape Hatch\nDriver=macvlan .network\n(L2 mDNS / Home Assistant)"
+    color: orange
+    stroke: dashed
+    size: s
+    rank: 3
+    group: host
+
+edges:
+  - {from: trunk, to: nic, label: "802.1Q trunk", arrow: both}
+  - {from: nic, to: mgmtvlan, label: "VLAN 3"}
+  - {from: mgmtvlan, to: hostdaemons, arrow: both}
+  - {from: nic, to: svcvlan, label: "VLAN <V>"}
+  - {from: svcvlan, to: macvlan, label: "parent"}
+  - {from: macvlan, to: vrfdev, label: "enslaved to"}
+  - {from: vrfdev, to: iprule, label: "hits rule 1000 first", style: dashed}
+  - {from: hostdaemons, to: iprule, label: "skips 1000 -> local/main", style: dashed}
+  - {from: macvlan, to: pasta, label: "SO_BINDTODEVICE", arrow: both}
+  - {from: pasta, to: workload, label: "L4 tap (TCP/UDP/ICMP)", arrow: both}
+  - {from: svcvlan, to: rootfulnet, label: "ParentInterface", style: dashed}
+
+groups:
+  - {id: host, label: "Fedora CoreOS Host"}
+  - {id: defaultvrf, label: "Default VRF (Management)", group: host}
+  - {id: vrf, label: "Per-Component VRF Isolation (Managed by netmgr)", group: host}
+  - {id: container, label: "Rootless Service Namespace (UID <uid>)", group: host}
