@@ -400,6 +400,10 @@ func runValidate(ctx context.Context, args []string, stdout, stderr io.Writer) i
 			fmt.Fprintf(stdout, "Note (%s): placeholder DNS (%s) used for dns_from_dhcp components during offline validation\n",
 				hostname, manifest.PlaceholderDNS)
 		}
+		if rendered.UsedPlaceholderTrunk {
+			fmt.Fprintf(stdout, "Note (%s): placeholder trunk interface (%s) used for vlan=0 components during offline validation\n",
+				hostname, manifest.PlaceholderTrunkInterface)
+		}
 	}
 
 	if hadError {

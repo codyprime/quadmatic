@@ -92,12 +92,15 @@ Volume={{ .Component.DataDir }}/Caddyfile:/etc/caddy/Caddyfile:ro
 		t.Fatalf("expected stdout summary to mention services-02, got:\n%s", stdout.String())
 	}
 
-	// 2b. Validate a rootless [component.network] + dns_from_dhcp = true host offline.
+	// 2b. Validate a rootless [component.network] + dns_from_dhcp = true + vlan = 0 host offline.
 	netRepoDir := t.TempDir()
 	writeRepoFiles(t, netRepoDir, map[string]string{
 		"users.toml": `
 [users.openwebui]
 uid = 2001
+
+[users.direct]
+uid = 2002
 `,
 		"hosts/services-02.toml": `
 hostname = "services-02"
@@ -111,6 +114,14 @@ vlan = 30
 mac = "02:51:4d:00:07:d1"
 dns_from_dhcp = true
 tcp_ports = ["8080:8080"]
+
+[[component]]
+name = "direct"
+user = "direct"
+
+[component.network]
+mac = "02:51:4d:00:07:d2"
+dns = ["10.0.0.1"]
 `,
 		"components/open-webui/open-webui.container.tmpl": `[Container]
 Image=ghcr.io/open-webui/open-webui:main
@@ -118,6 +129,11 @@ Network={{ .Net.PastaArgs }}
 {{- range .Net.DNS }}
 DNS={{ . }}
 {{- end }}
+`,
+		"components/direct/direct.container.tmpl": `[Container]
+Image=alpine:3.20
+Network={{ .Net.PastaArgs }}
+# parent={{ .Net.ParentInterface }}
 `,
 	})
 	stdout.Reset()
@@ -128,6 +144,9 @@ DNS={{ . }}
 	}
 	if !strings.Contains(stdout.String(), "192.0.2.53") {
 		t.Fatalf("expected placeholder DNS note in validate stdout, got:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "trunk_interface") {
+		t.Fatalf("expected placeholder trunk interface note in validate stdout, got:\n%s", stdout.String())
 	}
 
 	// 3. Introduce a default-VRF port collision -> exit non-zero with clear stderr message.

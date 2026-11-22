@@ -11,6 +11,11 @@ import (
 	"quadmatic/internal/hashutil"
 )
 
+// PlaceholderTrunkInterface is the placeholder parent interface name used during
+// offline validation or dry-run when a component specifies vlan=0 and no trunk
+// parent interface was resolved in RenderEnv.ParentIfaces.
+const PlaceholderTrunkInterface = "trunk_interface"
+
 // RenderHost renders all component quadlet and data templates using Go text/template
 // with Option("missingkey=error"), resolves .Net metadata and .Net.PastaArgs, and
 // builds destination paths, file modes, ownership, and SHA-256 digests.
@@ -26,8 +31,10 @@ func RenderHost(host *ResolvedHost, env RenderEnv) (*RenderedHost, error) {
 	}
 
 	compContexts := make([]ComponentContext, len(host.Components))
-	compPlaceholder := make([]bool, len(host.Components))
-	anyPlaceholder := false
+	compPlaceholderDNS := make([]bool, len(host.Components))
+	compPlaceholderTrunk := make([]bool, len(host.Components))
+	anyPlaceholderDNS := false
+	anyPlaceholderTrunk := false
 
 	// Build complete .Host.Components metadata before executing templates so cross-component
 	// references (e.g., Caddy upstream templates) see every component regardless of manifest order.
@@ -35,13 +42,17 @@ func RenderHost(host *ResolvedHost, env RenderEnv) (*RenderedHost, error) {
 		if !comp.Rootful && (comp.UID <= 0 || strings.TrimSpace(comp.DataDir) == "") {
 			return nil, fmt.Errorf("rootless component %q must have positive UID and non-empty DataDir", comp.Name)
 		}
-		netCtx, usedPlaceholder, err := buildNetContext(comp, env)
+		netCtx, usedPlaceholderDNS, usedPlaceholderTrunk, err := buildNetContext(comp, env)
 		if err != nil {
 			return nil, err
 		}
-		if usedPlaceholder {
-			anyPlaceholder = true
-			compPlaceholder[i] = true
+		if usedPlaceholderDNS {
+			anyPlaceholderDNS = true
+			compPlaceholderDNS[i] = true
+		}
+		if usedPlaceholderTrunk {
+			anyPlaceholderTrunk = true
+			compPlaceholderTrunk[i] = true
 		}
 
 		cc := ComponentContext{
@@ -60,10 +71,11 @@ func RenderHost(host *ResolvedHost, env RenderEnv) (*RenderedHost, error) {
 	}
 
 	rendered := &RenderedHost{
-		Hostname:           host.Hostname,
-		Vars:               cloneAnyMap(host.Vars),
-		Components:         make([]RenderedComponent, 0, len(host.Components)),
-		UsedPlaceholderDNS: anyPlaceholder,
+		Hostname:             host.Hostname,
+		Vars:                 cloneAnyMap(host.Vars),
+		Components:           make([]RenderedComponent, 0, len(host.Components)),
+		UsedPlaceholderDNS:   anyPlaceholderDNS,
+		UsedPlaceholderTrunk: anyPlaceholderTrunk,
 	}
 
 	for i, comp := range host.Components {
@@ -130,18 +142,19 @@ func RenderHost(host *ResolvedHost, env RenderEnv) (*RenderedHost, error) {
 		}
 
 		rendered.Components = append(rendered.Components, RenderedComponent{
-			Name:               comp.Name,
-			User:               comp.User,
-			UID:                comp.UID,
-			Rootful:            comp.Rootful,
-			DataDir:            comp.DataDir,
-			Vars:               cc.Vars,
-			Ports:              cc.Ports,
-			Network:            cc.Network,
-			Net:                cc.Net,
-			Secrets:            cloneStringMap(comp.Secrets),
-			Files:              files,
-			UsedPlaceholderDNS: compPlaceholder[i],
+			Name:                 comp.Name,
+			User:                 comp.User,
+			UID:                  comp.UID,
+			Rootful:              comp.Rootful,
+			DataDir:              comp.DataDir,
+			Vars:                 cc.Vars,
+			Ports:                cc.Ports,
+			Network:              cc.Network,
+			Net:                  cc.Net,
+			Secrets:              cloneStringMap(comp.Secrets),
+			Files:                files,
+			UsedPlaceholderDNS:   compPlaceholderDNS[i],
+			UsedPlaceholderTrunk: compPlaceholderTrunk[i],
 		})
 	}
 
@@ -175,14 +188,14 @@ func BuildPastaArgs(iface string, net *NetworkSpec) string {
 	return "pasta:" + strings.Join(args, ",")
 }
 
-func buildNetContext(comp ResolvedComponent, env RenderEnv) (*NetContext, bool, error) {
+func buildNetContext(comp ResolvedComponent, env RenderEnv) (*NetContext, bool, bool, error) {
 	if comp.Network == nil {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 	netSpec := comp.Network
-	parentIface, err := resolveParentIface(comp.Name, netSpec.VLAN, env)
+	parentIface, usedPlaceholderTrunk, err := resolveParentIface(comp.Name, netSpec.VLAN, env)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 
 	if comp.Rootful {
@@ -191,22 +204,22 @@ func buildNetContext(comp ResolvedComponent, env RenderEnv) (*NetContext, bool, 
 			VLAN:            netSpec.VLAN,
 			MAC:             netSpec.MAC,
 			DNS:             append([]string(nil), netSpec.DNS...),
-		}, false, nil
+		}, false, usedPlaceholderTrunk, nil
 	}
 
 	iface := fmt.Sprintf("qm-%d", comp.UID)
 	vrf := fmt.Sprintf("qmv-%d", comp.UID)
 
 	var dns []string
-	usedPlaceholder := false
+	usedPlaceholderDNS := false
 	if netSpec.DNSFromDHCP {
 		if live := env.LiveDNS[comp.Name]; len(live) > 0 {
 			dns = append([]string(nil), live...)
 		} else if env.DryRun {
 			dns = []string{PlaceholderDNS}
-			usedPlaceholder = true
+			usedPlaceholderDNS = true
 		} else {
-			return nil, false, fmt.Errorf("component %q has dns_from_dhcp=true but no live DNS is available", comp.Name)
+			return nil, false, false, fmt.Errorf("component %q has dns_from_dhcp=true but no live DNS is available", comp.Name)
 		}
 	} else {
 		dns = append([]string(nil), netSpec.DNS...)
@@ -220,22 +233,22 @@ func buildNetContext(comp ResolvedComponent, env RenderEnv) (*NetContext, bool, 
 		MAC:             netSpec.MAC,
 		DNS:             dns,
 		PastaArgs:       BuildPastaArgs(iface, netSpec),
-	}, usedPlaceholder, nil
+	}, usedPlaceholderDNS, usedPlaceholderTrunk, nil
 }
 
-func resolveParentIface(compName string, vlan int, env RenderEnv) (string, error) {
+func resolveParentIface(compName string, vlan int, env RenderEnv) (string, bool, error) {
 	if env.ParentIfaces != nil {
 		if iface := env.ParentIfaces[vlan]; iface != "" {
-			return iface, nil
+			return iface, false, nil
 		}
 	}
 	if vlan == 0 {
 		if !env.DryRun {
-			return "", fmt.Errorf("component %q has vlan=0 without resolved trunk parent interface", compName)
+			return "", false, fmt.Errorf("component %q has vlan=0 without resolved trunk parent interface", compName)
 		}
-		return "trunk_interface", nil
+		return PlaceholderTrunkInterface, true, nil
 	}
-	return fmt.Sprintf("qm-vlan%d", vlan), nil
+	return fmt.Sprintf("qm-vlan%d", vlan), false, nil
 }
 
 func renderSourceFile(compName string, sf SourceFile, ctx TemplateContext) ([]byte, error) {

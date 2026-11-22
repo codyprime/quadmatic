@@ -118,18 +118,19 @@ type RenderedFile struct {
 
 // RenderedComponent holds all rendered files and resolved metadata for one component.
 type RenderedComponent struct {
-	Name               string
-	User               string
-	UID                int
-	Rootful            bool
-	DataDir            string
-	Vars               map[string]any
-	Ports              map[string]PortSpec
-	Network            *NetworkSpec
-	Net                *NetContext
-	Secrets            map[string]string
-	Files              []RenderedFile
-	UsedPlaceholderDNS bool
+	Name                 string
+	User                 string
+	UID                  int
+	Rootful              bool
+	DataDir              string
+	Vars                 map[string]any
+	Ports                map[string]PortSpec
+	Network              *NetworkSpec
+	Net                  *NetContext
+	Secrets              map[string]string
+	Files                []RenderedFile
+	UsedPlaceholderDNS   bool
+	UsedPlaceholderTrunk bool
 }
 
 // Scope returns "rootful" for rootful components or the Linux username for rootless ones.
@@ -142,10 +143,11 @@ func (c RenderedComponent) Scope() string {
 
 // RenderedHost holds all rendered components for a host.
 type RenderedHost struct {
-	Hostname           string
-	Vars               map[string]any
-	Components         []RenderedComponent
-	UsedPlaceholderDNS bool
+	Hostname             string
+	Vars                 map[string]any
+	Components           []RenderedComponent
+	UsedPlaceholderDNS   bool
+	UsedPlaceholderTrunk bool
 }
 
 // NetContext exposes resolved virtual-network variables to templates under .Net.

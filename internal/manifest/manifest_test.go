@@ -1244,6 +1244,9 @@ mac = "02:51:4d:00:07:e1"
 	})
 
 	t.Run("vlan 0 uses trunk_interface placeholder in DryRun and errors when non-DryRun without ParentIfaces[0]", func(t *testing.T) {
+		if manifest.PlaceholderTrunkInterface != "trunk_interface" {
+			t.Fatalf("PlaceholderTrunkInterface = %q, want trunk_interface", manifest.PlaceholderTrunkInterface)
+		}
 		r := newTestRepo(t)
 		reg := r.parseRegistry(t, "[users.u1]\nuid = 2001\n")
 		r.writeFile(t, "components/app/app.container.tmpl", "parent={{ .Net.ParentInterface }}\n")
@@ -1266,6 +1269,10 @@ dns = ["10.0.0.1"]
 		if err != nil {
 			t.Fatalf("RenderHost default failed: %v", err)
 		}
+		if !renderedDefault.UsedPlaceholderTrunk || !renderedDefault.Components[0].UsedPlaceholderTrunk {
+			t.Fatalf("expected UsedPlaceholderTrunk=true on host and component, got host=%v comp=%v",
+				renderedDefault.UsedPlaceholderTrunk, renderedDefault.Components[0].UsedPlaceholderTrunk)
+		}
 		gotDefault := string(findRenderedFile(t, renderedDefault.Components[0].Files, "app.container").Content)
 		if gotDefault != "parent=trunk_interface\n" {
 			t.Fatalf("expected trunk_interface placeholder, got %q", gotDefault)
@@ -1276,13 +1283,17 @@ dns = ["10.0.0.1"]
 			t.Fatal("expected error when DryRun=false, vlan=0, and ParentIfaces[0] is empty")
 		}
 
-		// Non-dry-run with explicit ParentIfaces[0] succeeds.
+		// Non-dry-run with explicit ParentIfaces[0] succeeds and clears UsedPlaceholderTrunk.
 		renderedLive, err := manifest.RenderHost(resolved, manifest.RenderEnv{
 			ParentIfaces: map[int]string{0: "enp3s0"},
 			DryRun:       false,
 		})
 		if err != nil {
 			t.Fatalf("RenderHost live explicit failed: %v", err)
+		}
+		if renderedLive.UsedPlaceholderTrunk || renderedLive.Components[0].UsedPlaceholderTrunk {
+			t.Fatalf("expected UsedPlaceholderTrunk=false when ParentIfaces[0] provided, got host=%v comp=%v",
+				renderedLive.UsedPlaceholderTrunk, renderedLive.Components[0].UsedPlaceholderTrunk)
 		}
 		gotLive := string(findRenderedFile(t, renderedLive.Components[0].Files, "app.container").Content)
 		if gotLive != "parent=enp3s0\n" {
@@ -1295,6 +1306,10 @@ dns = ["10.0.0.1"]
 		})
 		if err != nil {
 			t.Fatalf("RenderHost explicit failed: %v", err)
+		}
+		if renderedExplicit.UsedPlaceholderTrunk || renderedExplicit.Components[0].UsedPlaceholderTrunk {
+			t.Fatalf("expected UsedPlaceholderTrunk=false in DryRun when ParentIfaces[0] provided, got host=%v comp=%v",
+				renderedExplicit.UsedPlaceholderTrunk, renderedExplicit.Components[0].UsedPlaceholderTrunk)
 		}
 		gotExplicit := string(findRenderedFile(t, renderedExplicit.Components[0].Files, "app.container").Content)
 		if gotExplicit != "parent=enp3s0\n" {
