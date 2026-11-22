@@ -99,8 +99,9 @@ func (c *Client) FetchAndVerify(ctx context.Context, appliedSHA string, allowNon
 
 // FetchAndVerifyDryRun performs a remote SSH fetch and verification inside an ephemeral
 // temporary bare repository so cfg.RepoDir and its refs are never mutated during --dry-run.
-// When cfg.RepoDir already contains a valid git repository, its object/ref history is seeded
-// read-only via `git clone --bare --local` so fast-forward checks against appliedSHA still work.
+// When cfg.RepoDir already contains a valid git repository with an objects directory,
+// objects/info/alternates is linked read-only to cfg.RepoDir/objects so appliedSHA and its
+// commit graph remain visible for fast-forward checks without copying objects into /tmp.
 // Callers must invoke cleanup() after ExportCommit completes.
 func (c *Client) FetchAndVerifyDryRun(ctx context.Context, appliedSHA string, allowNonFF bool) (newSHA string, cleanup func(), err error) {
 	branch, err := c.validateFetchConfig(appliedSHA, false)
@@ -116,22 +117,32 @@ func (c *Client) FetchAndVerifyDryRun(ctx context.Context, appliedSHA string, al
 		_ = os.RemoveAll(tmpRepo)
 	}
 
-	seeded := false
+	if err := ensureBareRepo(ctx, tmpRepo, branch); err != nil {
+		cleanupTmp()
+		return "", nil, err
+	}
+
 	if strings.TrimSpace(c.cfg.RepoDir) != "" {
 		if info, statErr := os.Stat(c.cfg.RepoDir); statErr == nil && info.IsDir() {
 			if _, revErr := runGit(ctx, c.cfg.RepoDir, nil, "rev-parse", "--git-dir"); revErr == nil {
-				if _, cloneErr := runGit(ctx, "", nil, "clone", "--bare", "--local", "--", c.cfg.RepoDir, tmpRepo); cloneErr != nil {
+				absRepoDir, absErr := filepath.Abs(c.cfg.RepoDir)
+				if absErr != nil {
 					cleanupTmp()
-					return "", nil, fmt.Errorf("seed dry-run repo from %q: %w", c.cfg.RepoDir, cloneErr)
+					return "", nil, fmt.Errorf("resolve repo_dir %q: %w", c.cfg.RepoDir, absErr)
 				}
-				seeded = true
+				objectsDir := filepath.Join(absRepoDir, "objects")
+				if objInfo, objErr := os.Stat(objectsDir); objErr == nil && objInfo.IsDir() {
+					altPath := filepath.Join(tmpRepo, "objects", "info", "alternates")
+					if mkErr := os.MkdirAll(filepath.Dir(altPath), 0o750); mkErr != nil {
+						cleanupTmp()
+						return "", nil, fmt.Errorf("create dry-run alternates dir %q: %w", filepath.Dir(altPath), mkErr)
+					}
+					if writeErr := os.WriteFile(altPath, []byte(objectsDir+"\n"), 0o644); writeErr != nil {
+						cleanupTmp()
+						return "", nil, fmt.Errorf("write dry-run alternates %q: %w", altPath, writeErr)
+					}
+				}
 			}
-		}
-	}
-	if !seeded {
-		if err := ensureBareRepo(ctx, tmpRepo, branch); err != nil {
-			cleanupTmp()
-			return "", nil, err
 		}
 	}
 

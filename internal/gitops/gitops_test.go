@@ -802,6 +802,20 @@ func TestFetchAndVerifyDryRunIsolatesRepoDirAndVerifiesFastForward(t *testing.T)
 		cleanup()
 		t.Fatalf("expected activeRepo to point to temp repo, got %q", tmpRepo)
 	}
+	altBytes, err := os.ReadFile(filepath.Join(tmpRepo, "objects", "info", "alternates"))
+	if err != nil {
+		cleanup()
+		t.Fatalf("expected objects/info/alternates in dry-run temp repo: %v", err)
+	}
+	wantAlt := filepath.Join(mirrorDir, "objects") + "\n"
+	if string(altBytes) != wantAlt {
+		cleanup()
+		t.Fatalf("objects/info/alternates = %q, want %q", string(altBytes), wantAlt)
+	}
+	if _, err := resolveCommitSHA(ctx, tmpRepo, sha1); err != nil {
+		cleanup()
+		t.Fatalf("expected sha1 visible in dry-run temp repo via alternates: %v", err)
+	}
 
 	exportDir := t.TempDir()
 	if err := client.ExportCommit(ctx, got2, exportDir); err != nil {

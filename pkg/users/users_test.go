@@ -1042,6 +1042,125 @@ func TestAdoptSubIDRollbackOnMigrateFailureAndLingerBeforeSubID(t *testing.T) {
 	})
 }
 
+func TestApplyPartialMigrateFailureRevertsOnlyUnmigratedUsers(t *testing.T) {
+	runCase := func(t *testing.T, betaHadPrior bool) {
+		t.Helper()
+		dir := t.TempDir()
+		passwdPath := filepath.Join(dir, "passwd")
+		subuidPath := filepath.Join(dir, "subuid")
+		subgidPath := filepath.Join(dir, "subgid")
+		lingerDir := filepath.Join(dir, "linger")
+		runUserDir := filepath.Join(dir, "run_user")
+
+		mustMkdirAll(t, lingerDir)
+		mustWriteFile(t, filepath.Join(lingerDir, "alpha"), "")
+		mustWriteFile(t, filepath.Join(lingerDir, "beta"), "")
+		mustWriteFile(t, passwdPath, "core:x:1000:1000::/var/home/core:/bin/bash\nalpha:x:2001:2001::/var/home/alpha:/usr/sbin/nologin\nbeta:x:2002:2002::/var/home/beta:/usr/sbin/nologin\n")
+
+		priorLines := "core:100000:65536\nalpha:200000:65536\n"
+		if betaHadPrior {
+			priorLines += "beta:300000:65536\n"
+		}
+		mustWriteFile(t, subuidPath, priorLines)
+		mustWriteFile(t, subgidPath, priorLines)
+
+		reg, err := users.ParseRegistry([]byte(`
+[users.alpha]
+uid = 2001
+
+[users.beta]
+uid = 2002
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		failBeta := true
+		runner := &fakeRunner{
+			hook: func(_ context.Context, name string, args ...string) ([]byte, error) {
+				if name == "systemd-run" && slices.Contains(args, "migrate") && slices.Contains(args, "--machine=beta@.host") && failBeta {
+					return []byte("beta migrate failed"), os.ErrPermission
+				}
+				return nil, nil
+			},
+		}
+
+		rec := users.NewReconciler(users.Options{
+			PasswdPath: passwdPath,
+			SubUIDPath: subuidPath,
+			SubGIDPath: subgidPath,
+			LingerDir:  lingerDir,
+			RunUserDir: runUserDir,
+			HomeBase:   filepath.Join(dir, "home"),
+			BusTimeout: 200 * time.Millisecond,
+			Runner:     runner,
+		})
+
+		if _, err := rec.Apply(context.Background(), reg, []string{"alpha", "beta"}, nil); err == nil {
+			t.Fatal("expected Apply to fail on beta podman system migrate")
+		}
+
+		wantAfterFail := "core:100000:65536\nalpha:1065536:65536\n"
+		if betaHadPrior {
+			wantAfterFail += "beta:300000:65536\n"
+		}
+		if got := mustReadFile(t, subuidPath); got != wantAfterFail {
+			t.Fatalf("subuid after partial migrate failure mismatch:\ngot:\n%s\nwant:\n%s", got, wantAfterFail)
+		}
+		if got := mustReadFile(t, subgidPath); got != wantAfterFail {
+			t.Fatalf("subgid after partial migrate failure mismatch:\ngot:\n%s\nwant:\n%s", got, wantAfterFail)
+		}
+
+		// Subsequent Plan schedules updates and MigratePodman ONLY for beta (zero mutating actions for alpha).
+		planNext, err := rec.Plan(context.Background(), reg, []string{"alpha", "beta"}, nil)
+		if err != nil {
+			t.Fatalf("Plan after partial migrate failure failed: %v", err)
+		}
+		wantActions := []users.ActionKind{
+			users.AdoptUser, // alpha
+			users.AdoptUser, // beta
+			users.UpdateSubUID,
+			users.UpdateSubGID,
+			users.MigratePodman,
+		}
+		var gotKinds []users.ActionKind
+		for _, a := range planNext.Actions {
+			gotKinds = append(gotKinds, a.Kind)
+			if a.User == "alpha" && a.Kind != users.AdoptUser {
+				t.Fatalf("unexpected non-AdoptUser action for already-migrated alpha: %+v", a)
+			}
+			if a.Kind == users.UpdateSubUID || a.Kind == users.UpdateSubGID || a.Kind == users.MigratePodman {
+				if a.User != "beta" {
+					t.Fatalf("expected action %s only for beta, got %+v", a.Kind, a)
+				}
+			}
+		}
+		if !slices.Equal(gotKinds, wantActions) {
+			t.Fatalf("next Plan action kinds = %v, want %v", gotKinds, wantActions)
+		}
+
+		// Retry succeeds cleanly.
+		failBeta = false
+		if _, err := rec.Apply(context.Background(), reg, []string{"alpha", "beta"}, nil); err != nil {
+			t.Fatalf("retry Apply failed: %v", err)
+		}
+		wantFinal := "core:100000:65536\nalpha:1065536:65536\nbeta:1131072:65536\n"
+		if got := mustReadFile(t, subuidPath); got != wantFinal {
+			t.Fatalf("subuid after retry mismatch:\ngot:\n%s\nwant:\n%s", got, wantFinal)
+		}
+		if got := mustReadFile(t, subgidPath); got != wantFinal {
+			t.Fatalf("subgid after retry mismatch:\ngot:\n%s\nwant:\n%s", got, wantFinal)
+		}
+	}
+
+	t.Run("beta_had_prior_subid_line", func(t *testing.T) {
+		runCase(t, true)
+	})
+	t.Run("beta_had_no_prior_subid_line", func(t *testing.T) {
+		runCase(t, false)
+	})
+}
+
 func mustWriteFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {

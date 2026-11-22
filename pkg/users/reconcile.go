@@ -297,6 +297,8 @@ func (r *Reconciler) Apply(ctx context.Context, reg *Registry, activeUsers []str
 		hasSubIDSnap bool
 		subuidSnap   subIDFileSnapshot
 		subgidSnap   subIDFileSnapshot
+		priorSubUIDs map[string]priorSubIDRecord
+		priorSubGIDs map[string]priorSubIDRecord
 	)
 	if len(migrateActions) > 0 {
 		var err error
@@ -305,6 +307,14 @@ func (r *Reconciler) Apply(ctx context.Context, reg *Registry, activeUsers []str
 			return plan, err
 		}
 		subgidSnap, err = snapshotSubIDFile(r.opts.SubGIDPath)
+		if err != nil {
+			return plan, err
+		}
+		priorSubUIDs, err = capturePriorSubIDRecords(subuidSnap, subuidUpdates)
+		if err != nil {
+			return plan, err
+		}
+		priorSubGIDs, err = capturePriorSubIDRecords(subgidSnap, subgidUpdates)
 		if err != nil {
 			return plan, err
 		}
@@ -323,6 +333,24 @@ func (r *Reconciler) Apply(ctx context.Context, reg *Registry, activeUsers []str
 		}
 		if len(subgidUpdates) > 0 {
 			if err := restoreSubIDSnapshot(r.opts.SubGIDPath, subgidSnap); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		return errors.Join(errs...)
+	}
+
+	restoreSubIDsPartial := func(migrated map[string]bool) error {
+		if !hasSubIDSnap {
+			return nil
+		}
+		var errs []error
+		if len(subuidUpdates) > 0 {
+			if err := restoreUnmigratedSubIDs(r.opts.SubUIDPath, subuidSnap, subuidUpdates, priorSubUIDs, migrated); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if len(subgidUpdates) > 0 {
+			if err := restoreUnmigratedSubIDs(r.opts.SubGIDPath, subgidSnap, subgidUpdates, priorSubGIDs, migrated); err != nil {
 				errs = append(errs, err)
 			}
 		}
@@ -355,6 +383,7 @@ func (r *Reconciler) Apply(ctx context.Context, reg *Registry, activeUsers []str
 		}
 	}
 
+	migrated := make(map[string]bool, len(migrateActions))
 	for _, act := range migrateActions {
 		if _, err := r.opts.Runner.Run(
 			ctx,
@@ -369,11 +398,18 @@ func (r *Reconciler) Apply(ctx context.Context, reg *Registry, activeUsers []str
 			"migrate",
 		); err != nil {
 			migErr := fmt.Errorf("podman system migrate for %q: %w", act.User, err)
-			if rbErr := restoreSubIDs(); rbErr != nil {
+			var rbErr error
+			if len(migrated) == 0 {
+				rbErr = restoreSubIDs()
+			} else {
+				rbErr = restoreSubIDsPartial(migrated)
+			}
+			if rbErr != nil {
 				return plan, errors.Join(migErr, rbErr)
 			}
 			return plan, migErr
 		}
+		migrated[act.User] = true
 	}
 
 	return plan, nil
@@ -446,6 +482,100 @@ type subIDFileSnapshot struct {
 	existed bool
 	data    []byte
 	mode    os.FileMode
+}
+
+type priorSubIDRecord struct {
+	existed bool
+	entries []SubIDEntry
+}
+
+func capturePriorSubIDRecords(snap subIDFileSnapshot, updates []SubIDEntry) (map[string]priorSubIDRecord, error) {
+	prior := make(map[string]priorSubIDRecord, len(updates))
+	for _, upd := range updates {
+		prior[upd.Name] = priorSubIDRecord{}
+	}
+	if !snap.existed {
+		return prior, nil
+	}
+	lines, err := parseSubIDLines(snap.data)
+	if err != nil {
+		return nil, fmt.Errorf("parse pre-apply subid snapshot: %w", err)
+	}
+	for _, l := range lines {
+		if l.entry == nil {
+			continue
+		}
+		if rec, ok := prior[l.entry.Name]; ok {
+			rec.existed = true
+			rec.entries = append(rec.entries, *l.entry)
+			prior[l.entry.Name] = rec
+		}
+	}
+	return prior, nil
+}
+
+func restoreUnmigratedSubIDs(
+	path string,
+	snap subIDFileSnapshot,
+	updates []SubIDEntry,
+	prior map[string]priorSubIDRecord,
+	migrated map[string]bool,
+) error {
+	curData, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %q during partial subid rollback: %w", path, err)
+	}
+	lines, err := parseSubIDLines(curData)
+	if err != nil {
+		return fmt.Errorf("parse %q during partial subid rollback: %w", path, err)
+	}
+
+	updatedSet := make(map[string]bool, len(updates))
+	for _, upd := range updates {
+		updatedSet[upd.Name] = true
+	}
+
+	restored := make(map[string]bool, len(updates))
+	outLines := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if l.entry == nil || !updatedSet[l.entry.Name] || migrated[l.entry.Name] {
+			outLines = append(outLines, l.raw)
+			continue
+		}
+		if restored[l.entry.Name] {
+			continue
+		}
+		restored[l.entry.Name] = true
+		if rec, ok := prior[l.entry.Name]; ok && rec.existed {
+			for _, e := range rec.entries {
+				outLines = append(outLines, formatSubIDEntry(e))
+			}
+		}
+	}
+	for _, upd := range updates {
+		if migrated[upd.Name] || restored[upd.Name] {
+			continue
+		}
+		if rec, ok := prior[upd.Name]; ok && rec.existed {
+			restored[upd.Name] = true
+			for _, e := range rec.entries {
+				outLines = append(outLines, formatSubIDEntry(e))
+			}
+		}
+	}
+
+	content := ""
+	if len(outLines) > 0 {
+		content = strings.Join(outLines, "\n") + "\n"
+	}
+	mode := snap.mode
+	if mode == 0 {
+		mode = 0o644
+	}
+	if err := writeFileAtomic(path, []byte(content), mode); err != nil {
+		return fmt.Errorf("partially restore %q during rollback: %w", path, err)
+	}
+	return nil
 }
 
 func snapshotSubIDFile(path string) (subIDFileSnapshot, error) {

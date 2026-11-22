@@ -634,25 +634,18 @@ func (r *Reconciler) Restore(ctx context.Context, snap *Snapshot, createdDuringA
 	}
 
 	if len(inactiveItems) > 0 {
-		// Deactivate previously-inactive profiles after property restoration in delete order
-		// (macvlan -> vrf -> vlan) against a refreshed active set so re-added autoconnect=yes
-		// profiles are caught and controller teardown never races port deactivation.
+		// Unconditionally deactivate previously-inactive profiles after property restoration
+		// in delete order (macvlan -> vrf -> vlan) so async NetworkManager activation can
+		// never slip past a stale active list; downConnection treats not-active (exit 10) as nil.
 		slices.SortFunc(inactiveItems, func(a, b snapItem) int {
 			if ra, rb := deleteRank(a.kind, a.name), deleteRank(b.kind, b.name); ra != rb {
 				return ra - rb
 			}
 			return strings.Compare(a.name, b.name)
 		})
-		postRestoreActive, err := r.listActiveConnectionNames(ctx)
-		if err != nil {
-			errs = append(errs, err)
-			postRestoreActive = nil
-		}
 		for _, item := range inactiveItems {
-			if postRestoreActive == nil || postRestoreActive[item.name] {
-				if err := r.downConnection(ctx, item.name); err != nil {
-					errs = append(errs, err)
-				}
+			if err := r.downConnection(ctx, item.name); err != nil {
+				errs = append(errs, err)
 			}
 		}
 	}
@@ -1094,9 +1087,40 @@ func (r *Reconciler) restoreProfile(ctx context.Context, connName, kind string, 
 		return fmt.Errorf("cannot restore unknown profile kind %q for %q", kind, connName)
 	}
 
-	mutated, _, err := r.ensureProfile(ctx, connName, kind, desired, addFn)
+	addedDuringRestore := false
+	addProps := desired
+	if !wasActive && desired["connection.autoconnect"] != "no" {
+		cloned := make(map[string]string, len(desired))
+		for k, v := range desired {
+			cloned[k] = v
+		}
+		cloned["connection.autoconnect"] = "no"
+		addProps = cloned
+	}
+
+	wrappedAddFn := func() ([]string, error) {
+		addedDuringRestore = true
+		switch kind {
+		case kindVLAN:
+			return vlanAddArgs(connName, addProps), nil
+		case kindVRF:
+			return vrfAddArgs(connName, addProps), nil
+		case kindMacvlan:
+			return macvlanAddArgs(connName, addProps), nil
+		default:
+			return addFn()
+		}
+	}
+
+	mutated, _, err := r.ensureProfile(ctx, connName, kind, desired, wrappedAddFn)
 	if err != nil {
 		return err
+	}
+	if addedDuringRestore && !wasActive && desired["connection.autoconnect"] != "no" {
+		out, err := r.runner.Run(ctx, nil, "nmcli", "connection", "modify", connName, "connection.autoconnect", desired["connection.autoconnect"])
+		if err != nil {
+			return formatCmdErr(fmt.Sprintf("nmcli connection modify %s connection.autoconnect", connName), out, err)
+		}
 	}
 	if !wasActive {
 		return nil

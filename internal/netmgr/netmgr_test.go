@@ -2022,7 +2022,7 @@ func TestRestorePreservesPreApplyInactiveProfilesAndCustomPrio0Rule(t *testing.T
 
 		runner.failHook = func(_ []byte, name string, args []string) ([]byte, error) {
 			if name == "nmcli" && len(args) >= 4 && args[0] == "connection" && args[1] == "add" && args[3] == "macvlan" {
-				// Simulate NM auto-activating newly re-added autoconnect=yes macvlan profile.
+				// Simulate NM auto-activating newly re-added macvlan profile despite autoconnect=no.
 				runner.active["qm-2001"] = true
 			}
 			return nil, nil
@@ -2031,6 +2031,29 @@ func TestRestorePreservesPreApplyInactiveProfilesAndCustomPrio0Rule(t *testing.T
 		runner.calls = nil
 		if err := r.Restore(ctx, snap, owned); err != nil {
 			t.Fatalf("Restore failed: %v", err)
+		}
+
+		// Newly added !wasActive profile must pass autoconnect=no on `add`, then restore autoconnect=yes via `modify`.
+		addIdx := -1
+		for i, c := range runner.calls {
+			if c.name == "nmcli" && len(c.args) >= 2 && c.args[0] == "connection" && c.args[1] == "add" {
+				addIdx = i
+				break
+			}
+		}
+		if addIdx < 0 {
+			t.Fatalf("expected nmcli connection add for deleted qm-2001, calls=%+v", runner.calls)
+		}
+		addArgs := runner.calls[addIdx].args
+		autoIdx := slices.Index(addArgs, "autoconnect")
+		if autoIdx < 0 || autoIdx+1 >= len(addArgs) || addArgs[autoIdx+1] != "no" {
+			t.Fatalf("expected nmcli connection add for !wasActive profile to pass autoconnect no, got %v", addArgs)
+		}
+		if findCallIndex(runner.calls, "nmcli", "connection", "modify", "qm-2001", "connection.autoconnect", "yes") < 0 {
+			t.Fatalf("expected snapshotted connection.autoconnect=yes restored via modify after add, calls=%+v", runner.calls)
+		}
+		if runner.conns["qm-2001"].props["connection.autoconnect"] != "yes" {
+			t.Fatalf("expected restored qm-2001 connection.autoconnect=yes, got %q", runner.conns["qm-2001"].props["connection.autoconnect"])
 		}
 
 		var downOrder []string
@@ -2048,8 +2071,10 @@ func TestRestorePreservesPreApplyInactiveProfilesAndCustomPrio0Rule(t *testing.T
 			}
 		}
 
-		// Simulate `nmcli connection down` returning "not an active connection" (exit 10)
-		// (for example, if listActiveConnectionNames fails or profile raced down right before `down`).
+		// Even when `nmcli connection show --active` lists NONE of the !wasActive profiles,
+		// Restore MUST call `nmcli connection down` unconditionally in macvlan -> vrf -> vlan order
+		// and treat exit 10 ("not an active connection") as a clean nil no-op.
+		runner.active = make(map[string]bool)
 		runner.calls = nil
 		runner.failHook = func(_ []byte, name string, args []string) ([]byte, error) {
 			if name == "nmcli" && len(args) >= 3 && args[0] == "connection" && args[1] == "down" {
@@ -2060,15 +2085,14 @@ func TestRestorePreservesPreApplyInactiveProfilesAndCustomPrio0Rule(t *testing.T
 		if err := r.Restore(ctx, snap, owned); err != nil {
 			t.Fatalf("expected Restore to treat not-an-active-connection (exit 10) on down as no-op, got: %v", err)
 		}
-		// Ensure `down` was actually invoked against the inactive snapshot (since all were inactive,
-		// listActiveConnectionNames returns empty unless forced; force active or test with failHook on down).
-		runner.active["qm-2001"] = true
-		runner.calls = nil
-		if err := r.Restore(ctx, snap, owned); err != nil {
-			t.Fatalf("expected Restore to treat not-an-active-connection (exit 10) on down as no-op when invoked, got: %v", err)
+		var unconditionalDownOrder []string
+		for _, c := range runner.calls {
+			if c.name == "nmcli" && len(c.args) >= 3 && c.args[0] == "connection" && c.args[1] == "down" {
+				unconditionalDownOrder = append(unconditionalDownOrder, c.args[2])
+			}
 		}
-		if findCallIndex(runner.calls, "nmcli", "connection", "down", "qm-2001") < 0 {
-			t.Fatalf("expected nmcli connection down qm-2001 to be invoked, calls=%+v", runner.calls)
+		if !slices.Equal(unconditionalDownOrder, []string{"qm-2001", "qmv-2001", "qm-vlan30"}) {
+			t.Fatalf("unconditional down order when --active empty = %v, want [qm-2001 qmv-2001 qm-vlan30]", unconditionalDownOrder)
 		}
 	})
 
