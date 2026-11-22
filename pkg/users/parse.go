@@ -15,6 +15,7 @@ const (
 	defaultSubIDUIDBase = 2000
 	defaultSubIDCount   = 65536
 	minServiceUID       = 1000
+	reservedRootfulUser = "rootful"
 )
 
 var validUsernameRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]*$`)
@@ -77,6 +78,9 @@ func ParseRegistry(data []byte) (*Registry, error) {
 	assignedRanges := make([]SubIDEntry, 0, len(names))
 
 	for _, name := range names {
+		if name == reservedRootfulUser {
+			return nil, fmt.Errorf("invalid username %q: reserved scope name", name)
+		}
 		if !validUsernameRe.MatchString(name) {
 			return nil, fmt.Errorf("invalid username %q: must match %s", name, validUsernameRe.String())
 		}
@@ -157,12 +161,14 @@ func resolveSubIDConfig(raw rawSubIDConfig) (SubIDConfig, error) {
 }
 
 // SubIDRange computes the deterministic (start, count) subuid/subgid range for uid,
-// honoring explicit per-user overrides when set.
+// honoring explicit per-user overrides when set. When subuid_start is omitted (0),
+// UID stride is computed strictly from cfg.Count (defaulting to 65536), not spec.SubUIDCount.
 func SubIDRange(uid int, spec UserSpec, cfg SubIDConfig) (start, count int) {
-	count = cfg.Count
-	if count <= 0 {
-		count = defaultSubIDCount
+	stride := cfg.Count
+	if stride <= 0 {
+		stride = defaultSubIDCount
 	}
+	count = stride
 	if spec.SubUIDCount > 0 {
 		count = spec.SubUIDCount
 	}
@@ -177,5 +183,5 @@ func SubIDRange(uid int, spec UserSpec, cfg SubIDConfig) (start, count int) {
 	if uidBase <= 0 {
 		uidBase = defaultSubIDUIDBase
 	}
-	return base + (uid-uidBase)*count, count
+	return base + (uid-uidBase)*stride, count
 }

@@ -90,7 +90,8 @@ func expandCgroupPath(pattern string, uid int, user, compName, unit string) (str
 	return expanded, len(segs), nil
 }
 
-func collectNFTGuardTargets(pattern string, host *manifest.ResolvedHost) ([]nftGuardTarget, error) {
+func (r *Reconciler) collectNFTGuardTargets(host *manifest.ResolvedHost) ([]nftGuardTarget, error) {
+	pattern := r.cgroupPattern
 	if pattern == "" {
 		pattern = DefaultCgroupPattern
 	}
@@ -119,10 +120,13 @@ func collectNFTGuardTargets(pattern string, host *manifest.ResolvedHost) ([]nftG
 			if err != nil {
 				return nil, err
 			}
-			if !seen[cgPath] {
+			if !seen[cgPath] && r.checkCgroupExists(cgPath) {
 				seen[cgPath] = true
 				cgroups = append(cgroups, cgPath)
 			}
+		}
+		if len(cgroups) == 0 {
+			continue
 		}
 		slices.Sort(cgroups)
 		targets = append(targets, nftGuardTarget{
@@ -141,7 +145,7 @@ func collectNFTGuardTargets(pattern string, host *manifest.ResolvedHost) ([]nftG
 	return targets, nil
 }
 
-// ApplyNFTables renders and atomically replaces `table inet quadmatic` for all rootless
+// ApplyNFTables renders and atomically replaces `table inet quadmatic` for all active rootless
 // outbound_guard-enabled components in host (or deletes the table if none remain).
 // Intended to run after workload systemd units are active so Linux nftables can resolve
 // cgroupv2 paths to live cgroup inodes.
@@ -155,7 +159,7 @@ func (r *Reconciler) ApplyNFTables(ctx context.Context, host *manifest.ResolvedH
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	targets, err := collectNFTGuardTargets(r.cgroupPattern, host)
+	targets, err := r.collectNFTGuardTargets(host)
 	if err != nil {
 		return "", err
 	}

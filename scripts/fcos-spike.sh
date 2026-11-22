@@ -110,6 +110,21 @@ check_3_provision_user() {
   log "systemctl --user -M ${SPIKE_USER}@ daemon-reload succeeded"
 }
 
+assert_tcp_blocked() {
+  local target_ip="$1"
+  local target_port="$2"
+  local label="$3"
+  local out rc=0
+  out="$(systemd-run --machine="${SPIKE_USER}@.host" --user --wait --quiet --pipe \
+    podman exec "$CONTAINER_NAME" sh -c 'nc -w 2 "$1" "$2" </dev/null 2>&1' _ "$target_ip" "$target_port")" || rc=$?
+  if [[ "$rc" -eq 0 ]] || [[ "$out" == *"SSH-"* ]]; then
+    fail "container unexpectedly reached ${target_ip}:${target_port} (${label}): ${out}"
+  fi
+  if [[ "$rc" -eq 127 ]] || [[ "$out" == *"Usage:"* ]] || [[ "$out" == *"unrecognized option"* ]] || [[ "$out" == *"invalid option"* ]] || [[ "$out" == *"not found"* ]]; then
+    fail "isolation probe command failed for ${target_ip}:${target_port} (rc=${rc}): ${out}"
+  fi
+}
+
 check_1_networking_and_pasta() {
   log "=== Check 1: L3Mdev sysctls, VLAN/VRF/macvlan setup, and rootless pasta isolation ==="
   local tcp_l3mdev udp_l3mdev
@@ -185,15 +200,9 @@ check_1_networking_and_pasta() {
   log "Verifying isolation from host sshd (port 22 on host loopback and host primary IP)..."
   local host_ip
   host_ip="$(ip -4 -o addr show dev "$TRUNK_IFACE" scope global | awk '{print $4}' | cut -d/ -f1 | head -n1)"
-  if systemd-run --machine="${SPIKE_USER}@.host" --user --wait --quiet \
-    podman exec "$CONTAINER_NAME" nc -z -w 2 127.0.0.1 22 >/dev/null 2>&1; then
-    fail "container unexpectedly reached 127.0.0.1:22 (host loopback isolation broken)"
-  fi
+  assert_tcp_blocked 127.0.0.1 22 "host loopback isolation broken"
   if [[ -n "$host_ip" ]]; then
-    if systemd-run --machine="${SPIKE_USER}@.host" --user --wait --quiet \
-      podman exec "$CONTAINER_NAME" nc -z -w 2 "$host_ip" 22 >/dev/null 2>&1; then
-      fail "container unexpectedly reached host sshd at ${host_ip}:22"
-    fi
+    assert_tcp_blocked "$host_ip" 22 "host primary IP sshd"
   fi
   log "Isolation from host sshd verified"
 }

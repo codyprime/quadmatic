@@ -100,12 +100,51 @@ subuid_count = 65536
 		}
 	})
 
-	t.Run("rejects invalid username and unknown keys", func(t *testing.T) {
+	t.Run("rejects invalid username, reserved rootful, and unknown keys", func(t *testing.T) {
 		if _, err := users.ParseRegistry([]byte("[users.BadUser]\nuid = 2001\n")); err == nil {
 			t.Fatal("expected error for invalid username, got nil")
 		}
+		if _, err := users.ParseRegistry([]byte("[users.rootful]\nuid = 2001\n")); err == nil {
+			t.Fatal("expected error for reserved username rootful, got nil")
+		}
 		if _, err := users.ParseRegistry([]byte("extra = true\n[users.good]\nuid = 2001\n")); err == nil {
 			t.Fatal("expected error for unknown key, got nil")
+		}
+	})
+
+	t.Run("SubIDRange uses cfg.Count as UID stride when subuid_start is omitted", func(t *testing.T) {
+		tomlData := `
+[users.small]
+uid = 2001
+subuid_count = 1000
+
+[users.next]
+uid = 2002
+`
+		reg, err := users.ParseRegistry([]byte(tomlData))
+		if err != nil {
+			t.Fatalf("ParseRegistry failed: %v", err)
+		}
+		start, count := users.SubIDRange(2001, reg.Users["small"], reg.SubID)
+		if start != 1_065_536 || count != 1000 {
+			t.Fatalf("expected (1065536, 1000) using cfg.Count stride, got (%d, %d)", start, count)
+		}
+		nextStart, nextCount := users.SubIDRange(2002, reg.Users["next"], reg.SubID)
+		if nextStart != 1_131_072 || nextCount != 65536 {
+			t.Fatalf("expected (1131072, 65536), got (%d, %d)", nextStart, nextCount)
+		}
+
+		// A subuid_count > cfg.Count without subuid_start still uses cfg.Count stride and is caught as overlap with uid=2002.
+		overlapTOML := `
+[users.wide]
+uid = 2001
+subuid_count = 131072
+
+[users.next]
+uid = 2002
+`
+		if _, err := users.ParseRegistry([]byte(overlapTOML)); err == nil {
+			t.Fatal("expected overlap error when subuid_count exceeds cfg.Count stride")
 		}
 	})
 

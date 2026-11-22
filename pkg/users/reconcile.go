@@ -81,6 +81,9 @@ func (r *Reconciler) Plan(ctx context.Context, reg *Registry, activeUsers []stri
 	sortedActive := dedupAndSort(activeUsers)
 	activeSet := make(map[string]bool, len(sortedActive))
 	for _, u := range sortedActive {
+		if u == reservedRootfulUser {
+			return nil, fmt.Errorf("invalid username %q: reserved scope name", u)
+		}
 		if _, ok := reg.Users[u]; !ok {
 			return nil, fmt.Errorf("active user %q not found in users registry", u)
 		}

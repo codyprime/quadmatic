@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -64,27 +66,33 @@ func newZeroL3mdevSysctl() *fakeSysctl {
 }
 
 type fakeRunner struct {
-	calls        []recordedCmd
-	conns        map[string]*fakeNMConn
-	active       map[string]bool
-	unmanagedDev []fakeDevice
-	dnsByIface   map[string]string
-	dnsPolls     map[string]int
-	dnsReadyAt   map[string]int
-	routes       map[int][]string
-	nftTable     string
-	nftCounters  bool
-	failHook     func(stdin []byte, name string, args []string) ([]byte, error)
+	calls          []recordedCmd
+	conns          map[string]*fakeNMConn
+	active         map[string]bool
+	unmanagedDev   []fakeDevice
+	rawVLANShowOut map[string]string
+	rawIPLinkOut   map[string]string
+	dnsByIface     map[string]string
+	dnsPolls       map[string]int
+	dnsReadyAt     map[string]int
+	routes         map[int][]string
+	routes6        map[int][]string
+	nftTable       string
+	nftCounters    bool
+	failHook       func(stdin []byte, name string, args []string) ([]byte, error)
 }
 
 func newFakeRunner() *fakeRunner {
 	return &fakeRunner{
-		conns:      make(map[string]*fakeNMConn),
-		active:     make(map[string]bool),
-		dnsByIface: make(map[string]string),
-		dnsPolls:   make(map[string]int),
-		dnsReadyAt: make(map[string]int),
-		routes:     make(map[int][]string),
+		conns:          make(map[string]*fakeNMConn),
+		active:         make(map[string]bool),
+		rawVLANShowOut: make(map[string]string),
+		rawIPLinkOut:   make(map[string]string),
+		dnsByIface:     make(map[string]string),
+		dnsPolls:       make(map[string]int),
+		dnsReadyAt:     make(map[string]int),
+		routes:         make(map[int][]string),
+		routes6:        make(map[int][]string),
 	}
 }
 
@@ -209,6 +217,9 @@ doneFlags:
 			if len(rest) >= 3 {
 				id := rest[len(rest)-1]
 				if getValues == "vlan.parent,vlan.id" {
+					if raw, ok := f.rawVLANShowOut[id]; ok {
+						return []byte(raw), nil
+					}
 					for _, d := range f.unmanagedDev {
 						if d.conn == id {
 							return []byte(fmt.Sprintf("%s\n%d\n", d.parent, d.vlanID)), nil
@@ -332,15 +343,24 @@ func applyNMCLIModifyProps(props map[string]string, args []string) {
 }
 
 func (f *fakeRunner) handleIP(args []string) ([]byte, error) {
+	isV6 := false
+	if len(args) > 0 && args[0] == "-6" {
+		isV6 = true
+		args = args[1:]
+	}
+	routeStore := f.routes
+	if isV6 {
+		routeStore = f.routes6
+	}
 	if len(args) >= 2 && args[0] == "route" {
 		switch args[1] {
 		case "replace":
 			tableID, route := extractIPRouteAndTable(args[2:])
-			f.routes[tableID] = []string{route}
+			routeStore[tableID] = []string{route}
 			return nil, nil
 		case "del":
 			tableID, _ := extractIPRouteAndTable(args[2:])
-			delete(f.routes, tableID)
+			delete(routeStore, tableID)
 			return nil, nil
 		case "show":
 			tableID := 0
@@ -349,11 +369,14 @@ func (f *fakeRunner) handleIP(args []string) ([]byte, error) {
 					tableID, _ = strconv.Atoi(args[i+1])
 				}
 			}
-			return []byte(strings.Join(f.routes[tableID], "\n")), nil
+			return []byte(strings.Join(routeStore[tableID], "\n")), nil
 		}
 	}
 	if len(args) >= 5 && args[0] == "-d" && args[1] == "-o" && args[2] == "link" && args[3] == "show" {
 		devName := args[len(args)-1]
+		if raw, ok := f.rawIPLinkOut[devName]; ok {
+			return []byte(raw), nil
+		}
 		for _, d := range f.unmanagedDev {
 			if d.device == devName {
 				return []byte(fmt.Sprintf("5: %s@%s: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 vlan protocol 802.1Q id %d", d.device, d.parent, d.vlanID)), nil
@@ -412,6 +435,8 @@ func (f *fakeRunner) handleNFT(stdin string, args []string) ([]byte, error) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+func alwaysCgroupExists(string) bool { return true }
 
 func TestCheckKernelInvariantsRejectsNonZeroL3mdevAccept(t *testing.T) {
 	runner := newFakeRunner()
@@ -481,6 +506,7 @@ func TestApplyRootlessCreatesVLANVRFMacvlanAndNFTGuard(t *testing.T) {
 	}
 
 	r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+	r.CgroupExists = alwaysCgroupExists
 	owned, liveDNS, nftHash, err := r.Apply(ctx, host, nil, 2*time.Second)
 	if err != nil {
 		t.Fatalf("Apply unexpected error: %v", err)
@@ -532,6 +558,7 @@ func TestApplyRootlessCreatesVLANVRFMacvlanAndNFTGuard(t *testing.T) {
 	if mvConn.props["macvlan.parent"] != "qm-vlan30" ||
 		mvConn.props["macvlan.mode"] != "private" ||
 		mvConn.props["connection.controller"] != "qmv-2001" ||
+		mvConn.props["connection.port-type"] != "vrf" ||
 		strings.ToLower(mvConn.props["802-3-ethernet.cloned-mac-address"]) != "02:51:4d:00:07:d1" ||
 		mvConn.props["ipv4.method"] != "auto" ||
 		mvConn.props["ipv4.route-table"] != "12001" ||
@@ -657,6 +684,7 @@ func TestReuseUnmanagedManagementVLANAndNeverPruneIt(t *testing.T) {
 	}
 
 	r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+	r.CgroupExists = alwaysCgroupExists
 
 	parents, err := r.ResolveVLANParents(ctx, hostWithComp)
 	if err != nil {
@@ -723,6 +751,7 @@ func TestRestoreRollbackDeletesNewConnectionsAndRestoresSnapshot(t *testing.T) {
 	ctx := context.Background()
 	runner := newFakeRunner()
 	r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+	r.CgroupExists = alwaysCgroupExists
 
 	// Commit 1 succeeds with component A (UID 2001, VLAN 30).
 	host1 := &manifest.ResolvedHost{
@@ -832,6 +861,7 @@ func TestSnapshotAndRestoreWhenNFTablesAbsent(t *testing.T) {
 	ctx := context.Background()
 	runner := newFakeRunner()
 	r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+	r.CgroupExists = alwaysCgroupExists
 
 	// Clean host: Snapshot succeeds even when table inet quadmatic does not exist yet.
 	snap, err := r.Snapshot(ctx, nil)
@@ -950,6 +980,7 @@ func TestApplyValidationAndDHCPTimeoutAndDrift(t *testing.T) {
 	t.Run("DetectDrift catches missing unreachable route and modified profile and nft drift", func(t *testing.T) {
 		runner := newFakeRunner()
 		r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+		r.CgroupExists = alwaysCgroupExists
 		host := &manifest.ResolvedHost{
 			Hostname: "services-02",
 			Components: []manifest.ResolvedComponent{
@@ -1007,6 +1038,7 @@ func TestIPv6CustomCgroupPatternIdempotencyAndEdgeCases(t *testing.T) {
 	t.Run("ipv6 bridge mode custom cgroup pattern and idempotent second Apply", func(t *testing.T) {
 		runner := newFakeRunner()
 		r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+		r.CgroupExists = alwaysCgroupExists
 		if err := r.SetCgroupPattern("user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{unit}/container"); err != nil {
 			t.Fatalf("SetCgroupPattern error: %v", err)
 		}
@@ -1046,16 +1078,46 @@ func TestIPv6CustomCgroupPatternIdempotencyAndEdgeCases(t *testing.T) {
 			t.Fatal("expected qm-2005")
 		}
 		if mv.props["macvlan.mode"] != "bridge" ||
+			mv.props["connection.port-type"] != "vrf" ||
 			mv.props["ipv6.method"] != "auto" ||
 			mv.props["ipv6.route-table"] != "12005" ||
 			mv.props["ipv6.ignore-auto-dns"] != "yes" {
 			t.Fatalf("unexpected ipv6/bridge props: %+v", mv.props)
+		}
+		if gotR6 := runner.routes6[12005]; len(gotR6) != 1 || !strings.Contains(gotR6[0], "unreachable default") || !strings.Contains(gotR6[0], "metric 8192") {
+			t.Fatalf("expected IPv6 unreachable default route in table 12005, got %v", gotR6)
 		}
 		if !strings.Contains(runner.nftTable, `socket cgroupv2 level 6 "user.slice/user-2005.slice/user@2005.service/app.slice/stack-pod.service/container"`) {
 			t.Fatalf("missing level 6 .pod cgroup rule in:\n%s", runner.nftTable)
 		}
 		if !strings.Contains(runner.nftTable, `socket cgroupv2 level 6 "user.slice/user-2005.slice/user@2005.service/app.slice/web.service/container"`) {
 			t.Fatalf("missing level 6 .container cgroup rule in:\n%s", runner.nftTable)
+		}
+
+		// Missing IPv6 unreachable route must be flagged by DetectDrift and healed by Apply.
+		delete(runner.routes6, 12005)
+		drifted6, err := r.DetectDrift(ctx, host, owned)
+		if err != nil || !drifted6 {
+			t.Fatalf("DetectDrift after IPv6 route delete = (%v, %v), want (true, nil)", drifted6, err)
+		}
+		if owned, _, _, err = r.Apply(ctx, host, owned, time.Second); err != nil {
+			t.Fatalf("Apply heal IPv6 route error: %v", err)
+		}
+		if gotR6 := runner.routes6[12005]; len(gotR6) != 1 {
+			t.Fatalf("expected IPv6 unreachable route healed, got %v", gotR6)
+		}
+
+		// Snapshot & Restore preserves IPv6 unreachable route even after deleting it.
+		snap, err := r.Snapshot(ctx, owned)
+		if err != nil {
+			t.Fatalf("Snapshot error: %v", err)
+		}
+		delete(runner.routes6, 12005)
+		if err := r.Restore(ctx, snap, owned); err != nil {
+			t.Fatalf("Restore error: %v", err)
+		}
+		if gotR6 := runner.routes6[12005]; len(gotR6) != 1 {
+			t.Fatalf("expected IPv6 unreachable route restored, got %v", gotR6)
 		}
 
 		// Simulate NM returning "2 (bridge)" on connection show and verify second Apply is a no-op for NM add/modify/up.
@@ -1075,6 +1137,14 @@ func TestIPv6CustomCgroupPatternIdempotencyAndEdgeCases(t *testing.T) {
 					t.Fatalf("expected idempotent Apply not to call nmcli connection %s, got %v", call.args[1], call.args)
 				}
 			}
+		}
+
+		// Pruning removes both IPv4 and IPv6 unreachable default routes.
+		if _, _, _, err := r.Apply(ctx, &manifest.ResolvedHost{Hostname: "services-02"}, owned2, time.Second); err != nil {
+			t.Fatalf("prune Apply error: %v", err)
+		}
+		if len(runner.routes[12005]) != 0 || len(runner.routes6[12005]) != 0 {
+			t.Fatalf("expected both IPv4 and IPv6 routes cleaned up on prune, got v4=%v v6=%v", runner.routes[12005], runner.routes6[12005])
 		}
 	})
 
@@ -1267,6 +1337,7 @@ func TestApplyProfilesAndApplyNFTablesSeparationAndInodeDrift(t *testing.T) {
 	runner := newFakeRunner()
 	runner.dnsByIface["qm-2001"] = "10.30.0.1\n"
 	r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+	r.CgroupExists = alwaysCgroupExists
 
 	host := &manifest.ResolvedHost{
 		Hostname: "services-02",
@@ -1287,13 +1358,13 @@ func TestApplyProfilesAndApplyNFTablesSeparationAndInodeDrift(t *testing.T) {
 		},
 	}
 
-	// Stage 7a: ApplyProfiles must NOT invoke nft at all.
-	owned, liveDNS, err := r.ApplyProfiles(ctx, host, nil, time.Second)
+	// Stage 7a: ApplyProfiles must NOT invoke nft at all and must report mutated components.
+	owned, liveDNS, mutated, err := r.ApplyProfiles(ctx, host, nil, time.Second)
 	if err != nil {
 		t.Fatalf("ApplyProfiles error: %v", err)
 	}
-	if len(owned) != 3 || !slices.Equal(liveDNS["open-webui"], []string{"10.30.0.1"}) {
-		t.Fatalf("unexpected ApplyProfiles result: owned=%+v liveDNS=%+v", owned, liveDNS)
+	if len(owned) != 3 || !slices.Equal(liveDNS["open-webui"], []string{"10.30.0.1"}) || !mutated["open-webui"] {
+		t.Fatalf("unexpected ApplyProfiles result: owned=%+v liveDNS=%+v mutated=%+v", owned, liveDNS, mutated)
 	}
 	for _, call := range runner.calls {
 		if call.name == "nft" {
@@ -1302,6 +1373,15 @@ func TestApplyProfilesAndApplyNFTablesSeparationAndInodeDrift(t *testing.T) {
 	}
 	if runner.nftTable != "" {
 		t.Fatalf("expected no nft table after ApplyProfiles, got:\n%s", runner.nftTable)
+	}
+
+	// Idempotent ApplyProfiles returns empty mutatedComponents.
+	_, _, mutated2, err := r.ApplyProfiles(ctx, host, owned, time.Second)
+	if err != nil {
+		t.Fatalf("idempotent ApplyProfiles error: %v", err)
+	}
+	if len(mutated2) != 0 {
+		t.Fatalf("expected empty mutatedComponents on idempotent ApplyProfiles, got %+v", mutated2)
 	}
 
 	// Stage 7d: ApplyNFTables applies table inet quadmatic without invoking nmcli/ip.
@@ -1338,4 +1418,292 @@ func TestApplyProfilesAndApplyNFTablesSeparationAndInodeDrift(t *testing.T) {
 	if err != nil || drifted {
 		t.Fatalf("DetectDrift after ApplyNFTables re-bind = (%v, %v), want (false, nil)", drifted, err)
 	}
+}
+
+func TestStoppedOrMissingCgroupNFTablesBehavior(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("CgroupExistsUnderRoot distinguishes dir vs missing vs file", func(t *testing.T) {
+		root := t.TempDir()
+		cgDir := "user.slice/user-2001.slice/user@2001.service/app.slice/open-webui.service"
+		if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(cgDir)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		filePath := "user.slice/user-2001.slice/not-a-dir"
+		if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(filePath)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		pred := netmgr.CgroupExistsUnderRoot(root)
+		if !pred(cgDir) {
+			t.Fatalf("expected %q to exist as directory", cgDir)
+		}
+		if pred(filePath) {
+			t.Fatalf("expected non-dir %q to return false", filePath)
+		}
+		if pred("user.slice/user-2001.slice/user@2001.service/app.slice/stopped.service") {
+			t.Fatal("expected missing cgroup dir to return false")
+		}
+	})
+
+	t.Run("stopped single unit deletes stale table and does not fail or cause perpetual drift", func(t *testing.T) {
+		runner := newFakeRunner()
+		activeCgroups := map[string]bool{
+			"user.slice/user-2001.slice/user@2001.service/app.slice/open-webui.service": true,
+		}
+		r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+		r.CgroupExists = func(cg string) bool { return activeCgroups[cg] }
+
+		host := &manifest.ResolvedHost{
+			Hostname: "services-02",
+			Components: []manifest.ResolvedComponent{
+				{
+					Name: "open-webui",
+					User: "openwebui",
+					UID:  2001,
+					Network: &manifest.NetworkSpec{
+						VLAN:          30,
+						MAC:           "02:51:4d:00:07:d1",
+						DNS:           []string{"10.30.0.1"},
+						OutboundGuard: boolPtr(true),
+					},
+					QuadletFiles: []manifest.SourceFile{{RelPath: "open-webui.container"}},
+				},
+			},
+		}
+
+		owned, _, hash, err := r.Apply(ctx, host, nil, time.Second)
+		if err != nil || hash == "" || runner.nftTable == "" {
+			t.Fatalf("initial Apply failed: err=%v hash=%q table=%q", err, hash, runner.nftTable)
+		}
+
+		// Unit is manually stopped -> cgroup disappears -> nft shows numeric inode.
+		activeCgroups["user.slice/user-2001.slice/user@2001.service/app.slice/open-webui.service"] = false
+		runner.nftTable = strings.ReplaceAll(
+			runner.nftTable,
+			`"user.slice/user-2001.slice/user@2001.service/app.slice/open-webui.service"`,
+			`123456789`,
+		)
+
+		// DetectDrift sees stale table should be deleted.
+		drifted, err := r.DetectDrift(ctx, host, owned)
+		if err != nil || !drifted {
+			t.Fatalf("DetectDrift when stale table remains for stopped unit = (%v, %v), want (true, nil)", drifted, err)
+		}
+
+		// ApplyNFTables must NOT fail with missing cgroup; it deletes table inet quadmatic cleanly.
+		runner.calls = nil
+		hashAfter, err := r.ApplyNFTables(ctx, host)
+		if err != nil {
+			t.Fatalf("ApplyNFTables on stopped unit failed: %v", err)
+		}
+		if hashAfter != "" || runner.nftTable != "" {
+			t.Fatalf("expected table inet quadmatic deleted, got hash=%q table=%q", hashAfter, runner.nftTable)
+		}
+		for _, call := range runner.calls {
+			if call.name == "nft" && len(call.args) >= 2 && call.args[0] == "-f" {
+				t.Fatalf("ApplyNFTables must not run nft -f - when zero active cgroups exist, got %v", call)
+			}
+		}
+
+		// Subsequent DetectDrift must return false (no perpetual drift while unit stays stopped).
+		driftedAfter, err := r.DetectDrift(ctx, host, owned)
+		if err != nil || driftedAfter {
+			t.Fatalf("DetectDrift after deleting stale table = (%v, %v), want (false, nil)", driftedAfter, err)
+		}
+	})
+
+	t.Run("mixed active and stopped units emit rules only for active cgroups", func(t *testing.T) {
+		runner := newFakeRunner()
+		activeCgroups := map[string]bool{
+			"user.slice/user-2001.slice/user@2001.service/app.slice/app1.service": true,
+			"user.slice/user-2002.slice/user@2002.service/app.slice/app2.service": false,
+		}
+		r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+		r.CgroupExists = func(cg string) bool { return activeCgroups[cg] }
+
+		host := &manifest.ResolvedHost{
+			Hostname: "services-02",
+			Components: []manifest.ResolvedComponent{
+				{
+					Name: "app1",
+					User: "app1",
+					UID:  2001,
+					Network: &manifest.NetworkSpec{
+						VLAN:          30,
+						MAC:           "02:51:4d:00:07:d1",
+						DNS:           []string{"10.30.0.1"},
+						OutboundGuard: boolPtr(true),
+					},
+					QuadletFiles: []manifest.SourceFile{{RelPath: "app1.container"}},
+				},
+				{
+					Name: "app2",
+					User: "app2",
+					UID:  2002,
+					Network: &manifest.NetworkSpec{
+						VLAN:          30,
+						MAC:           "02:51:4d:00:07:d2",
+						DNS:           []string{"10.30.0.1"},
+						OutboundGuard: boolPtr(true),
+					},
+					QuadletFiles: []manifest.SourceFile{{RelPath: "app2.container"}},
+				},
+			},
+		}
+
+		owned, _, _, err := r.Apply(ctx, host, nil, time.Second)
+		if err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if !strings.Contains(runner.nftTable, "guard_2001") || strings.Contains(runner.nftTable, "guard_2002") {
+			t.Fatalf("expected only active app1 (guard_2001) in ruleset, got:\n%s", runner.nftTable)
+		}
+		drifted, err := r.DetectDrift(ctx, host, owned)
+		if err != nil || drifted {
+			t.Fatalf("DetectDrift = (%v, %v), want (false, nil)", drifted, err)
+		}
+	})
+}
+
+func TestUnmanagedVLANFallbackAndPortTypeCompatibility(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("empty or UUID vlan.parent falls back to inspectKernelVLANLink", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			showOut string
+		}{
+			{name: "empty vlan.parent", showOut: "\n3\n"},
+			{name: "UUID vlan.parent", showOut: "5fb06bd0-0bb0-7ffb-45f1-d6edd65f3e03\n3\n"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				runner := newFakeRunner()
+				runner.unmanagedDev = []fakeDevice{
+					{device: "enp3s0.3", typ: "vlan", conn: "mgmt-vlan3", parent: "enp3s0", vlanID: 3},
+				}
+				runner.rawVLANShowOut["mgmt-vlan3"] = tc.showOut
+
+				r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+				host := &manifest.ResolvedHost{
+					Hostname: "services-02",
+					Components: []manifest.ResolvedComponent{
+						{
+							Name: "app",
+							User: "app",
+							UID:  2001,
+							Network: &manifest.NetworkSpec{
+								VLAN: 3,
+								MAC:  "02:51:4d:00:07:d1",
+								DNS:  []string{"10.0.3.1"},
+							},
+						},
+					},
+				}
+
+				parents, err := r.ResolveVLANParents(ctx, host)
+				if err != nil {
+					t.Fatalf("ResolveVLANParents error: %v", err)
+				}
+				if parents[3] != "enp3s0.3" {
+					t.Fatalf("parents[3] = %q, want enp3s0.3", parents[3])
+				}
+			})
+		}
+	})
+
+	t.Run("inspectKernelVLANLink enforces token delimiter before device@", func(t *testing.T) {
+		runner := newFakeRunner()
+		runner.unmanagedDev = []fakeDevice{
+			{device: "enp3s0.3", typ: "vlan", conn: "--", parent: "enp3s0", vlanID: 3},
+		}
+		// Malformed/substring device name without delimiter before enp3s0.3@ must NOT match.
+		runner.rawIPLinkOut["enp3s0.3"] = "5: bad_enp3s0.3@enp3s0: <BROADCAST> mtu 1500 vlan protocol 802.1Q id 3"
+
+		r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+		host := &manifest.ResolvedHost{
+			Hostname: "services-02",
+			Components: []manifest.ResolvedComponent{
+				{
+					Name: "app",
+					User: "app",
+					UID:  2001,
+					Network: &manifest.NetworkSpec{
+						VLAN: 3,
+						MAC:  "02:51:4d:00:07:d1",
+						DNS:  []string{"10.0.3.1"},
+					},
+				},
+			},
+		}
+		parents, err := r.ResolveVLANParents(ctx, host)
+		if err != nil {
+			t.Fatalf("ResolveVLANParents error: %v", err)
+		}
+		if parents[3] != "qm-vlan3" {
+			t.Fatalf("expected non-matching prefix to fall back to qm-vlan3, got %q", parents[3])
+		}
+
+		// Proper delimiter before enp3s0.3@ matches.
+		runner.rawIPLinkOut["enp3s0.3"] = "5: enp3s0.3@enp3s0: <BROADCAST> mtu 1500 vlan protocol 802.1Q id 3"
+		parents, err = r.ResolveVLANParents(ctx, host)
+		if err != nil {
+			t.Fatalf("ResolveVLANParents error: %v", err)
+		}
+		if parents[3] != "enp3s0.3" {
+			t.Fatalf("expected matching enp3s0.3, got %q", parents[3])
+		}
+	})
+
+	t.Run("connection.port-type vrf and legacy connection.slave-type compatibility", func(t *testing.T) {
+		runner := newFakeRunner()
+		r := netmgr.NewReconciler("enp3s0", runner, newZeroL3mdevSysctl())
+		r.CgroupExists = alwaysCgroupExists
+
+		host := &manifest.ResolvedHost{
+			Hostname: "services-02",
+			Components: []manifest.ResolvedComponent{
+				{
+					Name: "app",
+					User: "app",
+					UID:  2001,
+					Network: &manifest.NetworkSpec{
+						VLAN: 30,
+						MAC:  "02:51:4d:00:07:d1",
+						DNS:  []string{"10.30.0.1"},
+					},
+				},
+			},
+		}
+
+		owned, _, _, err := r.Apply(ctx, host, nil, time.Second)
+		if err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		mv := runner.conns["qm-2001"]
+		if mv.props["connection.port-type"] != "vrf" {
+			t.Fatalf("expected connection.port-type=vrf, got %+v", mv.props)
+		}
+
+		// Simulate NM returning legacy connection.slave-type=vrf with empty connection.port-type.
+		delete(mv.props, "connection.port-type")
+		mv.props["connection.slave-type"] = "vrf"
+		drifted, err := r.DetectDrift(ctx, host, owned)
+		if err != nil || drifted {
+			t.Fatalf("DetectDrift with connection.slave-type=vrf = (%v, %v), want (false, nil)", drifted, err)
+		}
+
+		// Wrong port-type / slave-type triggers drift and heals to vrf.
+		mv.props["connection.slave-type"] = "bridge"
+		drifted, err = r.DetectDrift(ctx, host, owned)
+		if err != nil || !drifted {
+			t.Fatalf("DetectDrift with wrong slave-type = (%v, %v), want (true, nil)", drifted, err)
+		}
+		if _, _, _, err := r.Apply(ctx, host, owned, time.Second); err != nil {
+			t.Fatalf("Apply heal port-type failed: %v", err)
+		}
+		if mv.props["connection.port-type"] != "vrf" {
+			t.Fatalf("expected healed connection.port-type=vrf, got %+v", mv.props)
+		}
+	})
 }

@@ -184,6 +184,58 @@ func TestRecorderHandlesNilResultError(t *testing.T) {
 	assertCounterValue(t, families, "quadmatic_reconcile_errors_total", map[string]string{"stage": "unknown"}, 1)
 }
 
+func TestRecorderPreservesUnitMetricsAcrossPreApplyErrors(t *testing.T) {
+	rec := NewRecorder("services-02")
+
+	// Baseline successful reconcile with active unit counts and one failed unit.
+	rec.RecordResult(&apply.Result{
+		AppliedSHA:           "sha-good",
+		ManagedUnitsRootless: 3,
+		ManagedUnitsRootful:  1,
+		FailedUnits: []apply.UnitStatus{
+			{Scope: "openwebui", Unit: "openwebui.service", ActiveState: "failed"},
+		},
+		Duration: 1 * time.Second,
+	}, nil)
+
+	for _, stage := range []string{"fetch", "verify", "validate"} {
+		rec.RecordResult(&apply.Result{
+			AppliedSHA:           "sha-good",
+			FailedStage:          stage,
+			ManagedUnitsRootless: 0,
+			ManagedUnitsRootful:  0,
+			FailedUnits:          nil,
+			Duration:             250 * time.Millisecond,
+		}, errors.New(stage+" failed"))
+
+		_, families := scrapeMetrics(t, rec.Handler())
+		assertGaugeValue(t, families, "quadmatic_last_sync_success", nil, 0)
+		assertGaugeValue(t, families, "quadmatic_managed_units", map[string]string{"scope": "rootless"}, 3)
+		assertGaugeValue(t, families, "quadmatic_managed_units", map[string]string{"scope": "rootful"}, 1)
+		assertGaugeValue(t, families, "quadmatic_failed_units", map[string]string{"user": "openwebui", "unit": "openwebui.service"}, 1)
+		assertGaugeValue(t, families, "quadmatic_applied_info", map[string]string{"sha": "sha-good", "hostname": "services-02"}, 1)
+		assertCounterValue(t, families, "quadmatic_reconcile_errors_total", map[string]string{"stage": stage}, 1)
+	}
+
+	// An "apply" stage failure with updated unit statuses DOES refresh unit metrics.
+	rec.RecordResult(&apply.Result{
+		AppliedSHA:           "sha-good",
+		FailedStage:          "apply",
+		RolledBack:           true,
+		ManagedUnitsRootless: 2,
+		ManagedUnitsRootful:  0,
+		FailedUnits:          nil,
+		Duration:             500 * time.Millisecond,
+	}, errors.New("apply failed"))
+
+	_, families := scrapeMetrics(t, rec.Handler())
+	assertGaugeValue(t, families, "quadmatic_managed_units", map[string]string{"scope": "rootless"}, 2)
+	assertGaugeValue(t, families, "quadmatic_managed_units", map[string]string{"scope": "rootful"}, 0)
+	if fam, ok := families["quadmatic_failed_units"]; ok && len(fam.GetMetric()) > 0 {
+		t.Fatalf("expected failed_units cleared on post-validate failure, got %+v", fam.GetMetric())
+	}
+}
+
 func TestNewServerRejectsWildcardBind(t *testing.T) {
 	rec := NewRecorder("services-02")
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -42,6 +43,15 @@ func newFakeUsersReconciler() *fakeUsersReconciler {
 	return &fakeUsersReconciler{
 		created: make(map[string]int),
 	}
+}
+
+func (f *fakeUsersReconciler) scopeForUID(uid int) string {
+	for u, id := range f.created {
+		if id == uid {
+			return u
+		}
+	}
+	return ""
 }
 
 func (f *fakeUsersReconciler) Plan(_ context.Context, reg *users.Registry, activeUsers []string, _ []string) (*users.Plan, error) {
@@ -283,6 +293,7 @@ type fakeNetRunner struct {
 	active     map[string]bool
 	dnsByIface map[string]string
 	routes     map[int][]string
+	routes6    map[int][]string
 	nftTable   string
 }
 
@@ -292,6 +303,7 @@ func newFakeNetRunner() *fakeNetRunner {
 		active:     make(map[string]bool),
 		dnsByIface: make(map[string]string),
 		routes:     make(map[int][]string),
+		routes6:    make(map[int][]string),
 	}
 }
 
@@ -472,15 +484,24 @@ func parseNMCLIAdd(args []string) map[string]string {
 }
 
 func (f *fakeNetRunner) handleIP(args []string) ([]byte, error) {
+	isV6 := false
+	if len(args) > 0 && args[0] == "-6" {
+		isV6 = true
+		args = args[1:]
+	}
+	routeStore := f.routes
+	if isV6 {
+		routeStore = f.routes6
+	}
 	if len(args) >= 2 && args[0] == "route" {
 		switch args[1] {
 		case "replace":
 			tbl, route := extractTable(args[2:])
-			f.routes[tbl] = []string{route}
+			routeStore[tbl] = []string{route}
 			return nil, nil
 		case "del":
 			tbl, _ := extractTable(args[2:])
-			delete(f.routes, tbl)
+			delete(routeStore, tbl)
 			return nil, nil
 		case "show":
 			tbl := 0
@@ -489,7 +510,7 @@ func (f *fakeNetRunner) handleIP(args []string) ([]byte, error) {
 					tbl, _ = strconv.Atoi(args[i+1])
 				}
 			}
-			return []byte(strings.Join(f.routes[tbl], "\n")), nil
+			return []byte(strings.Join(routeStore[tbl], "\n")), nil
 		}
 	}
 	return nil, fmt.Errorf("unsupported ip command: %v", args)
@@ -615,6 +636,24 @@ func newTestEnv(t *testing.T) *testEnv {
 	sysd := newFakeSystemd()
 	gitClient := &spyGitClient{Client: gitops.NewLocalClient(repoDir, cfg)}
 
+	netRec := netmgr.NewReconciler("enp3s0", netRunner, newZeroSysctl())
+	netRec.CgroupExists = func(cgPath string) bool {
+		unit := path.Base(cgPath)
+		uid := extractCgroupUID(cgPath)
+		if uid <= 0 {
+			return false
+		}
+		scope := usersRec.scopeForUID(uid)
+		if scope == "" {
+			return false
+		}
+		key := scope + "/" + unit
+		if st, ok := sysd.overrideActiveState[key]; ok {
+			return st == "active"
+		}
+		return sysd.states[key] == "active"
+	}
+
 	env := &testEnv{
 		t:           t,
 		rootDir:     rootDir,
@@ -629,7 +668,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		qRunner:     qRunner,
 		secretsMgr:  secrets.NewManager(secRunner),
 		secRunner:   secRunner,
-		netmgr:      netmgr.NewReconciler("enp3s0", netRunner, newZeroSysctl()),
+		netmgr:      netRec,
 		netRunner:   netRunner,
 		systemd:     sysd,
 	}
@@ -651,6 +690,19 @@ func newTestEnv(t *testing.T) *testEnv {
 		VerifyPollInterval: 5 * time.Millisecond,
 	})
 	return env
+}
+
+func extractCgroupUID(cgPath string) int {
+	for _, seg := range strings.Split(cgPath, "/") {
+		if after, ok := strings.CutPrefix(seg, "user-"); ok {
+			if uidStr, ok := strings.CutSuffix(after, ".slice"); ok {
+				if uid, err := strconv.Atoi(uidStr); err == nil {
+					return uid
+				}
+			}
+		}
+	}
+	return 0
 }
 
 func (e *testEnv) hostPath(dest string) string {
@@ -762,8 +814,16 @@ Secret=webui_secret,type=env,target=WEBUI_SECRET_KEY
 	if res.PlanSummary == "" {
 		t.Fatalf("expected non-empty PlanSummary")
 	}
-	if !strings.Contains(res.PlanSummary, "open-webui") {
-		t.Fatalf("expected PlanSummary to mention open-webui, got:\n%s", res.PlanSummary)
+	for _, want := range []string{
+		"open-webui",
+		"write /etc/containers/systemd/users/2001/open-webui.container",
+		"write /var/home/openwebui/.config/quadmatic/open-webui/config.yaml",
+		"upsert openwebui/webui_secret",
+		"start openwebui/open-webui.service",
+	} {
+		if !strings.Contains(res.PlanSummary, want) {
+			t.Fatalf("expected PlanSummary to contain %q, got:\n%s", want, res.PlanSummary)
+		}
 	}
 	if res.ManagedUnitsRootless != 1 || res.ManagedUnitsRootful != 0 {
 		t.Fatalf("unexpected managed unit counts: rootless=%d rootful=%d", res.ManagedUnitsRootless, res.ManagedUnitsRootful)
@@ -1403,6 +1463,9 @@ reason = "USB Coral passthrough"
 	if err != nil {
 		t.Fatalf("commit 1 failed: %v", err)
 	}
+	if res1.AppliedSHA != sha1 {
+		t.Fatalf("AppliedSHA = %q, want %q", res1.AppliedSHA, sha1)
+	}
 	if res1.ManagedUnitsRootless != 1 || res1.ManagedUnitsRootful != 1 {
 		t.Fatalf("unexpected rootless/rootful counts: %+v", res1)
 	}
@@ -1833,5 +1896,327 @@ user = "brokenuser"
 	}
 	if env.secRunner.store["openwebui/webui_secret"] != "secret-v1" {
 		t.Fatalf("expected secret restored to secret-v1, got %q", env.secRunner.store["openwebui/webui_secret"])
+	}
+}
+
+func TestReconcileDryRunPlanSummaryIncludesWriteHealPruneSecretsAndUnits(t *testing.T) {
+	env := newTestEnv(t)
+
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml": []byte("[users.openwebui]\nuid = 2001\n\n[users.caddy]\nuid = 2002\n\n[users.legacy]\nuid = 2003\n"),
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "open-webui"
+user = "openwebui"
+
+[[component]]
+name = "legacy"
+user = "legacy"
+`),
+		"components/open-webui/component.toml":       []byte("[secrets]\nwebui_secret = \"secrets/open-webui.age\"\n"),
+		"components/open-webui/open-webui.container": []byte("[Container]\nImage=ghcr.io/open-webui/open-webui:v1\nSecret=webui_secret,type=env,target=WEBUI_SECRET_KEY\n"),
+		"components/open-webui/files/app.conf":       []byte("v1\n"),
+		"components/legacy/component.toml":           []byte("[secrets]\nlegacy_sec = \"secrets/legacy.age\"\n"),
+		"components/legacy/legacy.container":         []byte("[Container]\nImage=alpine:3.20\nSecret=legacy_sec,type=env,target=LEGACY\n"),
+		"components/legacy/files/old.conf":           []byte("old\n"),
+		"secrets/open-webui.age":                     env.encryptSecret("ow-v1"),
+		"secrets/legacy.age":                         env.encryptSecret("leg-v1"),
+	})
+	env.commitRepo("commit 1")
+
+	if _, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond)); err != nil {
+		t.Fatalf("commit 1 failed: %v", err)
+	}
+
+	// Tamper with open-webui/files/app.conf on disk so it is marked healed in dry-run.
+	if err := os.WriteFile(env.hostPath("/var/home/openwebui/.config/quadmatic/open-webui/app.conf"), []byte("tampered\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	// Commit 2: updates open-webui secret, drops legacy (prune files, secret, stop unit), adds caddy (write file, upsert secret, start unit).
+	env.writeRepoFiles(map[string][]byte{
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "open-webui"
+user = "openwebui"
+
+[[component]]
+name = "caddy"
+user = "caddy"
+`),
+		"components/caddy/component.toml":  []byte("[secrets]\ncaddy_sec = \"secrets/caddy.age\"\n"),
+		"components/caddy/caddy.container": []byte("[Container]\nImage=docker.io/library/caddy:2\nSecret=caddy_sec,type=env,target=CADDY_SEC\n"),
+		"secrets/open-webui.age":           env.encryptSecret("ow-v2"),
+		"secrets/caddy.age":                env.encryptSecret("cad-v1"),
+	})
+	env.commitRepo("commit 2")
+
+	opts := env.reconcileOpts(100 * time.Millisecond)
+	opts.DryRun = true
+	res, err := env.engine.Reconcile(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("dry-run reconcile failed: %v", err)
+	}
+
+	wants := []string{
+		"write /etc/containers/systemd/users/2002/caddy.container",
+		"write /var/home/openwebui/.config/quadmatic/open-webui/app.conf (healed)",
+		"prune /etc/containers/systemd/users/2003/legacy.container",
+		"prune /var/home/legacy/.config/quadmatic/legacy/old.conf",
+		"upsert caddy/caddy_sec",
+		"upsert openwebui/webui_secret",
+		"prune legacy/legacy_sec",
+		"start caddy/caddy.service",
+		"restart openwebui/open-webui.service",
+		"stop legacy/legacy.service",
+	}
+	for _, want := range wants {
+		if !strings.Contains(res.PlanSummary, want) {
+			t.Fatalf("PlanSummary missing %q:\n%s", want, res.PlanSummary)
+		}
+	}
+}
+
+func TestReconcileStoppedOutboundGuardUnitDoesNotFailOrDrift(t *testing.T) {
+	env := newTestEnv(t)
+
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml": []byte("[users.openwebui]\nuid = 2001\n"),
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "open-webui"
+user = "openwebui"
+
+[component.network]
+vlan = 30
+mac = "02:51:4d:00:07:d1"
+dns = ["10.30.0.1"]
+outbound_guard = true
+`),
+		"components/open-webui/open-webui.container.tmpl": []byte("[Container]\nImage=ghcr.io/open-webui/open-webui:v1\nNetwork={{ .Net.PastaArgs }}\n"),
+	})
+	sha1 := env.commitRepo("commit 1: guarded unit")
+
+	res1, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("commit 1 failed: %v", err)
+	}
+	if res1.AppliedSHA != sha1 {
+		t.Fatalf("AppliedSHA = %q, want %q", res1.AppliedSHA, sha1)
+	}
+	if env.netRunner.nftTable == "" {
+		t.Fatalf("expected table inet quadmatic created after commit 1")
+	}
+
+	// Manually stop the unit on the host -> cgroupv2 directory disappears, leaving numeric inode in nft list output.
+	env.systemd.states["openwebui/open-webui.service"] = "inactive"
+	env.netRunner.nftTable = strings.ReplaceAll(
+		env.netRunner.nftTable,
+		`"user.slice/user-2001.slice/user@2001.service/app.slice/open-webui.service"`,
+		`987654321`,
+	)
+	env.systemd.clearCalls()
+	env.netRunner.clearCalls()
+
+	// Next tick cleans stale table inet quadmatic cleanly without failing ApplyNFTables, rolling back, or restarting stopped unit.
+	res2, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("reconcile on manually stopped outbound_guard unit failed: %v", err)
+	}
+	if res2.RolledBack || res2.AppliedSHA != sha1 {
+		t.Fatalf("unexpected rollback/SHA on stopped unit: %+v", res2)
+	}
+	if env.netRunner.nftTable != "" {
+		t.Fatalf("expected stale table inet quadmatic deleted, got:\n%s", env.netRunner.nftTable)
+	}
+	if env.systemd.countCalls("start", "openwebui", "open-webui.service") != 0 ||
+		env.systemd.countCalls("restart", "openwebui", "open-webui.service") != 0 {
+		t.Fatalf("manually stopped unit must not be started/restarted, calls=%v", env.systemd.calls)
+	}
+	wantFailed := []apply.UnitStatus{{Scope: "openwebui", Unit: "open-webui.service", ActiveState: "inactive"}}
+	if !reflect.DeepEqual(res2.FailedUnits, wantFailed) {
+		t.Fatalf("FailedUnits = %+v, want %+v", res2.FailedUnits, wantFailed)
+	}
+
+	// Following tick while unit remains stopped reports zero drift and performs zero mutations.
+	env.systemd.clearCalls()
+	env.netRunner.clearCalls()
+	res3, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("subsequent reconcile on stopped unit failed: %v", err)
+	}
+	if res3.DriftDetected || res3.RolledBack {
+		t.Fatalf("expected no perpetual drift or rollback, got %+v", res3)
+	}
+	if !reflect.DeepEqual(res3.FailedUnits, wantFailed) {
+		t.Fatalf("FailedUnits = %+v, want %+v", res3.FailedUnits, wantFailed)
+	}
+	for _, call := range env.systemd.calls {
+		if call.op != "active-state" {
+			t.Fatalf("expected zero mutating systemd calls on steady stopped unit, got %v", env.systemd.calls)
+		}
+	}
+	for _, call := range env.netRunner.calls {
+		if strings.HasPrefix(call, "nft -f") || strings.HasPrefix(call, "nft delete") {
+			t.Fatalf("expected zero mutating nft calls on steady stopped unit, got %v", env.netRunner.calls)
+		}
+	}
+}
+
+func TestReconcileNetworkConfigChangeWithoutTemplateChangeRestartsUnitAndRollsBack(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Container template uses {{ .Net.PastaArgs }} + static DNS, so rendered text is identical
+	// regardless of vlan, mac, or macvlan_mode changes.
+	env.writeRepoFiles(map[string][]byte{
+		"users.toml": []byte("[users.openwebui]\nuid = 2001\n\n[users.brokenuser]\nuid = 2002\n"),
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "open-webui"
+user = "openwebui"
+
+[component.network]
+vlan = 30
+mac = "02:51:4d:00:07:d1"
+macvlan_mode = "private"
+dns = ["10.30.0.1"]
+tcp_ports = ["8080:8080"]
+`),
+		"components/open-webui/open-webui.container.tmpl": []byte("[Container]\nImage=ghcr.io/open-webui/open-webui:v1\nNetwork={{ .Net.PastaArgs }}\nDNS={{ index .Net.DNS 0 }}\n"),
+		"components/open-webui/open-webui.volume":         []byte("[Volume]\n"),
+	})
+	env.commitRepo("commit 1: baseline network")
+
+	if _, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond)); err != nil {
+		t.Fatalf("commit 1 failed: %v", err)
+	}
+	quadletPath := env.hostPath("/etc/containers/systemd/users/2001/open-webui.container")
+	renderedBefore, err := os.ReadFile(quadletPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Commit 2: change MAC only -> rendered .container is identical, yet rootless workload unit MUST restart.
+	env.systemd.clearCalls()
+	env.writeRepoFiles(map[string][]byte{
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "open-webui"
+user = "openwebui"
+
+[component.network]
+vlan = 30
+mac = "02:51:4d:00:07:d2"
+macvlan_mode = "private"
+dns = ["10.30.0.1"]
+tcp_ports = ["8080:8080"]
+`),
+	})
+	sha2 := env.commitRepo("commit 2: change MAC only")
+
+	res2, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("commit 2 failed: %v", err)
+	}
+	if res2.AppliedSHA != sha2 {
+		t.Fatalf("AppliedSHA = %q, want %q", res2.AppliedSHA, sha2)
+	}
+	renderedAfter, err := os.ReadFile(quadletPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(renderedAfter) != string(renderedBefore) {
+		t.Fatalf("expected identical rendered .container text:\nbefore:\n%s\nafter:\n%s", renderedBefore, renderedAfter)
+	}
+	if env.systemd.countCalls("restart", "openwebui", "open-webui.service") != 1 {
+		t.Fatalf("expected open-webui.service restarted on MAC change, calls=%v", env.systemd.calls)
+	}
+	if env.systemd.countCalls("restart", "openwebui", "open-webui-volume.service") != 0 {
+		t.Fatalf("helper volume unit must not be restarted, calls=%v", env.systemd.calls)
+	}
+
+	// Commit 3: change vlan and macvlan_mode -> rendered .container still identical, yet unit MUST restart.
+	env.systemd.clearCalls()
+	env.writeRepoFiles(map[string][]byte{
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "open-webui"
+user = "openwebui"
+
+[component.network]
+vlan = 31
+mac = "02:51:4d:00:07:d2"
+macvlan_mode = "bridge"
+dns = ["10.30.0.1"]
+tcp_ports = ["8080:8080"]
+`),
+	})
+	sha3 := env.commitRepo("commit 3: change vlan and macvlan_mode")
+
+	res3, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("commit 3 failed: %v", err)
+	}
+	if res3.AppliedSHA != sha3 {
+		t.Fatalf("AppliedSHA = %q, want %q", res3.AppliedSHA, sha3)
+	}
+	if env.systemd.countCalls("restart", "openwebui", "open-webui.service") != 1 {
+		t.Fatalf("expected open-webui.service restarted on vlan+macvlan_mode change, calls=%v", env.systemd.calls)
+	}
+
+	// Commit 4: change MAC again + add broken unit that fails Start BEFORE open-webui.service is restarted.
+	// Rollback restores qm-2001 MAC AND must restart open-webui.service even without DaemonReload.
+	env.systemd.clearCalls()
+	sysWrapper := &failingStartSystemd{Systemd: env.systemd, failStartKey: "brokenuser/broken.service"}
+	env.engine = apply.NewEngine(apply.EngineDeps{
+		Config:             env.cfg,
+		Git:                env.git,
+		Users:              env.users,
+		Quadlet:            env.quadlet,
+		Secrets:            env.secretsMgr,
+		Netmgr:             env.netmgr,
+		Systemd:            sysWrapper,
+		RootDir:            env.rootDir,
+		Chown:              func(string, int, int) error { return nil },
+		DHCPTimeout:        100 * time.Millisecond,
+		VerifyPollInterval: 5 * time.Millisecond,
+	})
+	env.writeRepoFiles(map[string][]byte{
+		"hosts/services-02.toml": []byte(`hostname = "services-02"
+
+[[component]]
+name = "open-webui"
+user = "openwebui"
+
+[component.network]
+vlan = 31
+mac = "02:51:4d:00:07:d3"
+macvlan_mode = "bridge"
+dns = ["10.30.0.1"]
+tcp_ports = ["8080:8080"]
+
+[[component]]
+name = "broken"
+user = "brokenuser"
+`),
+		"components/broken/broken.container": []byte("[Container]\nImage=example.invalid/broken:latest\n"),
+	})
+	env.commitRepo("commit 4: mac change + failing new unit")
+
+	res4, err := env.engine.Reconcile(context.Background(), env.reconcileOpts(100*time.Millisecond))
+	if err == nil || !res4.RolledBack || res4.AppliedSHA != sha3 {
+		t.Fatalf("expected rollback to %q, got res=%+v err=%v", sha3, res4, err)
+	}
+	if gotMAC := env.netRunner.conns["qm-2001"].props["802-3-ethernet.cloned-mac-address"]; gotMAC != "02:51:4d:00:07:d2" {
+		t.Fatalf("expected qm-2001 MAC rolled back to 02:51:4d:00:07:d2, got %q", gotMAC)
+	}
+	if env.systemd.countCalls("restart", "openwebui", "open-webui.service") != 1 {
+		t.Fatalf("expected rollback to restart open-webui.service after restoring qm-2001, calls=%v", env.systemd.calls)
 	}
 }

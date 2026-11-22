@@ -627,6 +627,48 @@ user = "nobody_in_reg"
 			},
 			wantErr: "registry",
 		},
+		{
+			name: "rejects reserved rootful username for rootless component",
+			setupRepo: func(t *testing.T, r *testRepo) {
+				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
+				r.writeFile(t, "hosts/node.toml", `
+[[component]]
+name = "c1"
+user = "rootful"
+`)
+			},
+			wantErr: "reserved",
+		},
+		{
+			name: "rejects secret name starting with dash",
+			setupRepo: func(t *testing.T, r *testRepo) {
+				r.writeFile(t, "secrets/s.age", "ct")
+				r.writeFile(t, "components/c1/component.toml", "[secrets]\n\"-replace\" = \"secrets/s.age\"\n")
+				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
+				r.writeFile(t, "hosts/node.toml", "[[component]]\nname = \"c1\"\nuser = \"u1\"\n")
+			},
+			wantErr: "secret name",
+		},
+		{
+			name: "rejects secret name starting with dot",
+			setupRepo: func(t *testing.T, r *testRepo) {
+				r.writeFile(t, "secrets/s.age", "ct")
+				r.writeFile(t, "components/c1/component.toml", "[secrets]\n\".hidden\" = \"secrets/s.age\"\n")
+				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
+				r.writeFile(t, "hosts/node.toml", "[[component]]\nname = \"c1\"\nuser = \"u1\"\n")
+			},
+			wantErr: "secret name",
+		},
+		{
+			name: "rejects secret name with disallowed equals character",
+			setupRepo: func(t *testing.T, r *testRepo) {
+				r.writeFile(t, "secrets/s.age", "ct")
+				r.writeFile(t, "components/c1/component.toml", "[secrets]\n\"a=b\" = \"secrets/s.age\"\n")
+				r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
+				r.writeFile(t, "hosts/node.toml", "[[component]]\nname = \"c1\"\nuser = \"u1\"\n")
+			},
+			wantErr: "secret name",
+		},
 	}
 
 	for _, tc := range cases {
@@ -667,6 +709,22 @@ mac = "02:51:4d:00:07:e1"
 		}
 		if err := manifest.Validate(h, r.root); err != nil {
 			t.Fatalf("expected rootful network component without dns to pass validation, got: %v", err)
+		}
+	})
+
+	t.Run("allows secret names matching [a-zA-Z0-9_][a-zA-Z0-9_.-]*", func(t *testing.T) {
+		r := newTestRepo(t)
+		reg := r.parseRegistry(t, baseRegistry)
+		r.writeFile(t, "secrets/s.age", "ct")
+		r.writeFile(t, "components/c1/component.toml", "[secrets]\n\"_App_Secret-1.v2\" = \"secrets/s.age\"\n")
+		r.writeFile(t, "components/c1/c1.container", "[Container]\nImage=alpine\n")
+		r.writeFile(t, "hosts/node.toml", "[[component]]\nname = \"c1\"\nuser = \"u1\"\n")
+		h, err := manifest.LoadHost(r.root, "node", reg)
+		if err != nil {
+			t.Fatalf("LoadHost failed: %v", err)
+		}
+		if err := manifest.Validate(h, r.root); err != nil {
+			t.Fatalf("expected valid secret name to pass validation, got: %v", err)
 		}
 	})
 }

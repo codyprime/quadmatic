@@ -108,6 +108,9 @@ func validateComponentIdentity(host *ResolvedHost, comp ResolvedComponent) error
 	if comp.User == "" {
 		return fmt.Errorf("rootless component %q must specify user", comp.Name)
 	}
+	if comp.User == "rootful" {
+		return fmt.Errorf("component %q user %q is reserved", comp.Name, comp.User)
+	}
 	if err := validateSimpleName("user", comp.User); err != nil {
 		return fmt.Errorf("component %q: %w", comp.Name, err)
 	}
@@ -271,8 +274,8 @@ func validatePortOrRange(s string) error {
 
 func validateComponentSecrets(realRepoDir string, comp ResolvedComponent) error {
 	for _, secretName := range sortedMapKeys(comp.Secrets) {
-		if secretName == "" || strings.ContainsAny(secretName, "/\\,\x00 \t\r\n") || secretName == "." || secretName == ".." {
-			return fmt.Errorf("component %q invalid secret name %q", comp.Name, secretName)
+		if err := validateSecretName(secretName); err != nil {
+			return fmt.Errorf("component %q %w", comp.Name, err)
 		}
 		relPath := comp.Secrets[secretName]
 		if err := validateSafeRelPath(relPath); err != nil {
@@ -415,6 +418,26 @@ func validateComponentFiles(realRepoDir string, comp ResolvedComponent, scopeQua
 func validateSimpleName(kind, name string) error {
 	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\\x00") {
 		return fmt.Errorf("invalid %s %q", kind, name)
+	}
+	return nil
+}
+
+func validateSecretName(name string) error {
+	if name == "" {
+		return fmt.Errorf("secret name must not be empty")
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		isAlphaNum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if i == 0 {
+			if !isAlphaNum && c != '_' {
+				return fmt.Errorf("invalid secret name %q: must start with an alphanumeric character or underscore", name)
+			}
+			continue
+		}
+		if !isAlphaNum && c != '_' && c != '.' && c != '-' {
+			return fmt.Errorf("invalid secret name %q: contains disallowed character %q", name, c)
+		}
 	}
 	return nil
 }

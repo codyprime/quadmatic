@@ -158,7 +158,7 @@ systemd:
         [Unit]
         Description=Quadmatic GitOps Podman Quadlet Reconciler
         Wants=network-online.target
-        After=network-online.target NetworkManager.service
+        After=network-online.target NetworkManager.service systemd-user-sessions.service
 
         [Service]
         Type=simple

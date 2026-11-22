@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -79,6 +80,9 @@ type Reconciler struct {
 	runner         Runner
 	sysctl         SysctlReader
 	cgroupPattern  string
+	// CgroupExists reports whether a cgroupv2 path currently exists on the host.
+	// Defaults to checking that /sys/fs/cgroup/<cgPath> is a directory.
+	CgroupExists func(cgPath string) bool
 }
 
 // NewReconciler constructs a Reconciler for trunkInterface using runner and sysctl
@@ -95,7 +99,32 @@ func NewReconciler(trunkInterface string, runner Runner, sysctl SysctlReader) *R
 		runner:         runner,
 		sysctl:         sysctl,
 		cgroupPattern:  DefaultCgroupPattern,
+		CgroupExists:   defaultCgroupExists,
 	}
+}
+
+func defaultCgroupExists(cgPath string) bool {
+	return CgroupExistsUnderRoot("/sys/fs/cgroup")(cgPath)
+}
+
+// CgroupExistsUnderRoot returns a CgroupExists predicate checking whether
+// <root>/<cgPath> exists and is a directory.
+func CgroupExistsUnderRoot(root string) func(string) bool {
+	return func(cgPath string) bool {
+		clean := strings.Trim(cgPath, "/")
+		if clean == "" {
+			return false
+		}
+		info, err := os.Stat(filepath.Join(root, filepath.FromSlash(clean)))
+		return err == nil && info.IsDir()
+	}
+}
+
+func (r *Reconciler) checkCgroupExists(cgPath string) bool {
+	if r != nil && r.CgroupExists != nil {
+		return r.CgroupExists(cgPath)
+	}
+	return defaultCgroupExists(cgPath)
 }
 
 // SetCgroupPattern overrides the cgroupv2 path pattern used by outbound_guard rules.

@@ -67,7 +67,7 @@ type NetmgrReconciler interface {
 	ReadLiveDNS(ctx context.Context, ifname string) ([]string, error)
 	Snapshot(ctx context.Context, owned []state.ManagedNetworkRecord) (*netmgr.Snapshot, error)
 	DetectDrift(ctx context.Context, host *manifest.ResolvedHost, owned []state.ManagedNetworkRecord) (bool, error)
-	ApplyProfiles(ctx context.Context, host *manifest.ResolvedHost, prevOwned []state.ManagedNetworkRecord, dhcpTimeout time.Duration) ([]state.ManagedNetworkRecord, map[string][]string, error)
+	ApplyProfiles(ctx context.Context, host *manifest.ResolvedHost, prevOwned []state.ManagedNetworkRecord, dhcpTimeout time.Duration) ([]state.ManagedNetworkRecord, map[string][]string, map[string]bool, error)
 	ApplyNFTables(ctx context.Context, host *manifest.ResolvedHost) (string, error)
 	Restore(ctx context.Context, snap *netmgr.Snapshot, createdDuringAttempt []state.ManagedNetworkRecord) error
 }
@@ -173,12 +173,8 @@ func NewEngine(deps EngineDeps) *Engine {
 	}
 
 	chownFn := deps.Chown
-	if chownFn == nil {
-		if deps.RootDir == "" {
-			chownFn = os.Chown
-		} else {
-			chownFn = func(string, int, int) error { return nil }
-		}
+	if chownFn == nil && deps.RootDir != "" {
+		chownFn = func(string, int, int) error { return nil }
 	}
 
 	dhcpTimeout := deps.DHCPTimeout
@@ -256,6 +252,7 @@ type applyPlan struct {
 
 type rollbackTracker struct {
 	createdOrMutatedNet []state.ManagedNetworkRecord
+	mutatedNetComps     map[string]bool
 	writtenFiles        []string
 	prunedFiles         []string
 	upsertedSecrets     map[string]secretRef
@@ -486,8 +483,9 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 	}
 
 	// Stage 7a: Networks & Post-DHCP Re-Render
-	newNetRecords, postApplyLiveDNS, err := e.netmgr.ApplyProfiles(ctx, resolved, prevState.Networks, e.dhcpTimeout)
+	newNetRecords, postApplyLiveDNS, mutatedNetComps, err := e.netmgr.ApplyProfiles(ctx, resolved, prevState.Networks, e.dhcpTimeout)
 	tracker.createdOrMutatedNet = newNetRecords
+	tracker.mutatedNetComps = mutatedNetComps
 	if err != nil {
 		return runRollback("net", err)
 	}
@@ -528,24 +526,16 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 		res.ManagedUnitsRootless = plan.managedRootless
 		res.ManagedUnitsRootful = plan.managedRootful
 	}
+	markMutatedNetworkUnitsDirty(plan, prevState, mutatedNetComps)
 
 	// Stage 7b: Atomic File Writes
 	for _, destPath := range plan.filesToWrite {
 		rf := plan.desiredFiles[destPath]
-		absPath, err := resolveHostPath(e.rootDir, destPath)
-		if err != nil {
-			return runRollback("files", err)
-		}
-		var chownRootAbs string
+		var chownRootHost string
 		if rf.Kind == manifest.FileKindData && (rf.OwnerUID != 0 || rf.OwnerGID != 0) {
-			if cr := plan.fileChownRoots[destPath]; cr != "" {
-				chownRootAbs, err = resolveHostPath(e.rootDir, cr)
-				if err != nil {
-					return runRollback("files", err)
-				}
-			}
+			chownRootHost = plan.fileChownRoots[destPath]
 		}
-		if err := writeFileAtomic(absPath, rf.Content, rf.Mode, rf.OwnerUID, rf.OwnerGID, chownRootAbs, e.chown); err != nil {
+		if err := writeFileAtomic(e.rootDir, destPath, rf.Content, rf.Mode, rf.OwnerUID, rf.OwnerGID, chownRootHost, e.chown); err != nil {
 			return runRollback("files", err)
 		}
 		tracker.writtenFiles = append(tracker.writtenFiles, destPath)
@@ -575,11 +565,7 @@ func (e *Engine) Reconcile(ctx context.Context, opts ReconcileOptions) (*Result,
 	}
 
 	for _, destPath := range plan.filesToPrune {
-		absPath, err := resolveHostPath(e.rootDir, destPath)
-		if err != nil {
-			return runRollback("apply", err)
-		}
-		if err := removeFileIfExists(absPath); err != nil {
+		if err := removeFileIfExists(e.rootDir, destPath); err != nil {
 			return runRollback("apply", err)
 		}
 		tracker.prunedFiles = append(tracker.prunedFiles, destPath)
@@ -695,25 +681,18 @@ func (e *Engine) rollback(
 		mutatedFiles[p] = true
 	}
 	for _, destPath := range sortedBoolKeys(mutatedFiles) {
-		absPath, err := resolveHostPath(e.rootDir, destPath)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
 		entry, ok := fileSnap.entries[destPath]
 		if !ok || !entry.Existed {
-			if err := removeFileIfExists(absPath); err != nil {
+			if err := removeFileIfExists(e.rootDir, destPath); err != nil {
 				errs = append(errs, err)
 			}
 			continue
 		}
-		var chownRootAbs string
+		var chownRootHost string
 		if entry.OwnerUID != 0 || entry.OwnerGID != 0 {
-			if cr := inferUserHomeRoot(destPath); cr != "" {
-				chownRootAbs, _ = resolveHostPath(e.rootDir, cr)
-			}
+			chownRootHost = inferUserHomeRoot(destPath)
 		}
-		if err := writeFileAtomic(absPath, entry.Content, entry.Mode, entry.OwnerUID, entry.OwnerGID, chownRootAbs, e.chown); err != nil {
+		if err := writeFileAtomic(e.rootDir, destPath, entry.Content, entry.Mode, entry.OwnerUID, entry.OwnerGID, chownRootHost, e.chown); err != nil {
 			errs = append(errs, fmt.Errorf("restore file %q: %w", destPath, err))
 		}
 	}
@@ -889,7 +868,14 @@ func collectRollbackRestarts(
 		if _, existed := prevState.GeneratedUnits[unitKey]; !existed {
 			continue
 		}
-		if !tracker.daemonReloaded[meta.ID.Scope] || priorNonActive[unitKey] {
+		if priorNonActive[unitKey] {
+			continue
+		}
+		if !meta.ID.IsHelper && tracker.mutatedNetComps[meta.Component] {
+			addUnit(meta.ID)
+			continue
+		}
+		if !tracker.daemonReloaded[meta.ID.Scope] {
 			continue
 		}
 		if mutatedFiles[meta.SourceDestPath] || (!meta.ID.IsHelper && mutatedComps[meta.Component]) {
@@ -1095,11 +1081,7 @@ func (e *Engine) buildApplyPlan(
 
 	for _, destPath := range desiredPaths {
 		rf := p.desiredFiles[destPath]
-		absPath, err := resolveHostPath(e.rootDir, destPath)
-		if err != nil {
-			return nil, err
-		}
-		diskInfo, err := inspectDiskFile(absPath)
+		diskInfo, err := inspectDiskFile(e.rootDir, destPath)
 		if err != nil {
 			return nil, err
 		}
@@ -1131,11 +1113,7 @@ func (e *Engine) buildApplyPlan(
 	for destPath := range prevState.Files {
 		if _, ok := p.desiredFiles[destPath]; !ok {
 			p.filesToPrune = append(p.filesToPrune, destPath)
-			absPath, err := resolveHostPath(e.rootDir, destPath)
-			if err != nil {
-				return nil, err
-			}
-			diskInfo, err := inspectDiskFile(absPath)
+			diskInfo, err := inspectDiskFile(e.rootDir, destPath)
 			if err != nil {
 				return nil, err
 			}
@@ -1422,6 +1400,31 @@ func buildNextState(
 	return st
 }
 
+func markMutatedNetworkUnitsDirty(plan *applyPlan, prevState *state.State, mutatedNetComps map[string]bool) {
+	if plan == nil || prevState == nil || len(mutatedNetComps) == 0 {
+		return
+	}
+	alreadyRestart := make(map[string]bool, len(plan.unitsToRestart))
+	for _, u := range plan.unitsToRestart {
+		alreadyRestart[u.Key] = true
+	}
+	added := false
+	for unitKey, meta := range plan.desiredUnits {
+		if _, existed := prevState.GeneratedUnits[unitKey]; !existed {
+			continue
+		}
+		if meta.ID.IsHelper || !mutatedNetComps[meta.Component] || alreadyRestart[unitKey] {
+			continue
+		}
+		plan.unitsToRestart = append(plan.unitsToRestart, meta.ID)
+		alreadyRestart[unitKey] = true
+		added = true
+	}
+	if added {
+		sortUnitIDs(plan.unitsToRestart, false)
+	}
+}
+
 func formatPlanSummary(
 	prevSHA, newSHA string,
 	rendered *manifest.RenderedHost,
@@ -1454,9 +1457,45 @@ func formatPlanSummary(
 	}
 
 	fmt.Fprintf(&b, "Files: write=%d prune=%d healed=%d\n", len(plan.filesToWrite), len(plan.filesToPrune), len(plan.healedFiles))
+	filesToWrite := slices.Clone(plan.filesToWrite)
+	slices.Sort(filesToWrite)
+	for _, p := range filesToWrite {
+		if plan.healedFiles[p] {
+			fmt.Fprintf(&b, "  write %s (healed)\n", p)
+		} else {
+			fmt.Fprintf(&b, "  write %s\n", p)
+		}
+	}
+	filesToPrune := slices.Clone(plan.filesToPrune)
+	slices.Sort(filesToPrune)
+	for _, p := range filesToPrune {
+		fmt.Fprintf(&b, "  prune %s\n", p)
+	}
+
 	fmt.Fprintf(&b, "Secrets: upsert=%d prune=%d\n", len(plan.secretsToUpsert), len(plan.secretsToPrune))
+	secretsToUpsert := slices.Clone(plan.secretsToUpsert)
+	slices.Sort(secretsToUpsert)
+	for _, k := range secretsToUpsert {
+		fmt.Fprintf(&b, "  upsert %s\n", k)
+	}
+	secretsToPrune := slices.Clone(plan.secretsToPrune)
+	slices.Sort(secretsToPrune)
+	for _, k := range secretsToPrune {
+		fmt.Fprintf(&b, "  prune %s\n", k)
+	}
+
 	fmt.Fprintf(&b, "Units: start=%d restart=%d stop=%d (rootless=%d rootful=%d)\n",
 		len(plan.unitsToStart), len(plan.unitsToRestart), len(plan.unitsToStop), plan.managedRootless, plan.managedRootful)
+	for _, key := range sortedUnitKeys(plan.unitsToStart) {
+		fmt.Fprintf(&b, "  start %s\n", key)
+	}
+	for _, key := range sortedUnitKeys(plan.unitsToRestart) {
+		fmt.Fprintf(&b, "  restart %s\n", key)
+	}
+	for _, key := range sortedUnitKeys(plan.unitsToStop) {
+		fmt.Fprintf(&b, "  stop %s\n", key)
+	}
+
 	fmt.Fprintf(&b, "Drift: files=%v network=%v\n", len(plan.healedFiles) > 0, netDrifted)
 
 	if len(failedUnits) > 0 {
@@ -1467,6 +1506,15 @@ func formatPlanSummary(
 		fmt.Fprintf(&b, "Unchanged non-active units: %s\n", strings.Join(parts, ", "))
 	}
 	return b.String()
+}
+
+func sortedUnitKeys(units []unitID) []string {
+	keys := make([]string, 0, len(units))
+	for _, u := range units {
+		keys = append(keys, u.Key)
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 func classifyGitStage(err error, isLocal bool) string {

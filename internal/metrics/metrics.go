@@ -98,9 +98,13 @@ func (r *Recorder) RecordResult(res *apply.Result, err error) {
 	defer r.mu.Unlock()
 
 	r.lastSyncTimestamp.SetToCurrentTime()
+	preserveUnitMetrics := err != nil && res != nil && isPreApplyStage(res.FailedStage)
+
 	// Reset dynamic-label vectors so stale commit SHAs and recovered units do not linger.
 	r.appliedInfo.Reset()
-	r.failedUnits.Reset()
+	if !preserveUnitMetrics {
+		r.failedUnits.Reset()
+	}
 
 	if err != nil {
 		r.lastSyncSuccess.Set(0)
@@ -113,10 +117,12 @@ func (r *Recorder) RecordResult(res *apply.Result, err error) {
 		if res.AppliedSHA != "" {
 			r.appliedInfo.WithLabelValues(res.AppliedSHA, r.hostname).Set(1)
 		}
-		r.managedUnits.WithLabelValues("rootless").Set(float64(res.ManagedUnitsRootless))
-		r.managedUnits.WithLabelValues("rootful").Set(float64(res.ManagedUnitsRootful))
-		for _, fu := range res.FailedUnits {
-			r.failedUnits.WithLabelValues(fu.Scope, fu.Unit).Set(1)
+		if !preserveUnitMetrics {
+			r.managedUnits.WithLabelValues("rootless").Set(float64(res.ManagedUnitsRootless))
+			r.managedUnits.WithLabelValues("rootful").Set(float64(res.ManagedUnitsRootful))
+			for _, fu := range res.FailedUnits {
+				r.failedUnits.WithLabelValues(fu.Scope, fu.Unit).Set(1)
+			}
 		}
 		if res.DriftDetected {
 			r.driftDetected.Set(1)
@@ -138,6 +144,10 @@ func (r *Recorder) RecordResult(res *apply.Result, err error) {
 		}
 		r.reconcileErrorsTotal.WithLabelValues(stage).Inc()
 	}
+}
+
+func isPreApplyStage(stage string) bool {
+	return stage == "fetch" || stage == "verify" || stage == "validate"
 }
 
 // Handler returns a read-only HTTP handler serving the isolated Prometheus registry.

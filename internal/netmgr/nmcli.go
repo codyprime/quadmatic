@@ -298,7 +298,7 @@ func (r *Reconciler) DetectDrift(ctx context.Context, host *manifest.ResolvedHos
 		if !exists || !propsMatch(vrfProps, desiredVRFProps(rl)) {
 			return true, nil
 		}
-		hasRoute, err := r.hasVRFUnreachableRoute(ctx, rl.TableID)
+		hasRoute, err := r.hasVRFUnreachableRoute(ctx, rl.TableID, rl.IPv6)
 		if err != nil {
 			return false, err
 		}
@@ -325,30 +325,32 @@ func (r *Reconciler) DetectDrift(ctx context.Context, host *manifest.ResolvedHos
 // ApplyProfiles reconciles VLAN parents, per-component VRFs and macvlans, live DHCP DNS
 // polling, and pruning of unreferenced owned profiles without modifying nftables. Even when
 // err != nil, newOwned contains all `qm-*`/`qmv-*` profiles created or reconciled up to the
-// point of failure so callers can pass them straight to Restore.
+// point of failure so callers can pass them straight to Restore. mutatedComponents reports
+// components whose `qm-<uid>`, `qmv-<uid>`, or parent `qm-vlan<V>` profile was created,
+// modified, or reactivated during this pass.
 func (r *Reconciler) ApplyProfiles(
 	ctx context.Context,
 	host *manifest.ResolvedHost,
 	prevOwned []state.ManagedNetworkRecord,
 	dhcpTimeout time.Duration,
-) (newOwned []state.ManagedNetworkRecord, liveDNS map[string][]string, err error) {
+) (newOwned []state.ManagedNetworkRecord, liveDNS map[string][]string, mutatedComponents map[string]bool, err error) {
 	if r == nil {
-		return nil, nil, errors.New("netmgr reconciler is nil")
+		return nil, nil, nil, errors.New("netmgr reconciler is nil")
 	}
 	if host == nil {
-		return nil, nil, errors.New("resolved host is nil")
+		return nil, nil, nil, errors.New("resolved host is nil")
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	plan, err := r.buildDesiredPlan(ctx, host)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if len(plan.rootless) > 0 {
 		if err := r.CheckKernelInvariants(); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 
@@ -356,13 +358,15 @@ func (r *Reconciler) ApplyProfiles(
 	if plan.hasNetworks {
 		activeConns, err = r.listActiveConnectionNames(ctx)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 
 	// Track desired records incrementally so partial failures still return every qm-*/qmv-*
 	// profile created or updated up to the failure point.
 	newOwned = make([]state.ManagedNetworkRecord, 0, len(plan.vlans)+2*len(plan.rootless))
+	mutatedComponents = make(map[string]bool)
+	mutatedVLANDevs := make(map[string]bool)
 
 	for _, v := range plan.vlans {
 		if !v.Owned {
@@ -390,11 +394,18 @@ func (r *Reconciler) ApplyProfiles(
 			})
 		}
 		if err != nil {
-			return newOwned, nil, err
+			return newOwned, nil, mutatedComponents, err
 		}
-		if mutated || !activeConns[v.ConnName] {
+		needUp := mutated || !activeConns[v.ConnName]
+		if needUp {
+			mutatedVLANDevs[v.DeviceName] = true
+			for _, comp := range host.Components {
+				if comp.Network != nil && comp.Network.VLAN == v.VLAN {
+					mutatedComponents[comp.Name] = true
+				}
+			}
 			if err := r.upConnection(ctx, v.ConnName); err != nil {
-				return newOwned, nil, err
+				return newOwned, nil, mutatedComponents, err
 			}
 		}
 	}
@@ -415,15 +426,17 @@ func (r *Reconciler) ApplyProfiles(
 			})
 		}
 		if err != nil {
-			return newOwned, nil, err
+			return newOwned, nil, mutatedComponents, err
 		}
-		if vrfMutated || !activeConns[rl.VRFName] {
+		vrfNeedUp := vrfMutated || !activeConns[rl.VRFName]
+		if vrfNeedUp {
+			mutatedComponents[rl.CompName] = true
 			if err := r.upConnection(ctx, rl.VRFName); err != nil {
-				return newOwned, nil, err
+				return newOwned, nil, mutatedComponents, err
 			}
 		}
-		if err := r.ensureVRFUnreachableRoute(ctx, rl.TableID); err != nil {
-			return newOwned, nil, err
+		if err := r.ensureVRFUnreachableRoute(ctx, rl.TableID, rl.IPv6); err != nil {
+			return newOwned, nil, mutatedComponents, err
 		}
 
 		mvDesired := desiredMacvlanProps(rl)
@@ -440,28 +453,36 @@ func (r *Reconciler) ApplyProfiles(
 			})
 		}
 		if err != nil {
-			return newOwned, nil, err
+			return newOwned, nil, mutatedComponents, err
 		}
-		if mvMutated || !activeConns[rl.MacvlanName] {
+		mvNeedUp := mvMutated || !activeConns[rl.MacvlanName]
+		if mvNeedUp {
+			mutatedComponents[rl.CompName] = true
 			if err := r.upConnection(ctx, rl.MacvlanName); err != nil {
-				return newOwned, nil, err
+				return newOwned, nil, mutatedComponents, err
 			}
+		}
+		if !rl.IPv6 && mvMutated {
+			_, _ = r.runner.Run(ctx, nil, "ip", "-6", "route", "del", "unreachable", "default", "metric", vrfDefaultMetric, "table", strconv.Itoa(rl.TableID))
+		}
+		if mutatedVLANDevs[rl.ParentIface] {
+			mutatedComponents[rl.CompName] = true
 		}
 
 		if rl.DNSFromDHCP {
 			dns, err := r.pollLiveDNS(ctx, rl.MacvlanName, dhcpTimeout)
 			if err != nil {
-				return newOwned, nil, fmt.Errorf("component %q (%s): %w", rl.CompName, rl.MacvlanName, err)
+				return newOwned, nil, mutatedComponents, fmt.Errorf("component %q (%s): %w", rl.CompName, rl.MacvlanName, err)
 			}
 			liveDNS[rl.CompName] = dns
 		}
 	}
 
 	if err := r.pruneUnreferenced(ctx, prevOwned, newOwned); err != nil {
-		return newOwned, nil, err
+		return newOwned, nil, mutatedComponents, err
 	}
 
-	return newOwned, liveDNS, nil
+	return newOwned, liveDNS, mutatedComponents, nil
 }
 
 // Apply reconciles NetworkManager profiles (ApplyProfiles) followed by the cgroupv2-scoped
@@ -473,7 +494,7 @@ func (r *Reconciler) Apply(
 	prevOwned []state.ManagedNetworkRecord,
 	dhcpTimeout time.Duration,
 ) (newOwned []state.ManagedNetworkRecord, liveDNS map[string][]string, nftHash string, err error) {
-	newOwned, liveDNS, err = r.ApplyProfiles(ctx, host, prevOwned, dhcpTimeout)
+	newOwned, liveDNS, _, err = r.ApplyProfiles(ctx, host, prevOwned, dhcpTimeout)
 	if err != nil {
 		return newOwned, nil, "", err
 	}
@@ -549,6 +570,15 @@ func (r *Reconciler) Restore(ctx context.Context, snap *Snapshot, createdDuringA
 		return strings.Compare(a.name, b.name)
 	})
 
+	vrfIPv6 := make(map[string]bool)
+	for _, item := range restoreItems {
+		if item.kind == kindMacvlan {
+			if uidStr, ok := strings.CutPrefix(item.name, ManagedPrefix); ok {
+				vrfIPv6[ManagedVRFPrefix+uidStr] = item.props["ipv6.method"] == "auto"
+			}
+		}
+	}
+
 	var activeConns map[string]bool
 	if len(restoreItems) > 0 {
 		var err error
@@ -558,7 +588,7 @@ func (r *Reconciler) Restore(ctx context.Context, snap *Snapshot, createdDuringA
 		}
 	}
 	for _, item := range restoreItems {
-		if err := r.restoreProfile(ctx, item.name, item.kind, item.props, activeConns); err != nil {
+		if err := r.restoreProfile(ctx, item.name, item.kind, item.props, activeConns, vrfIPv6[item.name]); err != nil {
 			return err
 		}
 	}
@@ -687,7 +717,7 @@ func (r *Reconciler) buildDesiredPlan(ctx context.Context, host *manifest.Resolv
 		return strings.Compare(a.CompName, b.CompName)
 	})
 
-	targets, err := collectNFTGuardTargets(r.cgroupPattern, host)
+	targets, err := r.collectNFTGuardTargets(host)
 	if err != nil {
 		return nil, err
 	}
@@ -726,6 +756,12 @@ func (r *Reconciler) discoverUnmanagedVLANs(ctx context.Context) (map[int]unmana
 		var inspectErr error
 		if conn != "" && conn != "--" {
 			parent, vlanID, inspectErr = r.inspectVLANConnection(ctx, conn)
+			if inspectErr != nil || parent != r.trunkInterface {
+				kParent, kID, kErr := r.inspectKernelVLANLink(ctx, device)
+				if kErr == nil {
+					parent, vlanID, inspectErr = kParent, kID, nil
+				}
+			}
 		} else {
 			parent, vlanID, inspectErr = r.inspectKernelVLANLink(ctx, device)
 		}
@@ -751,30 +787,41 @@ func (r *Reconciler) inspectVLANConnection(ctx context.Context, conn string) (st
 	if err != nil {
 		return "", 0, err
 	}
-	var vals []string
-	for _, line := range strings.Split(string(out), "\n") {
+	raw := strings.TrimSuffix(strings.TrimSuffix(string(out), "\n"), "\r")
+	var parentVal, idVal string
+	var hasParent, hasID bool
+	var positional []string
+	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" {
+		if v, ok := strings.CutPrefix(line, "vlan.parent:"); ok {
+			parentVal = strings.TrimSpace(unescapeNMCLI(v))
+			hasParent = true
 			continue
 		}
-		if strings.HasPrefix(line, "vlan.parent:") {
-			vals = append(vals, unescapeNMCLI(strings.TrimPrefix(line, "vlan.parent:")))
+		if v, ok := strings.CutPrefix(line, "vlan.id:"); ok {
+			idVal = strings.TrimSpace(unescapeNMCLI(v))
+			hasID = true
 			continue
 		}
-		if strings.HasPrefix(line, "vlan.id:") {
-			vals = append(vals, unescapeNMCLI(strings.TrimPrefix(line, "vlan.id:")))
-			continue
-		}
-		vals = append(vals, unescapeNMCLI(line))
+		positional = append(positional, strings.TrimSpace(unescapeNMCLI(line)))
 	}
-	if len(vals) < 2 {
-		return "", 0, fmt.Errorf("unexpected nmcli vlan.parent,vlan.id output for %q", conn)
+	if !hasParent && len(positional) >= 1 {
+		parentVal = positional[0]
 	}
-	id, err := strconv.Atoi(strings.TrimSpace(vals[1]))
+	if !hasID {
+		if len(positional) >= 2 {
+			idVal = positional[1]
+		} else if hasParent && len(positional) == 1 {
+			idVal = positional[0]
+		} else {
+			return "", 0, fmt.Errorf("unexpected nmcli vlan.parent,vlan.id output for %q", conn)
+		}
+	}
+	id, err := strconv.Atoi(idVal)
 	if err != nil || id <= 0 {
-		return "", 0, fmt.Errorf("invalid vlan.id %q for %q", vals[1], conn)
+		return "", 0, fmt.Errorf("invalid vlan.id %q for %q", idVal, conn)
 	}
-	return strings.TrimSpace(vals[0]), id, nil
+	return parentVal, id, nil
 }
 
 func (r *Reconciler) inspectKernelVLANLink(ctx context.Context, device string) (string, int, error) {
@@ -784,11 +831,21 @@ func (r *Reconciler) inspectKernelVLANLink(ctx context.Context, device string) (
 	}
 	text := string(out)
 	var parent string
-	if idx := strings.Index(text, device+"@"); idx >= 0 {
-		rest := text[idx+len(device)+1:]
-		if end := strings.IndexAny(rest, ": "); end > 0 {
-			parent = rest[:end]
+	needle := device + "@"
+	for offset := 0; offset < len(text); {
+		rel := strings.Index(text[offset:], needle)
+		if rel < 0 {
+			break
 		}
+		idx := offset + rel
+		if idx == 0 || isLinkTokenBoundary(text[idx-1]) {
+			rest := text[idx+len(needle):]
+			if end := strings.IndexAny(rest, ": \t\r\n"); end > 0 {
+				parent = rest[:end]
+			}
+			break
+		}
+		offset = idx + 1
 	}
 	m := ipLinkVLANIDRe.FindStringSubmatch(text)
 	if parent == "" || len(m) < 2 {
@@ -799,6 +856,10 @@ func (r *Reconciler) inspectKernelVLANLink(ctx context.Context, device string) (
 		return "", 0, err
 	}
 	return parent, id, nil
+}
+
+func isLinkTokenBoundary(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == ':'
 }
 
 func (r *Reconciler) ensureProfile(
@@ -902,6 +963,7 @@ func macvlanAddArgs(connName string, desired map[string]string) []string {
 		"dev", desired["macvlan.parent"],
 		"mode", desired["macvlan.mode"],
 		"controller", desired["connection.controller"],
+		"connection.port-type", desired["connection.port-type"],
 		"ethernet.cloned-mac-address", desired["802-3-ethernet.cloned-mac-address"],
 		"ipv4.method", desired["ipv4.method"],
 		"ipv4.route-table", desired["ipv4.route-table"],
@@ -918,7 +980,7 @@ func macvlanAddArgs(connName string, desired map[string]string) []string {
 	return args
 }
 
-func (r *Reconciler) restoreProfile(ctx context.Context, connName, kind string, props map[string]string, activeConns map[string]bool) error {
+func (r *Reconciler) restoreProfile(ctx context.Context, connName, kind string, props map[string]string, activeConns map[string]bool, vrfIPv6 bool) error {
 	var desired map[string]string
 	var addFn func() ([]string, error)
 
@@ -959,6 +1021,7 @@ func (r *Reconciler) restoreProfile(ctx context.Context, connName, kind string, 
 			"macvlan.parent":                    props["macvlan.parent"],
 			"macvlan.mode":                      normalizeMacvlanMode(firstNonEmpty(props["macvlan.mode"], "private")),
 			"connection.controller":             firstNonEmpty(props["connection.controller"], props["connection.master"]),
+			"connection.port-type":              firstNonEmpty(props["connection.port-type"], firstNonEmpty(props["connection.slave-type"], "vrf")),
 			"802-3-ethernet.cloned-mac-address": strings.ToLower(firstNonEmpty(props["802-3-ethernet.cloned-mac-address"], props["ethernet.cloned-mac-address"])),
 			"ipv4.method":                       firstNonEmpty(props["ipv4.method"], "auto"),
 			"ipv4.route-table":                  props["ipv4.route-table"],
@@ -993,8 +1056,11 @@ func (r *Reconciler) restoreProfile(ctx context.Context, connName, kind string, 
 		if err != nil || tableID <= 0 {
 			return fmt.Errorf("invalid snapped VRF table %q for %q", desired["vrf.table"], connName)
 		}
-		if err := r.ensureVRFUnreachableRoute(ctx, tableID); err != nil {
+		if err := r.ensureVRFUnreachableRoute(ctx, tableID, vrfIPv6); err != nil {
 			return err
+		}
+		if !vrfIPv6 {
+			_, _ = r.runner.Run(ctx, nil, "ip", "-6", "route", "del", "unreachable", "default", "metric", vrfDefaultMetric, "table", strconv.Itoa(tableID))
 		}
 	}
 	return nil
@@ -1008,25 +1074,51 @@ func (r *Reconciler) upConnection(ctx context.Context, connName string) error {
 	return nil
 }
 
-func (r *Reconciler) ensureVRFUnreachableRoute(ctx context.Context, tableID int) error {
+func (r *Reconciler) ensureVRFUnreachableRoute(ctx context.Context, tableID int, ipv6 bool) error {
 	out, err := r.runner.Run(ctx, nil, "ip", "route", "replace", "unreachable", "default", "metric", vrfDefaultMetric, "table", strconv.Itoa(tableID))
 	if err != nil {
 		return formatCmdErr(fmt.Sprintf("ip route replace unreachable default metric %s table %d", vrfDefaultMetric, tableID), out, err)
 	}
+	if ipv6 {
+		out, err = r.runner.Run(ctx, nil, "ip", "-6", "route", "replace", "unreachable", "default", "metric", vrfDefaultMetric, "table", strconv.Itoa(tableID))
+		if err != nil {
+			return formatCmdErr(fmt.Sprintf("ip -6 route replace unreachable default metric %s table %d", vrfDefaultMetric, tableID), out, err)
+		}
+	}
 	return nil
 }
 
-func (r *Reconciler) hasVRFUnreachableRoute(ctx context.Context, tableID int) (bool, error) {
-	out, err := r.runner.Run(ctx, nil, "ip", "route", "show", "table", strconv.Itoa(tableID))
+func (r *Reconciler) hasVRFUnreachableRoute(ctx context.Context, tableID int, ipv6 bool) (bool, error) {
+	ok4, err := r.hasVRFUnreachableRouteFamily(ctx, tableID, false)
+	if err != nil || !ok4 {
+		return ok4, err
+	}
+	if !ipv6 {
+		return true, nil
+	}
+	return r.hasVRFUnreachableRouteFamily(ctx, tableID, true)
+}
+
+func (r *Reconciler) hasVRFUnreachableRouteFamily(ctx context.Context, tableID int, ipv6 bool) (bool, error) {
+	var args []string
+	var cmdDesc string
+	if ipv6 {
+		args = []string{"-6", "route", "show", "table", strconv.Itoa(tableID)}
+		cmdDesc = fmt.Sprintf("ip -6 route show table %d", tableID)
+	} else {
+		args = []string{"route", "show", "table", strconv.Itoa(tableID)}
+		cmdDesc = fmt.Sprintf("ip route show table %d", tableID)
+	}
+	out, err := r.runner.Run(ctx, nil, "ip", args...)
 	if err != nil {
 		if isNMNotFoundErr(out, err) || strings.Contains(strings.ToLower(string(out)), "table does not exist") {
 			return false, nil
 		}
-		return false, formatCmdErr(fmt.Sprintf("ip route show table %d", tableID), out, err)
+		return false, formatCmdErr(cmdDesc, out, err)
 	}
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[0] == "unreachable" && fields[1] == "default" {
+		if len(fields) >= 2 && fields[0] == "unreachable" && (fields[1] == "default" || (ipv6 && fields[1] == "::/0")) {
 			if slices.Contains(fields, vrfDefaultMetric) {
 				return true, nil
 			}
@@ -1115,7 +1207,9 @@ func (r *Reconciler) deleteOwnedRecord(ctx context.Context, rec state.ManagedNet
 	if rec.Kind == kindVRF || strings.HasPrefix(rec.ConnectionName, ManagedVRFPrefix) {
 		if uidStr, ok := strings.CutPrefix(rec.ConnectionName, ManagedVRFPrefix); ok {
 			if uid, err := strconv.Atoi(uidStr); err == nil && uid > 0 {
-				_, _ = r.runner.Run(ctx, nil, "ip", "route", "del", "unreachable", "default", "metric", vrfDefaultMetric, "table", strconv.Itoa(vrfTableOffset+uid))
+				tableStr := strconv.Itoa(vrfTableOffset + uid)
+				_, _ = r.runner.Run(ctx, nil, "ip", "route", "del", "unreachable", "default", "metric", vrfDefaultMetric, "table", tableStr)
+				_, _ = r.runner.Run(ctx, nil, "ip", "-6", "route", "del", "unreachable", "default", "metric", vrfDefaultMetric, "table", tableStr)
 			}
 		}
 	}
@@ -1198,6 +1292,7 @@ func desiredMacvlanProps(rl desiredRootlessNet) map[string]string {
 		"macvlan.parent":                    rl.ParentIface,
 		"macvlan.mode":                      rl.Mode,
 		"connection.controller":             rl.VRFName,
+		"connection.port-type":              "vrf",
 		"802-3-ethernet.cloned-mac-address": rl.MAC,
 		"ipv4.method":                       "auto",
 		"ipv4.route-table":                  strconv.Itoa(rl.TableID),
@@ -1242,12 +1337,14 @@ func propsMatch(actual, desired map[string]string) bool {
 }
 
 func lookupProp(props map[string]string, key string) string {
-	if v, ok := props[key]; ok {
+	if v, ok := props[key]; ok && v != "" {
 		return v
 	}
 	switch key {
 	case "connection.controller":
 		return props["connection.master"]
+	case "connection.port-type":
+		return props["connection.slave-type"]
 	case "802-3-ethernet.cloned-mac-address":
 		return props["ethernet.cloned-mac-address"]
 	}

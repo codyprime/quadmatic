@@ -262,7 +262,18 @@ repo_dir = %q
 		t.Fatalf("apply --dry-run failed (code=%d)\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
 	}
 	planOut := stdout.String()
-	for _, want := range []string{"Host: services-02", "open-webui", "caddy", "Files:", "Units:"} {
+	for _, want := range []string{
+		"Host: services-02",
+		"open-webui",
+		"caddy",
+		"Files:",
+		"/etc/containers/systemd/users/2001/open-webui.container",
+		"/etc/containers/systemd/users/2001/open-webui.volume",
+		"/etc/containers/systemd/users/2002/caddy.container",
+		"Units:",
+		"openwebui/open-webui.service",
+		"caddy/caddy.service",
+	} {
 		if !strings.Contains(planOut, want) {
 			t.Fatalf("expected %q in apply --dry-run stdout, got:\n%s", want, planOut)
 		}
