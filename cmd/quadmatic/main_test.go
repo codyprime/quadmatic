@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -342,10 +343,11 @@ func TestDaemonFailsFastOnBusyMetricsPort(t *testing.T) {
 	}
 }
 
-func TestDaemonLoopSIGHUPSerializationMetricsAndGracefulShutdown(t *testing.T) {
+func TestDaemonSIGHUPTriggersImmediateReconcileAndUpdatesMetrics(t *testing.T) {
 	metricsAddr := reserveFreeLocalAddr(t)
 	base := t.TempDir()
-	cfgPath := writeTestConfig(t, base, metricsAddr, "25ms")
+	// Long poll interval ensures the second reconcile can only come from SIGHUP.
+	cfgPath := writeTestConfig(t, base, metricsAddr, "1h")
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -353,33 +355,16 @@ func TestDaemonLoopSIGHUPSerializationMetricsAndGracefulShutdown(t *testing.T) {
 	}
 
 	var calls atomic.Int32
-	var active atomic.Int32
-	var maxConcurrent atomic.Int32
 	firstDone := make(chan struct{})
-	inFlightStarted := make(chan struct{}, 4)
-	releaseInFlight := make(chan struct{})
+	secondDone := make(chan struct{})
 
 	eng := &stubReconcileEngine{
 		fn: func(_ context.Context, _ apply.ReconcileOptions) (*apply.Result, error) {
-			cur := active.Add(1)
-			defer active.Add(-1)
-			for {
-				prev := maxConcurrent.Load()
-				if cur <= prev || maxConcurrent.CompareAndSwap(prev, cur) {
-					break
-				}
-			}
-
 			n := calls.Add(1)
 			if n == 1 {
 				close(firstDone)
-			}
-			if n == 2 {
-				select {
-				case inFlightStarted <- struct{}{}:
-				default:
-				}
-				<-releaseInFlight
+			} else if n == 2 {
+				close(secondDone)
 			}
 			return &apply.Result{
 				AppliedSHA:           fmt.Sprintf("sha-%d", n),
@@ -407,47 +392,143 @@ func TestDaemonLoopSIGHUPSerializationMetricsAndGracefulShutdown(t *testing.T) {
 		t.Fatalf("timed out waiting for initial daemon reconcile; stderr=%s", stderr.String())
 	}
 
-	// Verify /metrics is live and reflects the initial reconcile.
-	var bodyStr string
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err := http.Get("http://" + metricsAddr + "/metrics")
-		if err == nil {
-			b, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK && strings.Contains(string(b), `sha="sha-1"`) {
-				bodyStr = string(b)
-				break
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
+	if body := waitForMetricsSubstring(t, metricsAddr, `sha="sha-1"`); !strings.Contains(body, `quadmatic_last_sync_success 1`) {
+		t.Fatalf("expected sha-1 and success=1 in /metrics, got:\n%s", body)
 	}
-	if !strings.Contains(bodyStr, `quadmatic_last_sync_success 1`) || !strings.Contains(bodyStr, `sha="sha-1"`) {
-		t.Fatalf("expected metrics output with sha-1 and success=1, got:\n%s", bodyStr)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 reconcile before SIGHUP, got %d", got)
 	}
 
-	// Wait for 2nd reconcile (from ticker or SIGHUP) to enter in-flight state, send SIGHUP concurrently,
-	// then cancel ctx while still in-flight to verify graceful shutdown waits for active reconcile.
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("send SIGHUP: %v", err)
+	}
+
+	select {
+	case <-secondDone:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for SIGHUP-triggered reconcile; stderr=%s", stderr.String())
+	}
+
+	if body := waitForMetricsSubstring(t, metricsAddr, `sha="sha-2"`); !strings.Contains(body, `quadmatic_last_sync_success 1`) {
+		t.Fatalf("expected updated sha-2 in /metrics after SIGHUP, got:\n%s", body)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("expected 2 reconciles after SIGHUP, got %d", got)
+	}
+
+	cancel()
+	select {
+	case code := <-doneCh:
+		if code != 0 {
+			t.Fatalf("daemon exited with non-zero code %d\nstderr:\n%s", code, stderr.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for graceful daemon shutdown")
+	}
+	if _, err := http.Get("http://" + metricsAddr + "/metrics"); err == nil {
+		t.Fatalf("expected metrics HTTP server to be shut down after daemon exit")
+	}
+}
+
+func TestDaemonSerializationAndSignalPropagationOnShutdown(t *testing.T) {
+	metricsAddr := reserveFreeLocalAddr(t)
+	base := t.TempDir()
+	cfgPath := writeTestConfig(t, base, metricsAddr, "25ms")
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	var calls atomic.Int32
+	var active atomic.Int32
+	var maxConcurrent atomic.Int32
+	firstDone := make(chan struct{})
+	inFlightStarted := make(chan struct{}, 4)
+	observedCancel := make(chan struct{}, 1)
+	releaseRollback := make(chan struct{})
+
+	eng := &stubReconcileEngine{
+		fn: func(ctx context.Context, _ apply.ReconcileOptions) (*apply.Result, error) {
+			cur := active.Add(1)
+			defer active.Add(-1)
+			for {
+				prev := maxConcurrent.Load()
+				if cur <= prev || maxConcurrent.CompareAndSwap(prev, cur) {
+					break
+				}
+			}
+
+			n := calls.Add(1)
+			if n == 1 {
+				close(firstDone)
+				return &apply.Result{AppliedSHA: "sha-1", Duration: 5 * time.Millisecond}, nil
+			}
+			if n == 2 {
+				select {
+				case inFlightStarted <- struct{}{}:
+				default:
+				}
+				// Wait for sigCtx cancellation to propagate from daemon shutdown.
+				<-ctx.Done()
+				select {
+				case observedCancel <- struct{}{}:
+				default:
+				}
+				// Simulate post-cancellation rollback cleanup before returning.
+				<-releaseRollback
+				return &apply.Result{AppliedSHA: "sha-1", RolledBack: true, FailedStage: "apply"}, ctx.Err()
+			}
+			return &apply.Result{AppliedSHA: fmt.Sprintf("sha-%d", n)}, nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	doneCh := make(chan int, 1)
+	go func() {
+		doneCh <- runDaemonWithFactory(ctx, cfg, &stdout, &stderr, func(*config.HostConfig) reconcileRunner {
+			return eng
+		})
+	}()
+
+	select {
+	case <-firstDone:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for initial daemon reconcile; stderr=%s", stderr.String())
+	}
+
 	select {
 	case <-inFlightStarted:
 	case <-time.After(3 * time.Second):
 		t.Fatalf("timed out waiting for second reconcile")
 	}
 
+	// Trigger SIGHUP while 2nd reconcile is active and ticker continues firing to prove serialization.
 	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
 		t.Fatalf("send SIGHUP: %v", err)
 	}
 	time.Sleep(40 * time.Millisecond)
 
-	// Cancel context while 2nd reconcile is still blocked; daemon must wait until releaseInFlight!
+	// Cancel context while 2nd reconcile is active: sigCtx cancellation must propagate promptly
+	// into Reconcile, and daemon must still wait for rollback/cleanup before exiting.
 	cancel()
+
+	select {
+	case <-observedCancel:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected daemon shutdown to cancel Reconcile ctx")
+	}
+
 	select {
 	case code := <-doneCh:
-		t.Fatalf("daemon exited prematurely (code=%d) before active reconcile completed", code)
+		t.Fatalf("daemon exited prematurely (code=%d) before active reconcile finished rollback", code)
 	case <-time.After(40 * time.Millisecond):
 	}
 
-	close(releaseInFlight)
+	close(releaseRollback)
 
 	select {
 	case code := <-doneCh:
@@ -464,6 +545,86 @@ func TestDaemonLoopSIGHUPSerializationMetricsAndGracefulShutdown(t *testing.T) {
 	if _, err := http.Get("http://" + metricsAddr + "/metrics"); err == nil {
 		t.Fatalf("expected metrics HTTP server to be shut down after daemon exit")
 	}
+}
+
+func TestApplyTrapsSIGTERMForTransactionalRollback(t *testing.T) {
+	base := t.TempDir()
+	cfgPath := writeTestConfig(t, base, "", "5m")
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	started := make(chan struct{})
+	observedCancel := make(chan struct{})
+	eng := &stubReconcileEngine{
+		fn: func(ctx context.Context, _ apply.ReconcileOptions) (*apply.Result, error) {
+			close(started)
+			<-ctx.Done()
+			close(observedCancel)
+			return &apply.Result{
+				AppliedSHA:  "prev-sha",
+				RolledBack:  true,
+				FailedStage: "apply",
+			}, ctx.Err()
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	doneCh := make(chan int, 1)
+	go func() {
+		doneCh <- runApplyWithFactory(context.Background(), cfg, apply.ReconcileOptions{}, &stdout, &stderr, func(*config.HostConfig, *slog.Logger) reconcileRunner {
+			return eng
+		})
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for apply reconcile to start")
+	}
+
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("send SIGTERM: %v", err)
+	}
+
+	select {
+	case <-observedCancel:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected runApply SIGTERM handler to cancel Reconcile context")
+	}
+
+	select {
+	case code := <-doneCh:
+		if code == 0 {
+			t.Fatalf("expected non-zero exit code when apply is interrupted by SIGTERM")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for runApply to exit")
+	}
+	if !strings.Contains(stderr.String(), "rolled_back=true") {
+		t.Fatalf("expected rollback status on stderr, got:\n%s", stderr.String())
+	}
+}
+
+func waitForMetricsSubstring(t *testing.T, metricsAddr, substr string) string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var lastBody string
+	for time.Now().Before(deadline) {
+		resp, err := http.Get("http://" + metricsAddr + "/metrics")
+		if err == nil {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastBody = string(b)
+			if resp.StatusCode == http.StatusOK && strings.Contains(lastBody, substr) {
+				return lastBody
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for /metrics to contain %q; last body:\n%s", substr, lastBody)
+	return ""
 }
 
 func TestDaemonMetricsDisabledWhenListenEmpty(t *testing.T) {

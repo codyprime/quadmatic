@@ -170,9 +170,9 @@ func runDaemonWithFactory(
 	defer signal.Stop(sighupCh)
 
 	runOnce := func() {
-		// Finish an active reconcile pass cleanly if shutdown arrives mid-run.
-		reconcileCtx := context.WithoutCancel(sigCtx)
-		res, err := engine.Reconcile(reconcileCtx, apply.ReconcileOptions{})
+		// Pass sigCtx so SIGINT/SIGTERM interrupts hung pre-mutation fetches/waits while
+		// Engine.Reconcile still shields mid-Stage 7 rollback on its own detached context.
+		res, err := engine.Reconcile(sigCtx, apply.ReconcileOptions{})
 		rec.RecordResult(res, err)
 		if err != nil {
 			failedStage := ""
@@ -265,18 +265,36 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		return 1
 	}
 
-	logger := slog.New(slog.NewTextHandler(stderr, nil))
-	engine := apply.NewEngine(apply.EngineDeps{
-		Config: cfg,
-		Logger: logger,
-	})
-
-	res, err := engine.Reconcile(ctx, apply.ReconcileOptions{
+	return runApplyWithFactory(ctx, cfg, apply.ReconcileOptions{
 		DryRun:        *dryRun,
 		AllowNonFF:    *allowNonFF,
 		LocalRepoPath: *repoPath,
 		NoVerify:      *noVerify,
-	})
+	}, stdout, stderr, nil)
+}
+
+func runApplyWithFactory(
+	ctx context.Context,
+	cfg *config.HostConfig,
+	opts apply.ReconcileOptions,
+	stdout, stderr io.Writer,
+	factory func(*config.HostConfig, *slog.Logger) reconcileRunner,
+) int {
+	sigCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+
+	logger := slog.New(slog.NewTextHandler(stderr, nil))
+	var engine reconcileRunner
+	if factory != nil {
+		engine = factory(cfg, logger)
+	} else {
+		engine = apply.NewEngine(apply.EngineDeps{
+			Config: cfg,
+			Logger: logger,
+		})
+	}
+
+	res, err := engine.Reconcile(sigCtx, opts)
 	if res != nil && res.PlanSummary != "" {
 		fmt.Fprint(stdout, res.PlanSummary)
 		if !strings.HasSuffix(res.PlanSummary, "\n") {
