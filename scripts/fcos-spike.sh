@@ -151,7 +151,7 @@ check_1_networking_and_pasta() {
     ADDED_LOCAL_RULE_32765=1
   fi
   if has_local_rule_prio 0; then
-    ip rule del prio 0
+    ip rule del prio 0 table local
     REMOVED_LOCAL_RULE_0=1
   fi
 

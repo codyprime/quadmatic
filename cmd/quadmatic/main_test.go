@@ -788,3 +788,85 @@ func mustGitCmd(t *testing.T, dir string, args ...string) {
 		t.Fatalf("git %v failed: %v\n%s", full, err, string(out))
 	}
 }
+
+func TestButaneInlineQuadmaticServiceMatchesSystemdUnit(t *testing.T) {
+	unitPath := filepath.Join("..", "..", "deploy", "systemd", "quadmatic.service")
+	butanePath := filepath.Join("..", "..", "deploy", "butane", "node.bu.tmpl")
+
+	wantBytes, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", unitPath, err)
+	}
+	butaneBytes, err := os.ReadFile(butanePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", butanePath, err)
+	}
+
+	got := extractButaneSystemdUnitContents(t, string(butaneBytes), "quadmatic.service")
+	want := string(wantBytes)
+	if got != want {
+		t.Fatalf("Butane inline quadmatic.service drifted from %s:\n--- got (butane) ---\n%s\n--- want (systemd/quadmatic.service) ---\n%s", unitPath, got, want)
+	}
+}
+
+func extractButaneSystemdUnitContents(t *testing.T, butaneText, unitName string) string {
+	t.Helper()
+	lines := strings.Split(strings.ReplaceAll(butaneText, "\r\n", "\n"), "\n")
+	unitHeader := "- name: " + unitName
+	unitIdx := -1
+	unitIndent := 0
+	for i, line := range lines {
+		trimmed := strings.TrimLeft(line, " ")
+		if trimmed == unitHeader {
+			unitIdx = i
+			unitIndent = len(line) - len(trimmed)
+			break
+		}
+	}
+	if unitIdx < 0 {
+		t.Fatalf("unit %q not found in Butane template", unitName)
+	}
+
+	contentsIdx := -1
+	for i := unitIdx + 1; i < len(lines); i++ {
+		line := lines[i]
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		if indent <= unitIndent {
+			break
+		}
+		if strings.TrimSpace(line) == "contents: |" {
+			contentsIdx = i
+			break
+		}
+	}
+	if contentsIdx < 0 {
+		t.Fatalf("inline `contents: |` for unit %q not found in Butane template", unitName)
+	}
+
+	blockIndent := -1
+	var body []string
+	for i := contentsIdx + 1; i < len(lines); i++ {
+		line := lines[i]
+		if strings.TrimSpace(line) == "" {
+			if blockIndent >= 0 {
+				body = append(body, "")
+			}
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		if blockIndent < 0 {
+			blockIndent = indent
+		}
+		if indent < blockIndent {
+			break
+		}
+		body = append(body, line[blockIndent:])
+	}
+	for len(body) > 0 && body[len(body)-1] == "" {
+		body = body[:len(body)-1]
+	}
+	return strings.Join(body, "\n") + "\n"
+}

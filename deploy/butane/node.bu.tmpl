@@ -165,8 +165,8 @@ systemd:
         [Service]
         Type=oneshot
         RemainAfterExit=yes
-        ExecStart=/bin/sh -eu -c 'ip rule show >/dev/null; ip rule show | grep -Eq "^32765:[[:space:]]+from all lookup local([[:space:]]|$)" || ip rule add prio 32765 table local; if ip rule show | grep -Eq "^0:[[:space:]]+from all lookup local([[:space:]]|$)"; then ip rule del prio 0; fi'
-        ExecStart=/bin/sh -eu -c 'if ip -6 rule show >/dev/null 2>&1; then ip -6 rule show | grep -Eq "^32765:[[:space:]]+from all lookup local([[:space:]]|$)" || ip -6 rule add prio 32765 table local; if ip -6 rule show | grep -Eq "^0:[[:space:]]+from all lookup local([[:space:]]|$)"; then ip -6 rule del prio 0; fi; fi'
+        ExecStart=/bin/sh -eu -c 'ip rule show >/dev/null; ip rule show | grep -Eq "^32765:[[:space:]]+from all lookup local([[:space:]]|$)" || ip rule add prio 32765 table local; if ip rule show | grep -Eq "^0:[[:space:]]+from all lookup local([[:space:]]|$)"; then ip rule del prio 0 table local; fi'
+        ExecStart=/bin/sh -eu -c 'if ip -6 rule show >/dev/null 2>&1; then ip -6 rule show | grep -Eq "^32765:[[:space:]]+from all lookup local([[:space:]]|$)" || ip -6 rule add prio 32765 table local; if ip -6 rule show | grep -Eq "^0:[[:space:]]+from all lookup local([[:space:]]|$)"; then ip -6 rule del prio 0 table local; fi; fi'
 
         [Install]
         WantedBy=multi-user.target
